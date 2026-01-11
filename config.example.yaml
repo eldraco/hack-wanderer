@@ -1,6 +1,6 @@
 mode: test
 serial:
-  port: /dev/cu.SLAB_USBtoUART
+  port: /dev/ttyUSB2
   baudrate: 115200
   timeout_s: 1.0
   write_timeout_s: 1.0
@@ -22,6 +22,14 @@ features:
   vendor_specific: true
   sim_read: true
   auto_register: true
+
+external_gps:
+  enabled: true
+  port: /dev/ttyACM0
+  baudrate: 9600
+  timeout_s: 0.5
+  read_duration_s: 2.0
+  max_lines: 200
 
 sim:
   pin: ""
