@@ -1,4 +1,4 @@
-# Cellular Wardriving (Test Mode)
+# Hack-Wanderer (Cellular Wardriving)
 
 This repo contains a Python script that connects to a cellular modem over a serial port and runs AT commands to verify modem, SIM, and network status. It supports a test/diagnostics mode and a wardriving mode that logs periodic snapshots.
 
@@ -17,19 +17,19 @@ pip install pyserial pyyaml
 ## Quick start
 
 ```bash
-python wardriving.py --port /dev/cu.SLAB_USBtoUART --mode test
+python hack-wanderer.py --port /dev/cu.SLAB_USBtoUART --mode test
 ```
 
 With a config file:
 
 ```bash
-python wardriving.py --config config.example.yaml
+python hack-wanderer.py --config config.example.yaml
 ```
 
 Write full results to JSON:
 
 ```bash
-python wardriving.py --config config.example.yaml --output-json results.json
+python hack-wanderer.py --config config.example.yaml --output-json results.json
 ```
 
 By default, a log file is created under `logs/` for each run.
@@ -37,7 +37,7 @@ By default, a log file is created under `logs/` for each run.
 Wardriving mode (JSONL):
 
 ```bash
-python wardriving.py --config config.example.yaml --mode wardrive
+python hack-wanderer.py --config config.example.yaml --mode wardrive
 ```
 
 ## Configuration
@@ -81,7 +81,7 @@ sim:
 wardrive:
   interval_s: 5.0
   duration_s: 60.0
-  jsonl_path: wardrive.jsonl
+  jsonl_path: hack-wanderer.jsonl
   wigle_csv_path: ""
 
 sim_read:
@@ -134,18 +134,18 @@ ui:
 
 ## Logging and verbosity
 
-- Every run writes a log file (defaults to `logs/wardriving_YYYYmmdd_HHMMSS.log`).
+- Every run writes a log file (defaults to `logs/hack-wanderer_YYYYmmdd_HHMMSS.log`).
 - Console output is verbose and colored by default; disable with `--no-color` or `--no-emoji`.
 - Use step-by-step mode to prompt before each phase:
 
 ```bash
-python wardriving.py --config config.example.yaml --interactive
+python hack-wanderer.py --config config.example.yaml --interactive
 ```
 
 - For full command/response detail on the console:
 
 ```bash
-python wardriving.py --config config.example.yaml --console-level debug
+python hack-wanderer.py --config config.example.yaml --console-level debug
 ```
 
 - SIM PIN values are redacted in logs and console output.
@@ -155,7 +155,7 @@ python wardriving.py --config config.example.yaml --console-level debug
 
 ## CLI options
 
-Run `python wardriving.py --help` for the full list. Key flags:
+Run `python hack-wanderer.py --help` for the full list. Key flags:
 
 - `--port`, `--baudrate`
 - `--operator-scan` / `--no-operator-scan`
