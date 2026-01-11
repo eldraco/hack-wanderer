@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import datetime
 import json
 import os
 import sys
@@ -41,6 +42,14 @@ DEFAULT_CONFIG = {
         "vendor_specific": True,
         "sim_read": True,
         "auto_register": True,
+    },
+    "external_gps": {
+        "enabled": True,
+        "port": "/dev/ttyACM0",
+        "baudrate": 9600,
+        "timeout_s": 0.5,
+        "read_duration_s": 2.0,
+        "max_lines": 200,
     },
     "wardrive": {
         "interval_s": 5.0,
@@ -504,6 +513,12 @@ def resolve_config(args):
         config["features"]["gps"] = True
     if args.no_gps:
         config["features"]["gps"] = False
+    if args.gps_device and args.no_gps_device:
+        raise ValueError("Choose only one of --gps-device or --no-gps-device.")
+    if args.gps_device:
+        config["external_gps"]["enabled"] = True
+    if args.no_gps_device:
+        config["external_gps"]["enabled"] = False
     if args.vendor_specific and args.no_vendor_specific:
         raise ValueError("Choose only one of --vendor-specific or --no-vendor-specific.")
     if args.vendor_specific:
@@ -534,6 +549,14 @@ def resolve_config(args):
         config["timeouts"]["sim_read_s"] = args.sim_read_timeout_s
     if args.vendor_timeout_s is not None:
         config["timeouts"]["vendor_s"] = args.vendor_timeout_s
+    if args.gps_device_timeout_s is not None:
+        config["external_gps"]["timeout_s"] = args.gps_device_timeout_s
+    if args.gps_device_read_duration_s is not None:
+        config["external_gps"]["read_duration_s"] = args.gps_device_read_duration_s
+    if args.gps_device_port:
+        config["external_gps"]["port"] = args.gps_device_port
+    if args.gps_device_baudrate is not None:
+        config["external_gps"]["baudrate"] = args.gps_device_baudrate
     if args.output_raw:
         config["output"]["raw"] = True
     if args.output_json:
@@ -1123,6 +1146,219 @@ def parse_operator_list(payload):
     return operators
 
 
+def nmea_checksum_ok(sentence):
+    if "*" not in sentence:
+        return True
+    data, checksum_text = sentence.split("*", 1)
+    checksum_text = checksum_text.strip()
+    data = data.lstrip("$")
+    calc = 0
+    for ch in data:
+        calc ^= ord(ch)
+    try:
+        expected = int(checksum_text[:2], 16)
+    except ValueError:
+        return False
+    return calc == expected
+
+
+def parse_nmea_latlon(value, hemisphere):
+    if not value:
+        return None
+    try:
+        head = value.split(".")[0]
+        if len(head) < 4:
+            return None
+        deg_len = 2 if len(head) <= 4 else 3
+        degrees = float(value[:deg_len])
+        minutes = float(value[deg_len:])
+        coord = degrees + minutes / 60.0
+        hemi = (hemisphere or "").upper()
+        if hemi in ("S", "W"):
+            coord *= -1
+        return round(coord, 7)
+    except (ValueError, TypeError):
+        return None
+
+
+def nmea_timestamp_utc(date_text, time_text):
+    if not time_text or len(time_text) < 6:
+        return None
+    try:
+        hours = int(time_text[0:2])
+        minutes = int(time_text[2:4])
+        seconds_float = float(time_text[4:])
+    except (ValueError, TypeError):
+        return None
+    seconds_int = int(seconds_float)
+    micros = int(round((seconds_float - seconds_int) * 1_000_000))
+    if date_text and len(date_text) >= 6:
+        try:
+            day = int(date_text[0:2])
+            month = int(date_text[2:4])
+            year = 2000 + int(date_text[4:6])
+            dt = datetime.datetime(year, month, day, hours, minutes, seconds_int, micros, tzinfo=datetime.timezone.utc)
+            return dt.isoformat().replace("+00:00", "Z")
+        except (ValueError, TypeError):
+            pass
+    now = datetime.datetime.utcnow()
+    dt = datetime.datetime(now.year, now.month, now.day, hours, minutes, seconds_int, micros, tzinfo=datetime.timezone.utc)
+    return dt.isoformat().replace("+00:00", "Z")
+
+
+def parse_nmea_gga(line):
+    parts = line.split(",")
+    if len(parts) < 10:
+        return {}
+    lat = parse_nmea_latlon(parts[2], parts[3])
+    lon = parse_nmea_latlon(parts[4], parts[5])
+    return {
+        "time_utc": parts[1] or None,
+        "timestamp_utc": nmea_timestamp_utc("", parts[1]) if parts[1] else None,
+        "lat": lat,
+        "lon": lon,
+        "fix_quality": safe_int(parts[6]),
+        "satellites": safe_int(parts[7]),
+        "hdop": safe_float(parts[8]),
+        "alt_m": safe_float(parts[9]),
+        "geoid_sep_m": safe_float(parts[11]) if len(parts) > 11 else None,
+        "dgps_age_s": safe_float(parts[13]) if len(parts) > 13 else None,
+    }
+
+
+def parse_nmea_rmc(line):
+    parts = line.split(",")
+    if len(parts) < 10:
+        return {}
+    lat = parse_nmea_latlon(parts[3], parts[4])
+    lon = parse_nmea_latlon(parts[5], parts[6])
+    timestamp = nmea_timestamp_utc(parts[9], parts[1])
+    return {
+        "time_utc": parts[1] or None,
+        "date": parts[9] or None,
+        "timestamp_utc": timestamp,
+        "status": parts[2] or None,
+        "lat": lat,
+        "lon": lon,
+        "speed_knots": safe_float(parts[7]),
+        "course_deg": safe_float(parts[8]),
+        "mag_var": safe_float(parts[10]) if len(parts) > 10 else None,
+    }
+
+
+def parse_nmea_gsa(line):
+    parts = line.split(",")
+    if len(parts) < 17:
+        return {}
+    sats = [p for p in parts[3:15] if p]
+    return {
+        "mode": parts[1] or None,
+        "fix_type": safe_int(parts[2]),
+        "satellites": sats,
+        "pdop": safe_float(parts[15]),
+        "hdop": safe_float(parts[16]) if len(parts) > 16 else None,
+        "vdop": safe_float(parts[17]) if len(parts) > 17 else None,
+    }
+
+
+def parse_nmea_gsv(line):
+    parts = line.split(",")
+    if len(parts) < 4:
+        return {}
+    entry = {
+        "message_index": safe_int(parts[2]),
+        "message_count": safe_int(parts[1]),
+        "in_view": safe_int(parts[3]),
+        "satellites": [],
+    }
+    for idx in range(4, len(parts) - 3, 4):
+        prn = parts[idx]
+        elev = safe_int(parts[idx + 1]) if len(parts) > idx + 1 else None
+        az = safe_int(parts[idx + 2]) if len(parts) > idx + 2 else None
+        snr = safe_int(parts[idx + 3]) if len(parts) > idx + 3 else None
+        if prn:
+            entry["satellites"].append({
+                "prn": prn,
+                "elevation_deg": elev,
+                "azimuth_deg": az,
+                "snr_db": snr,
+            })
+    return entry
+
+
+def parse_nmea_gll(line):
+    parts = line.split(",")
+    if len(parts) < 7:
+        return {}
+    lat = parse_nmea_latlon(parts[1], parts[2])
+    lon = parse_nmea_latlon(parts[3], parts[4])
+    timestamp = nmea_timestamp_utc("", parts[5])
+    return {
+        "lat": lat,
+        "lon": lon,
+        "time_utc": parts[5] or None,
+        "timestamp_utc": timestamp,
+        "status": parts[6] or None,
+    }
+
+
+def aggregate_nmea(parsed, raw_lines):
+    gga = parsed.get("gga") or {}
+    rmc = parsed.get("rmc") or {}
+    gsa = parsed.get("gsa") or {}
+    gsv = parsed.get("gsv") or []
+    gll = parsed.get("gll") or {}
+    location = {}
+    location_source = None
+    for key, data in (("rmc", rmc), ("gga", gga), ("gll", gll)):
+        if data and data.get("lat") is not None and data.get("lon") is not None:
+            location = {
+                "lat": data.get("lat"),
+                "lon": data.get("lon"),
+                "alt_m": data.get("alt_m"),
+                "speed_knots": data.get("speed_knots"),
+                "course_deg": data.get("course_deg"),
+            }
+            if data.get("timestamp_utc"):
+                location["timestamp_utc"] = data["timestamp_utc"]
+            location_source = key
+            break
+    sats_in_use = gga.get("satellites") if gga else None
+    if sats_in_use is None and gsa:
+        sats_in_use = len(gsa.get("satellites", [])) if gsa.get("satellites") else None
+    sats_in_view = None
+    for entry in gsv:
+        if entry.get("in_view") is not None:
+            sats_in_view = max(sats_in_view or 0, entry["in_view"])
+    hdop = gga.get("hdop") or gsa.get("hdop")
+    timestamp = None
+    for candidate in (rmc.get("timestamp_utc"), gga.get("timestamp_utc"), gll.get("timestamp_utc")):
+        if candidate:
+            timestamp = candidate
+            break
+    return {
+        "location": location,
+        "location_source": location_source,
+        "has_fix": bool(location),
+        "timestamp_utc": timestamp,
+        "status": rmc.get("status") or gll.get("status"),
+        "fix_quality": gga.get("fix_quality"),
+        "fix_type": gsa.get("fix_type"),
+        "hdop": hdop,
+        "satellites": {
+            "in_use": sats_in_use,
+            "in_view": sats_in_view,
+            "used_prns": gsa.get("satellites") or [],
+        },
+        "gga": gga,
+        "rmc": rmc,
+        "gsa": gsa,
+        "gsv": gsv,
+        "gll": gll,
+        "raw_sample": raw_lines[:20],
+    }
+
+
 def collect_info(at):
     info = {}
     info["ati"] = at.send("ATI")["lines"]
@@ -1280,6 +1516,141 @@ def collect_gps(at, config):
     return gps
 
 
+def collect_external_gps(config, logger):
+    cfg = config.get("external_gps", {}) or {}
+    enabled = bool(cfg.get("enabled", True))
+    port = cfg.get("port") or "/dev/ttyACM0"
+    baudrate = cfg.get("baudrate") or 9600
+    timeout_s = cfg.get("timeout_s", 0.5)
+    read_duration_s = cfg.get("read_duration_s", 2.0)
+    max_lines = cfg.get("max_lines", 200) or 200
+    result = {
+        "source": "serial_nmea",
+        "port": port,
+        "baudrate": baudrate,
+        "enabled": enabled,
+    }
+    if not enabled:
+        result["available"] = False
+        logger.info("External GPS disabled in config.")
+        return result
+    if serial is None:
+        result["available"] = False
+        result["error"] = "pyserial missing"
+        logger.warning("External GPS skipped: pyserial not installed.")
+        return result
+    try:
+        ser = serial.Serial(
+            port=port,
+            baudrate=baudrate,
+            timeout=timeout_s,
+            write_timeout=timeout_s,
+        )
+    except Exception as exc:
+        result["available"] = False
+        result["error"] = str(exc)
+        logger.warning("External GPS not available on {}: {}".format(port, exc))
+        return result
+
+    raw_lines = []
+    parsed = {"gga": None, "rmc": None, "gsa": None, "gsv": [], "gll": None}
+    start = time.monotonic()
+    try:
+        while (time.monotonic() - start) < read_duration_s and len(raw_lines) < max_lines:
+            raw = ser.readline()
+            if not raw:
+                continue
+            try:
+                line = raw.decode(errors="ignore").strip()
+            except Exception:
+                continue
+            if not line:
+                continue
+            if not nmea_checksum_ok(line):
+                continue
+            raw_lines.append(line)
+            upper = line.upper()
+            if upper.startswith("$GPGGA") or upper.startswith("$GNGGA") or upper.startswith("$GAGGA"):
+                entry = parse_nmea_gga(line)
+                entry["raw"] = line
+                parsed["gga"] = entry
+            elif upper.startswith("$GPRMC") or upper.startswith("$GNRMC") or upper.startswith("$GARMC"):
+                entry = parse_nmea_rmc(line)
+                entry["raw"] = line
+                parsed["rmc"] = entry
+            elif upper.startswith("$GPGSA") or upper.startswith("$GNGSA") or upper.startswith("$GAGSA"):
+                entry = parse_nmea_gsa(line)
+                entry["raw"] = line
+                parsed["gsa"] = entry
+            elif upper.startswith("$GPGSV") or upper.startswith("$GNGSV") or upper.startswith("$GAGSV"):
+                entry = parse_nmea_gsv(line)
+                entry["raw"] = line
+                parsed["gsv"].append(entry)
+            elif upper.startswith("$GPGLL") or upper.startswith("$GNGLL") or upper.startswith("$GAGLL"):
+                entry = parse_nmea_gll(line)
+                entry["raw"] = line
+                parsed["gll"] = entry
+    finally:
+        ser.close()
+
+    report = aggregate_nmea(parsed, raw_lines)
+    report.update(result)
+    report["available"] = bool(raw_lines)
+    if report.get("has_fix"):
+        loc = report.get("location") or {}
+        sats = report.get("satellites") or {}
+        logger.info("GPS (device {}) source=device: lat={} lon={} alt={} sats_used={} sats_view={} timestamp={}".format(
+            port,
+            loc.get("lat"),
+            loc.get("lon"),
+            loc.get("alt_m"),
+            sats.get("in_use"),
+            sats.get("in_view"),
+            loc.get("timestamp_utc"),
+        ))
+    else:
+        logger.info("GPS (device {}) source=device: no fix yet ({} sentences)".format(
+            port,
+            len(raw_lines),
+        ))
+    return report
+
+
+def log_modem_gps(logger, gps_data):
+    if not gps_data:
+        logger.info("GPS (LTE modem) source=lte_modem: disabled or skipped.")
+        return
+    cgns = gps_data.get("cgnsinf") or {}
+    if cgns.get("lat") is not None and cgns.get("lon") is not None:
+        logger.info("GPS (LTE modem) source=lte_modem: lat={} lon={} alt={} fix_status={} utc={}".format(
+            cgns.get("lat"),
+            cgns.get("lon"),
+            cgns.get("alt_m"),
+            cgns.get("fix_status"),
+            cgns.get("utc"),
+        ))
+    else:
+        logger.info("GPS (LTE modem) source=lte_modem: no fix reported.")
+
+
+def best_location_from_sources(gps_modem, gps_device):
+    device_loc = (gps_device or {}).get("location") or {}
+    if device_loc.get("lat") is not None and device_loc.get("lon") is not None:
+        chosen = dict(device_loc)
+        chosen["source"] = "gps_device"
+        return chosen
+    cgns = (gps_modem or {}).get("cgnsinf") or {}
+    if cgns.get("lat") is not None and cgns.get("lon") is not None:
+        return {
+            "lat": cgns.get("lat"),
+            "lon": cgns.get("lon"),
+            "alt_m": cgns.get("alt_m"),
+            "timestamp_utc": cgns.get("utc"),
+            "source": "lte_modem",
+        }
+    return {}
+
+
 def collect_errors(at):
     errors = {}
     errors["ceer"] = parse_ceer(at.send("AT+CEER")["lines"])
@@ -1293,14 +1664,19 @@ def run_extra_commands(at, config):
     return extra_results
 
 
-def build_snapshot(at, config):
+def build_snapshot(at, config, logger):
     network = collect_network(at, config)
     vendor = collect_vendor_info(at, config)
+    gps_modem = collect_gps(at, config)
+    gps_device = collect_external_gps(config, logger)
+    log_modem_gps(logger, gps_modem)
     snapshot = {
         "timestamp_utc": iso_timestamp(),
         "network": network,
         "vendor": vendor,
-        "gps": collect_gps(at, config),
+        "gps": gps_modem,
+        "gps_device": gps_device,
+        "location": best_location_from_sources(gps_modem, gps_device),
         "towers": build_towers_snapshot(network, vendor),
     }
     return snapshot
@@ -1319,10 +1695,13 @@ def write_wigle_header(handle):
 
 def snapshot_to_wigle_rows(snapshot):
     rows = []
-    gps = snapshot.get("gps", {}).get("cgnsinf", {})
-    lat = gps.get("lat")
-    lon = gps.get("lon")
-    alt = gps.get("alt_m")
+    location = snapshot.get("location") or best_location_from_sources(
+        snapshot.get("gps"),
+        snapshot.get("gps_device"),
+    )
+    lat = location.get("lat")
+    lon = location.get("lon")
+    alt = location.get("alt_m")
     if lat is None or lon is None:
         return rows
     network = snapshot.get("network", {})
@@ -1477,14 +1856,41 @@ def print_summary(results, config, logger):
             logger.print_line("  Band: {}".format(qnw.get("band")))
     logger.print_line("")
     logger.section("GPS", "gps")
-    if gps.get("cgnsinf"):
-        cgns = gps["cgnsinf"]
-        if cgns.get("fix_status") is not None:
-            logger.print_line("  CGNS fix status: {}".format(cgns.get("fix_status")))
-        if cgns.get("lat") is not None and cgns.get("lon") is not None:
-            logger.print_line("  Location: {}, {}".format(cgns.get("lat"), cgns.get("lon")))
+    gps_modem = gps or {}
+    gps_device = results.get("gps_device") or {}
+    device_loc = gps_device.get("location") or {}
+    device_sats = gps_device.get("satellites") or {}
+    if gps_device.get("enabled") is False:
+        logger.print_line("  External GPS: disabled by config.")
+    elif device_loc.get("lat") is not None and device_loc.get("lon") is not None:
+        logger.print_line("  Device GPS ({}): lat={} lon={} alt={} sats_used={} in_view={} hdop={} source=device".format(
+            gps_device.get("port") or "external",
+            device_loc.get("lat"),
+            device_loc.get("lon"),
+            device_loc.get("alt_m"),
+            device_sats.get("in_use"),
+            device_sats.get("in_view"),
+            gps_device.get("hdop"),
+        ))
     else:
-        logger.print_line("  No GPS info detected.")
+        logger.print_line("  Device GPS ({}): no fix (in_use={} in_view={}) source=device".format(
+            gps_device.get("port") or "external",
+            device_sats.get("in_use"),
+            device_sats.get("in_view"),
+        ))
+    if gps_modem.get("cgnsinf"):
+        cgns = gps_modem["cgnsinf"]
+        if cgns.get("fix_status") is not None:
+            logger.print_line("  LTE GPS fix status: {} source=lte_modem".format(cgns.get("fix_status")))
+        if cgns.get("lat") is not None and cgns.get("lon") is not None:
+            logger.print_line("  LTE GPS location: {}, {} alt={} utc={} source=lte_modem".format(
+                cgns.get("lat"),
+                cgns.get("lon"),
+                cgns.get("alt_m"),
+                cgns.get("utc"),
+            ))
+    else:
+        logger.print_line("  LTE GPS: no info detected.")
     logger.print_line("")
     if results.get("diagnostics"):
         logger.section("Diagnostics", "diag")
@@ -1537,6 +1943,12 @@ def parse_args(argv):
     parser.add_argument("--vendor-timeout-s", type=float, help="Timeout for vendor-specific commands.")
     parser.add_argument("--gps", action="store_true", help="Enable GPS queries.")
     parser.add_argument("--no-gps", action="store_true", help="Disable GPS queries.")
+    parser.add_argument("--gps-device", action="store_true", help="Enable external NMEA GPS (/dev/ttyACM0).")
+    parser.add_argument("--no-gps-device", action="store_true", help="Disable external NMEA GPS.")
+    parser.add_argument("--gps-device-port", help="Serial port for external NMEA GPS (e.g. /dev/ttyACM0).")
+    parser.add_argument("--gps-device-baudrate", type=int, help="Baudrate for external NMEA GPS.")
+    parser.add_argument("--gps-device-timeout-s", type=float, help="Serial timeout when reading external GPS.")
+    parser.add_argument("--gps-device-read-duration-s", type=float, help="Seconds to sample NMEA sentences from external GPS.")
     parser.add_argument("--vendor-specific", action="store_true", help="Enable vendor-specific commands.")
     parser.add_argument("--no-vendor-specific", action="store_true", help="Disable vendor-specific commands.")
     parser.add_argument("--auto-register", action="store_true", help="Enable automatic network registration.")
@@ -1618,6 +2030,7 @@ def main(argv):
             "network": {},
             "vendor": {},
             "gps": {},
+            "gps_device": {},
             "errors": {},
             "diagnostics": [],
             "command_log": [],
@@ -1644,6 +2057,10 @@ def main(argv):
                 if config.get("features", {}).get("gps"):
                     logger.step("Collect GPS info")
                 results["gps"] = collect_gps(at, config)
+                log_modem_gps(logger, results["gps"])
+                logger.step("Collect external GPS info")
+                results["gps_device"] = collect_external_gps(config, logger)
+                results["location"] = best_location_from_sources(results["gps"], results["gps_device"])
                 logger.step("Collect error status")
                 results["errors"] = collect_errors(at)
                 if config.get("extra_commands"):
@@ -1674,7 +2091,7 @@ def main(argv):
                             if end_time and time.monotonic() >= end_time:
                                 logger.info("Wardrive duration reached; stopping.")
                                 break
-                            snapshot = build_snapshot(at, config)
+                            snapshot = build_snapshot(at, config, logger)
                             snapshot["sim_status"] = pin_info.get("status_after")
                             write_jsonl(jsonl_handle, snapshot)
                             if wigle_handle:
