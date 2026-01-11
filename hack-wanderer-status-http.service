@@ -1,0 +1,15 @@
+[Unit]
+Description=Hack-Wanderer status HTTP server
+After=network.target
+Wants=hack-wanderer.service
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/code/hack-wanderer/status
+ExecStart=/usr/bin/env python -m http.server 8800
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
