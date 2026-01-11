@@ -1,0 +1,18 @@
+[Unit]
+Description=Hack-Wanderer wardrive logger
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/code/hack-wanderer
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/pi/code/hack-wanderer/venv/bin/python /home/pi/code/hack-wanderer/hack-wanderer.py --config /home/pi/code/hack-wanderer/config.example.yaml --mode wardrive --duration-s 0
+Restart=always
+RestartSec=5
+StandardOutput=append:/home/pi/code/hack-wanderer/logs/service.log
+StandardError=append:/home/pi/code/hack-wanderer/logs/service.err
+
+[Install]
+WantedBy=multi-user.target
