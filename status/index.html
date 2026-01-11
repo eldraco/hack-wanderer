@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Hack-Wanderer Status</title>
+  <style>
+    :root {
+      --bg: #0f172a;
+      --card: #111827;
+      --text: #e5e7eb;
+      --muted: #9ca3af;
+      --accent: #22d3ee;
+      --warn: #fbbf24;
+    }
+    * { box-sizing: border-box; }
+    html, body { height: 100%; }
+    body {
+      margin: 0;
+      padding: 10px;
+      font-family: "Segoe UI", sans-serif;
+      background: radial-gradient(circle at 20% 20%, #1f2937 0%, #0f172a 45%);
+      color: var(--text);
+      overflow-y: auto;
+      -webkit-overflow-scrolling: touch;
+      touch-action: pan-y;
+    }
+    h1 { margin: 0 0 4px; font-size: 10px; letter-spacing: 0.4px; }
+    .panel {
+      background: var(--card);
+      border: 1px solid #1f2937;
+      border-radius: 8px;
+      padding: 8px;
+      box-shadow: 0 10px 30px rgba(0,0,0,0.35);
+    }
+    .row { display: grid; grid-template-columns: 26% 74%; gap: 4px; align-items: center; margin-bottom: 4px; }
+    .label { color: var(--muted); font-size: 9px; text-transform: uppercase; letter-spacing: 0.06em; }
+    .value { font-size: 10px; margin: 0; word-break: break-word; }
+    .pill {
+      display: inline-block;
+      padding: 1px 4px;
+      border-radius: 6px;
+      background: rgba(34,211,238,0.2);
+      border: 1px solid var(--accent);
+      color: var(--accent);
+      font-size: 9px;
+    }
+    .warn { color: var(--warn); }
+  </style>
+</head>
+<body>
+  <h1>Hack-Wanderer</h1>
+  <div class="panel" id="panel">
+    <div class="row"><div class="label">Time</div><div id="updated" class="value">--</div></div>
+    <div class="row"><div class="label">Loc</div><div id="location" class="value">--</div></div>
+    <div class="row"><div class="label">GPS dev</div><div id="gps-device" class="value">--</div></div>
+    <div class="row"><div class="label">GPS LTE</div><div id="gps-lte" class="value">--</div></div>
+    <div class="row"><div class="label">Net</div><div id="network" class="value">--</div></div>
+    <div class="row"><div class="label">Sig</div><div id="signal" class="value">--</div></div>
+    <div class="row"><div class="label">SIM</div><div id="sim" class="value">--</div></div>
+    <div class="row"><div class="label">Towers</div><div id="towers" class="value">--</div></div>
+    <div class="row"><div class="label">Top</div><div id="towers-detail" class="value">--</div></div>
+  </div>
+  <script>
+    async function loadStatus() {
+      try {
+        const res = await fetch('./status.json', {cache: 'no-store'});
+        if (!res.ok) throw new Error(res.statusText);
+        const data = await res.json();
+        render(data);
+      } catch (err) {
+        document.getElementById('updated').textContent = 'Error loading status';
+      }
+    }
+
+    function render(data) {
+      const updated = data.timestamp_utc || '--';
+      const loc = data.location || {};
+      const locText = (loc.lat != null && loc.lon != null) ?
+        `${loc.lat.toFixed(6)}, ${loc.lon.toFixed(6)}${loc.alt_m != null ? '  alt ' + loc.alt_m + 'm' : ''}` : 'No fix';
+      const gpsDevice = data.gps_device || {};
+      const gpsDeviceLoc = (gpsDevice.location || {});
+      const gpsDeviceText = (gpsDeviceLoc.lat != null && gpsDeviceLoc.lon != null)
+        ? `${gpsDeviceLoc.lat.toFixed(5)}, ${gpsDeviceLoc.lon.toFixed(5)} (sats ${((gpsDevice.satellites||{}).in_use)||'?'}/${((gpsDevice.satellites||{}).in_view)||'?'})`
+      : 'No fix';
+      const gpsModem = data.gps_lte_modem || {};
+      const gpsModemInfo = gpsModem.cgnsinf || {};
+      const gpsModemText = (gpsModemInfo.lat != null && gpsModemInfo.lon != null)
+        ? `${Number(gpsModemInfo.lat).toFixed(5)}, ${Number(gpsModemInfo.lon).toFixed(5)} (fix ${gpsModemInfo.fix_status||'?'})`
+        : 'No fix';
+
+      const net = data.network || {};
+      const cops = net.cops_current || {};
+      const reg = (net.cereg && net.cereg.stat_text) ? net.cereg : (net.cgreg && net.cgreg.stat_text ? net.cgreg : net.creg || {});
+      const signal = net.csq || {};
+
+      document.getElementById('updated').textContent = updated;
+      document.getElementById('location').textContent = locText;
+      document.getElementById('gps-device').textContent = gpsDeviceText + ' source=device';
+      document.getElementById('gps-lte').textContent = gpsModemText + ' source=lte_modem';
+      document.getElementById('network').textContent = `${cops.operator || 'unknown'}  RAT ${(cops.act!=null)?cops.act:'?'}  Reg ${(reg.stat_text)||'unknown'}`;
+      document.getElementById('signal').textContent = (signal.rssi_dbm!=null) ? `${signal.rssi_dbm} dBm (rssi ${signal.rssi})` : 'Unknown';
+      document.getElementById('sim').textContent = data.sim_status || 'unknown';
+
+      const towers = data.towers || [];
+      const towersText = towers.length ? `${towers.length} found` : 'None';
+      const top = towers.slice(0, 3).map(t => {
+        const id = t.cell_id != null ? t.cell_id : 'unk';
+        const rat = t.rat || t.mode || '?';
+        const tac = t.tac_lac != null ? `/${t.tac_lac}` : '';
+        return `${rat}:${id}${tac}`;
+      }).join(' | ');
+      document.getElementById('towers').textContent = towersText;
+      document.getElementById('towers-detail').textContent = top || '--';
+    }
+
+    loadStatus();
+    setInterval(loadStatus, 3000);
+  </script>
+</body>
+</html>
