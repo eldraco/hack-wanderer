@@ -109,6 +109,9 @@ output:
   raw: false
   json_path: ""
 
+status_page:
+  json_path: status/status.json
+
 logging:
   enabled: true
   dir: logs
@@ -188,6 +191,20 @@ Run `python hack-wanderer.py --help` for the full list. Key flags:
 - `--no-log` to disable log files
 - `--color` / `--no-color`, `--emoji` / `--no-emoji`
 - `--interactive` / `--no-interactive`
+
+## Local status page (small display)
+
+- The wardrive loop writes a live snapshot to `status/status.json` and a matching display at `status/index.html` (auto-refresh every 3s).
+- Serve it locally or open directly with a browser: `chromium-browser file:///home/pi/code/hack-wanderer/status/index.html`.
+- To auto-open on boot (kiosk on :0, adjust if your user/desktop differ):
+  ```bash
+  sudo cp /home/pi/code/hack-wanderer/hack-wanderer-status-http.service /etc/systemd/system/hack-wanderer-status-http.service
+  sudo cp /home/pi/code/hack-wanderer/hack-wanderer-display.service /etc/systemd/system/hack-wanderer-display.service
+  sudo systemctl daemon-reload
+  sudo systemctl enable --now hack-wanderer-status-http.service
+  sudo systemctl enable --now hack-wanderer-display.service
+  ```
+  This starts a tiny local web server on `http://127.0.0.1:8800/` and opens it in kiosk mode. It assumes `chromium-browser` is installed, `DISPLAY=:0`, and `.Xauthority` is in `/home/pi`.
 
 ## Autostart on boot (systemd)
 
