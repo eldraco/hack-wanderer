@@ -1,6 +1,6 @@
 # Cellular Wardriving (Test Mode)
 
-This repo contains a Python script that connects to a cellular modem over a serial port and runs AT commands to verify modem, SIM, and network status. It is a test and diagnostics tool for now; wardriving collection can be built on top later.
+This repo contains a Python script that connects to a cellular modem over a serial port and runs AT commands to verify modem, SIM, and network status. It supports a test/diagnostics mode and a wardriving mode that logs periodic snapshots.
 
 ## Requirements
 
@@ -32,9 +32,18 @@ Write full results to JSON:
 python wardriving.py --config config.example.yaml --output-json results.json
 ```
 
+By default, a log file is created under `logs/` for each run.
+
+Wardriving mode (JSONL):
+
+```bash
+python wardriving.py --config config.example.yaml --mode wardrive
+```
+
 ## Configuration
 
 All settings can be provided via CLI flags or a YAML file. CLI flags override the YAML values.
+Set `output.json_path` in YAML to always write JSON results without a CLI flag.
 
 Example config (`config.example.yaml`):
 
@@ -58,10 +67,22 @@ timeouts:
   vendor_s: 5.0
 
 features:
-  operator_scan: true
+  operator_scan: false
   gps: true
   vendor_specific: true
   sim_read: true
+  auto_register: true
+
+sim:
+  pin: ""
+  pin_env_key: SIM_PIN
+  env_file: .env
+
+wardrive:
+  interval_s: 5.0
+  duration_s: 60.0
+  jsonl_path: wardrive.jsonl
+  wigle_csv_path: ""
 
 sim_read:
   files:
@@ -78,12 +99,26 @@ sim_read:
 extra_commands: []
 output:
   raw: false
+  json_path: ""
+
+logging:
+  enabled: true
+  dir: logs
+  file: ""
+  file_level: debug
+  console_level: info
+
+ui:
+  color: true
+  emoji: true
+  interactive: false
 ```
 
 ## What the script checks
 
 - Modem info: manufacturer, model, firmware revision, IMEI
 - SIM info: SIM status, ICCID, IMSI, basic SIM file reads via `AT+CRSM`
+- SIM PIN state and optional unlock using a configured PIN
 - Network status: signal quality, registration status (2G/3G/4G), current operator
 - Operator scan: available nearby operators (`AT+COPS=?`)
 - Optional vendor-specific data (if supported): band, serving cell, neighbor cell
@@ -92,10 +127,31 @@ output:
 
 ## Notes
 
-- `AT+COPS=?` can take a long time. Disable it with `--no-operator-scan` if needed.
+- `AT+COPS=?` can take a long time. It is disabled by default; enable with `--operator-scan`.
 - SIM file reads are limited to a small list of common EF files. Full SIM exploration requires APDU workflows (e.g., `AT+CSIM`), which are not implemented yet.
 - GPS commands are queried only (no power-on commands are issued).
 - If you see `SIM PIN` or `SIM PUK`, the SIM is locked or blocked. The tool only reports it.
+
+## Logging and verbosity
+
+- Every run writes a log file (defaults to `logs/wardriving_YYYYmmdd_HHMMSS.log`).
+- Console output is verbose and colored by default; disable with `--no-color` or `--no-emoji`.
+- Use step-by-step mode to prompt before each phase:
+
+```bash
+python wardriving.py --config config.example.yaml --interactive
+```
+
+- For full command/response detail on the console:
+
+```bash
+python wardriving.py --config config.example.yaml --console-level debug
+```
+
+- SIM PIN values are redacted in logs and console output.
+- SIM PIN can be loaded from `.env` via `SIM_PIN` (recommended to avoid committing secrets).
+- Wardriving mode writes JSONL snapshots with timestamps and a `towers` array built from registration + vendor cell info; set `duration_s` to `0` to run forever.
+- Wigle CSV export is a draft format for now and may need adjustments for cell tower uploads.
 
 ## CLI options
 
@@ -105,7 +161,18 @@ Run `python wardriving.py --help` for the full list. Key flags:
 - `--operator-scan` / `--no-operator-scan`
 - `--gps` / `--no-gps`
 - `--vendor-specific` / `--no-vendor-specific`
+- `--auto-register` / `--no-auto-register`
 - `--sim-read` / `--no-sim-read`
+- `--sim-pin` to provide a SIM PIN if required
+- `--sim-read-file` to add SIM EF reads (format: `name,file_id,length`)
+- `--clear-sim-read-files` to reset the SIM file list
 - `--extra-command` to add extra AT commands
 - `--output-json` to save full results
 - `--output-raw` to print raw command logs
+- `--duration-s`, `--interval-s` for wardriving mode
+- `--jsonl-path` to override the wardriving JSONL file
+- `--wigle-csv` to write a draft Wigle CSV
+- `--log-dir`, `--log-file`, `--log-level`, `--console-level`
+- `--no-log` to disable log files
+- `--color` / `--no-color`, `--emoji` / `--no-emoji`
+- `--interactive` / `--no-interactive`
