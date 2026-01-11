@@ -41,6 +41,9 @@ DEFAULT_CONFIG = {
         "vendor_specific": True,
         "sim_read": True,
     },
+    "sim": {
+        "pin": "",
+    },
     "sim_read": {
         "files": [
             {"name": "iccid", "file_id": "2FE2", "length": 10},
@@ -50,7 +53,20 @@ DEFAULT_CONFIG = {
     },
     "extra_commands": [],
     "output": {
-        "raw": False
+        "raw": False,
+        "json_path": ""
+    },
+    "logging": {
+        "enabled": True,
+        "dir": "logs",
+        "file": "",
+        "file_level": "debug",
+        "console_level": "info",
+    },
+    "ui": {
+        "color": True,
+        "emoji": True,
+        "interactive": False,
     },
 }
 
@@ -87,10 +103,275 @@ REG_STATUS = {
     5: "registered_roaming",
 }
 
+LEVELS = {
+    "debug": 10,
+    "info": 20,
+    "warning": 30,
+    "error": 40,
+}
+
+LEVEL_NAMES = {
+    10: "DEBUG",
+    20: "INFO",
+    30: "WARNING",
+    40: "ERROR",
+}
+
+EMOJI = {
+    "debug": "\U0001F50D",
+    "info": "\u2139",
+    "warning": "\u26A0",
+    "error": "\u274C",
+    "success": "\u2705",
+    "step": "\U0001F9ED",
+    "modem": "\U0001F4F1",
+    "sim": "\U0001F4B3",
+    "network": "\U0001F4F6",
+    "gps": "\U0001F4CD",
+    "test": "\U0001F9EA",
+    "diag": "\U0001F6E0",
+}
+
+ANSI_COLORS = {
+    "reset": "\033[0m",
+    "red": "\033[31m",
+    "green": "\033[32m",
+    "yellow": "\033[33m",
+    "blue": "\033[34m",
+    "magenta": "\033[35m",
+    "cyan": "\033[36m",
+    "gray": "\033[90m",
+    "bold": "\033[1m",
+}
+
+LEVEL_COLORS = {
+    "debug": "gray",
+    "info": "cyan",
+    "warning": "yellow",
+    "error": "red",
+}
+
+
+def command_key(cmd):
+    text = cmd.strip()
+    if text.startswith("AT+QENG="):
+        return 'AT+QENG="..."'
+    if text.startswith("AT+CPIN="):
+        return "AT+CPIN="
+    if text.startswith("AT+CRSM="):
+        return "AT+CRSM=176"
+    if "=" in text and text.endswith("?"):
+        return text
+    if text.endswith("?"):
+        return text
+    if "=" in text:
+        return text.split("=", 1)[0] + "="
+    return text
+
+
+def describe_command(cmd):
+    key = command_key(cmd.upper())
+    descriptions = {
+        "AT": ("Modem ping", "Check if the modem responds to AT."),
+        "ATE0": ("Disable echo", "Turn off command echo for cleaner responses."),
+        "AT+CMEE=2": ("Verbose errors", "Enable detailed error codes."),
+        "AT+CGMI": ("Manufacturer", "Read the modem manufacturer string."),
+        "AT+CGMM": ("Model", "Read the modem model string."),
+        "AT+CGMR": ("Revision", "Read the modem firmware revision."),
+        "AT+CGSN": ("IMEI", "Read IMEI (serial number)."),
+        "AT+GSN": ("IMEI", "Read IMEI (alternate command)."),
+        "AT+CPIN?": ("SIM PIN status", "Check whether SIM needs a PIN or is ready."),
+        "AT+CPIN=": ("SIM PIN entry", "Submit SIM PIN to unlock the SIM."),
+        "AT+CCID": ("SIM ICCID", "Read SIM card ICCID identifier."),
+        "AT+CIMI": ("SIM IMSI", "Read subscriber IMSI."),
+        "AT+CSQ": ("Signal quality", "Read RSSI and BER."),
+        "AT+CREG=2": ("Enable CREG detail", "Enable extended GSM registration info."),
+        "AT+CGREG=2": ("Enable CGREG detail", "Enable extended GPRS registration info."),
+        "AT+CEREG=2": ("Enable CEREG detail", "Enable extended EPS/LTE registration info."),
+        "AT+CREG?": ("GSM registration", "Read 2G/3G registration status."),
+        "AT+CGREG?": ("GPRS registration", "Read GPRS registration status."),
+        "AT+CEREG?": ("EPS registration", "Read LTE/NR registration status."),
+        "AT+COPS?": ("Current operator", "Read current operator and RAT."),
+        "AT+COPS=?": ("Operator scan", "Scan for nearby operators."),
+        "AT+CEER": ("Last error", "Read last extended error report."),
+        "AT+QNWINFO": ("QNWINFO", "Read RAT, band, and operator (Quectel)."),
+        'AT+QENG="..."': ("QENG", "Serving/neighbor cell info (Quectel)."),
+        "AT+QCSQ": ("QCSQ", "Extended signal quality (Quectel)."),
+        "AT+CGNSPWR?": ("GNSS power", "Read GNSS power state."),
+        "AT+CGNSINF": ("GNSS info", "Read GNSS fix and location."),
+        "AT+CGPS?": ("GPS state", "Read GPS state (varies by vendor)."),
+        "AT+CGPSINFO": ("GPS info", "Read GPS info (varies by vendor)."),
+        "AT+QGPS?": ("QGPS state", "Read Quectel GPS state."),
+        "AT+QGPSLOC?": ("QGPS location", "Read Quectel GPS location."),
+        "AT+GPSINFO": ("GPS info", "Read GPS info (varies by vendor)."),
+        "AT+CRSM=176": ("SIM file read", "Read SIM EF file by ID."),
+        "ATI": ("Modem ID", "Read modem identification info."),
+    }
+    title, purpose = descriptions.get(key, ("AT command", "Execute AT command."))
+    return {"title": title, "purpose": purpose, "key": key}
+
 
 def eprint(*args):
     print(*args, file=sys.stderr)
 
+
+def now_timestamp():
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+
+
+def normalize_level(value, default):
+    if not value:
+        return LEVELS[default]
+    key = str(value).strip().lower()
+    return LEVELS.get(key, LEVELS[default])
+
+
+class RunLogger:
+    def __init__(self, config):
+        self.config = config
+        ui_cfg = config.get("ui", {})
+        log_cfg = config.get("logging", {})
+        self.use_color = bool(ui_cfg.get("color"))
+        if self.use_color and (not sys.stdout.isatty() or os.getenv("NO_COLOR")):
+            self.use_color = False
+        self.use_emoji = bool(ui_cfg.get("emoji"))
+        self.interactive = bool(ui_cfg.get("interactive")) and sys.stdin.isatty()
+        self.console_level = normalize_level(log_cfg.get("console_level"), "info")
+        self.file_level = normalize_level(log_cfg.get("file_level"), "debug")
+        self.enabled = bool(log_cfg.get("enabled", True))
+        self.file_path = self._resolve_log_path(log_cfg)
+        self._file_handle = None
+        if self.enabled and self.file_path:
+            try:
+                dirpath = os.path.dirname(self.file_path)
+                if dirpath:
+                    os.makedirs(dirpath, exist_ok=True)
+                self._file_handle = open(self.file_path, "a", encoding="utf-8")
+            except OSError as exc:
+                eprint("Failed to open log file {}: {}".format(self.file_path, exc))
+                self._file_handle = None
+                self.enabled = False
+
+    def _resolve_log_path(self, log_cfg):
+        custom = log_cfg.get("file")
+        if custom:
+            return custom
+        directory = log_cfg.get("dir") or "."
+        stamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+        filename = "wardriving_{}.log".format(stamp)
+        return os.path.join(directory, filename)
+
+    def close(self):
+        if self._file_handle:
+            self._file_handle.close()
+            self._file_handle = None
+
+    def _emoji(self, key):
+        if not self.use_emoji:
+            return ""
+        return EMOJI.get(key, "")
+
+    def with_emoji(self, key, text):
+        emoji = self._emoji(key)
+        if emoji:
+            return "{} {}".format(emoji, text)
+        return text
+
+    def _style(self, text, color=None, bold=False):
+        if not self.use_color:
+            return text
+        codes = []
+        if bold:
+            codes.append(ANSI_COLORS["bold"])
+        if color and color in ANSI_COLORS:
+            codes.append(ANSI_COLORS[color])
+        if not codes:
+            return text
+        return "{}{}{}".format("".join(codes), text, ANSI_COLORS["reset"])
+
+    def _write_file(self, level, message):
+        if not self.enabled or not self._file_handle:
+            return
+        if level < self.file_level:
+            return
+        label = LEVEL_NAMES.get(level, "INFO")
+        self._file_handle.write("{} {} {}\n".format(now_timestamp(), label, message))
+        self._file_handle.flush()
+
+    def _write_console(self, level, message, color=None, prefix=True, bold=False):
+        if level < self.console_level:
+            return
+        out = message
+        if prefix:
+            name = LEVEL_NAMES.get(level, "INFO")
+            emoji = self._emoji(name.lower())
+            prefix_text = "[{}]".format(name)
+            if emoji:
+                prefix_text = "{} {}".format(emoji, prefix_text)
+            prefix_text = self._style(prefix_text, LEVEL_COLORS.get(name.lower()), bold=True)
+            out = "{} {}".format(prefix_text, message)
+        if color:
+            out = self._style(out, color, bold=bold)
+        print(out)
+
+    def log(self, level_name, message, color=None, prefix=True, bold=False):
+        level = normalize_level(level_name, "info")
+        self._write_file(level, message)
+        self._write_console(level, message, color=color, prefix=prefix, bold=bold)
+
+    def debug(self, message):
+        self.log("debug", message)
+
+    def info(self, message):
+        self.log("info", message)
+
+    def warning(self, message):
+        self.log("warning", message)
+
+    def error(self, message):
+        self.log("error", message)
+
+    def print_line(self, message, level_name="info", color=None, bold=False):
+        level = normalize_level(level_name, "info")
+        if message:
+            self._write_file(level, message)
+        self._write_console(level, message, color=color, prefix=False, bold=bold)
+
+    def section(self, title, emoji_key=None):
+        label = title
+        emoji = self._emoji(emoji_key) if emoji_key else ""
+        if emoji:
+            label = "{} {}".format(emoji, title)
+        self.print_line(label, level_name="info", color="magenta", bold=True)
+
+    def step(self, message):
+        if self.interactive:
+            prompt = "{} Press Enter to {}...".format(self._emoji("step"), message)
+            prompt = self._style(prompt.strip(), "blue", bold=True)
+            try:
+                input(prompt + " ")
+            except EOFError:
+                pass
+        self.info(message)
+
+    def command_block(self, title, purpose, cmd, result, summary, raw_lines):
+        self.print_line("")
+        header = "{} {}".format(self._emoji("step"), title) if self.use_emoji else title
+        self.print_line(header, color="blue", bold=True)
+        self.print_line("  Purpose: {}".format(purpose), color="gray")
+        self.print_line("  Command: {}".format(cmd), color="cyan")
+        status = "OK" if result.get("ok") else "ERROR"
+        status_color = "green" if result.get("ok") else "red"
+        self.print_line(
+            "  Status: {} ({}) elapsed={}s".format(status, result.get("error") or "ok", result.get("elapsed_s")),
+            color=status_color
+        )
+        if summary:
+            self.print_line("  TL;DR: {}".format(summary), color="yellow")
+        if raw_lines:
+            self.print_line("  Output:")
+            for line in raw_lines:
+                self.print_line("    {}".format(line), color="gray")
 
 def deep_merge(base, override):
     for key, value in override.items():
@@ -115,6 +396,38 @@ def load_yaml_config(path):
     return data
 
 
+def redact_config(config):
+    cleaned = json.loads(json.dumps(config))
+    sim_cfg = cleaned.get("sim", {})
+    if "pin" in sim_cfg and sim_cfg.get("pin"):
+        sim_cfg["pin"] = "****"
+        cleaned["sim"] = sim_cfg
+    return cleaned
+
+
+def mask_command(cmd):
+    upper = cmd.strip().upper()
+    if upper.startswith("AT+CPIN="):
+        return "AT+CPIN=****"
+    return cmd
+
+
+def parse_sim_read_file(value):
+    if not value:
+        raise ValueError("SIM file definition is empty.")
+    if "," in value:
+        parts = [part.strip() for part in value.split(",")]
+    else:
+        parts = [part.strip() for part in value.split(":")]
+    if len(parts) != 3:
+        raise ValueError("SIM file definition must be name,file_id,length.")
+    name, file_id, length_text = parts
+    length = safe_int(length_text)
+    if length is None:
+        raise ValueError("SIM file length must be an integer.")
+    return {"name": name, "file_id": file_id, "length": length}
+
+
 def resolve_config(args):
     config = json.loads(json.dumps(DEFAULT_CONFIG))
     config_path = args.config
@@ -137,6 +450,10 @@ def resolve_config(args):
         config["serial"]["init_delay_s"] = args.init_delay_s
     if args.inter_command_delay_s is not None:
         config["serial"]["inter_command_delay_s"] = args.inter_command_delay_s
+    if args.init_retries is not None:
+        config["serial"]["init_retries"] = args.init_retries
+    if args.retry_delay_s is not None:
+        config["serial"]["retry_delay_s"] = args.retry_delay_s
     if args.operator_scan and args.no_operator_scan:
         raise ValueError("Choose only one of --operator-scan or --no-operator-scan.")
     if args.operator_scan:
@@ -163,18 +480,66 @@ def resolve_config(args):
         config["features"]["sim_read"] = False
     if args.operator_scan_timeout_s is not None:
         config["timeouts"]["operator_scan_s"] = args.operator_scan_timeout_s
+    if args.sim_pin:
+        config["sim"]["pin"] = args.sim_pin
+    if args.default_timeout_s is not None:
+        config["timeouts"]["default_s"] = args.default_timeout_s
+    if args.gps_timeout_s is not None:
+        config["timeouts"]["gps_s"] = args.gps_timeout_s
+    if args.sim_read_timeout_s is not None:
+        config["timeouts"]["sim_read_s"] = args.sim_read_timeout_s
+    if args.vendor_timeout_s is not None:
+        config["timeouts"]["vendor_s"] = args.vendor_timeout_s
     if args.output_raw:
         config["output"]["raw"] = True
+    if args.output_json:
+        config["output"]["json_path"] = args.output_json
+    if args.log_dir:
+        config["logging"]["dir"] = args.log_dir
+    if args.log_file:
+        config["logging"]["file"] = args.log_file
+    if args.no_log:
+        config["logging"]["enabled"] = False
+    if args.log_level:
+        config["logging"]["file_level"] = args.log_level
+    if args.console_level:
+        config["logging"]["console_level"] = args.console_level
+    if args.color and args.no_color:
+        raise ValueError("Choose only one of --color or --no-color.")
+    if args.color:
+        config["ui"]["color"] = True
+    if args.no_color:
+        config["ui"]["color"] = False
+    if args.emoji and args.no_emoji:
+        raise ValueError("Choose only one of --emoji or --no-emoji.")
+    if args.emoji:
+        config["ui"]["emoji"] = True
+    if args.no_emoji:
+        config["ui"]["emoji"] = False
+    if args.interactive and args.no_interactive:
+        raise ValueError("Choose only one of --interactive or --no-interactive.")
+    if args.interactive:
+        config["ui"]["interactive"] = True
+    if args.no_interactive:
+        config["ui"]["interactive"] = False
     if args.extra_command:
         config["extra_commands"] = config.get("extra_commands", []) + args.extra_command
+    if args.clear_sim_read_files:
+        config["sim_read"]["files"] = []
+    if args.sim_read_file:
+        entries = []
+        for value in args.sim_read_file:
+            entries.append(parse_sim_read_file(value))
+        config["sim_read"]["files"] = config.get("sim_read", {}).get("files", []) + entries
 
     return config
 
 
 class ATClient:
-    def __init__(self, serial_port, config):
+    def __init__(self, serial_port, config, logger):
         self.ser = serial_port
         self.config = config
+        self.logger = logger
         self.command_log = []
 
     def initialize(self):
@@ -190,6 +555,7 @@ class ATClient:
                 break
             time.sleep(self.config["serial"]["retry_delay_s"])
         if ok:
+            self.logger.debug("Disabling echo and enabling verbose errors.")
             self.send("ATE0")
             self.send("AT+CMEE=2")
         return ok
@@ -197,12 +563,32 @@ class ATClient:
     def send(self, cmd, timeout_s=None, retries=0):
         attempt = 0
         last_result = None
+        masked = mask_command(cmd)
+        desc = describe_command(cmd)
         while attempt <= retries:
             attempt += 1
+            self.logger.info("AT command [{} / {}]: {} - {}".format(
+                attempt, retries + 1, masked, desc["title"]
+            ))
             last_result = self._send_once(cmd, timeout_s)
+            last_result["command"] = masked
             self.command_log.append(last_result)
+            summary = summarize_response(cmd, last_result["lines"])
+            title = "{} (attempt {}/{})".format(desc["title"], attempt, retries + 1)
+            self.logger.command_block(
+                title,
+                desc["purpose"],
+                masked,
+                last_result,
+                summary,
+                last_result["lines"],
+            )
+            for line in last_result["lines"]:
+                self.logger.debug("AT response: {}".format(line))
             if last_result["ok"]:
+                self.logger.info("AT OK: {} ({}s)".format(masked, last_result["elapsed_s"]))
                 return last_result
+            self.logger.warning("AT error: {} ({})".format(masked, last_result["error"] or "error"))
             time.sleep(self.config["serial"]["retry_delay_s"])
         return last_result
 
@@ -396,6 +782,92 @@ def parse_crsm(lines):
     return {"raw": value}
 
 
+def summarize_response(cmd, lines):
+    key = command_key(cmd.upper())
+    if key in ("AT+CGMI", "AT+CGMM", "AT+CGMR"):
+        value = extract_first_line(lines)
+        return "Value: {}".format(value or "unknown")
+    if key in ("AT+CGSN", "AT+GSN"):
+        value = extract_first_numeric(lines)
+        return "IMEI: {}".format(value or "unknown")
+    if key == "ATI":
+        if lines:
+            return "Lines: {}".format(" | ".join(lines))
+        return "No identification lines."
+    if key == "AT+CPIN?":
+        status = parse_cpin(lines)
+        return "SIM status: {}".format(status or "unknown")
+    if key == "AT+CCID":
+        value = parse_ccid(lines)
+        return "ICCID: {}".format(value or "unknown")
+    if key == "AT+CIMI":
+        value = extract_first_numeric(lines)
+        return "IMSI: {}".format(value or "unknown")
+    if key == "AT+CSQ":
+        csq = parse_csq(lines)
+        if csq:
+            return "RSSI: {} dBm: {} BER: {}".format(
+                csq.get("rssi"), csq.get("rssi_dbm"), csq.get("ber")
+            )
+        return "Signal quality not reported."
+    if key in ("AT+CREG?", "AT+CGREG?", "AT+CEREG?"):
+        prefix = key.split("+", 1)[1].split("?", 1)[0]
+        reg = parse_reg(lines, prefix)
+        if reg:
+            return "Status: {} ({}) RAT: {} LAC/TAC: {} Cell ID: {}".format(
+                reg.get("stat_text"),
+                reg.get("stat_code"),
+                reg.get("rat") or "unknown",
+                reg.get("lac_tac"),
+                reg.get("cell_id"),
+            )
+        return "Registration status unavailable."
+    if key == "AT+COPS?":
+        cops = parse_cops_current(lines)
+        if cops:
+            return "Operator: {} RAT: {}".format(
+                cops.get("operator") or "unknown",
+                ACT_RAT.get(cops.get("act")) or "unknown",
+            )
+        return "Operator not reported."
+    if key == "AT+COPS=?":
+        operators = parse_cops_scan(lines)
+        return "Operators found: {}".format(len(operators))
+    if key == "AT+CEER":
+        ceer = parse_ceer(lines)
+        return "Last error: {}".format(ceer or "unknown")
+    if key == "AT+QNWINFO":
+        qnw = parse_qnwinfo(lines)
+        if qnw:
+            return "RAT: {} Band: {} Operator: {}".format(
+                qnw.get("rat") or "unknown",
+                qnw.get("band") or "unknown",
+                qnw.get("operator") or "unknown",
+            )
+        return "QNWINFO not reported."
+    if key == "AT+CGNSINF":
+        info = parse_cgnsinf(lines)
+        if info:
+            return "Fix: {} Lat: {} Lon: {}".format(
+                info.get("fix_status"),
+                info.get("lat"),
+                info.get("lon"),
+            )
+        return "GNSS info not reported."
+    if key == "AT+CRSM=176":
+        crsm = parse_crsm(lines)
+        if crsm:
+            return "SW1/SW2: {}/{} Response: {}".format(
+                crsm.get("sw1"),
+                crsm.get("sw2"),
+                crsm.get("response") or "none",
+            )
+        return "SIM read response not reported."
+    if lines:
+        return "Response lines: {}".format(len(lines))
+    return "No response lines."
+
+
 def build_reg_entry(stat, lac, ci, act):
     entry = {
         "stat_code": stat,
@@ -530,14 +1002,55 @@ def extract_first_line(lines):
     return None
 
 
-def collect_sim(at, config):
+def ensure_sim_ready(at, config, logger):
+    pin = (config.get("sim", {}) or {}).get("pin")
+    status_before = parse_cpin(at.send("AT+CPIN?")["lines"])
+    info = {
+        "status_before": status_before,
+        "status_after": status_before,
+        "pin_configured": bool(pin),
+        "pin_attempted": False,
+        "pin_ok": None,
+        "pin_error": None,
+    }
+    if status_before in ("SIM PIN", "SIM PIN2"):
+        if pin:
+            logger.warning("SIM PIN required. Attempting unlock with configured PIN.")
+            res = at.send('AT+CPIN="{}"'.format(pin))
+            info["pin_attempted"] = True
+            info["pin_ok"] = res["ok"]
+            if not res["ok"]:
+                info["pin_error"] = res["error"]
+                logger.error("SIM PIN unlock failed: {}".format(res["error"] or "error"))
+            time.sleep(1)
+            status_after = parse_cpin(at.send("AT+CPIN?")["lines"])
+            info["status_after"] = status_after
+            if status_after == "READY":
+                logger.info("SIM PIN accepted.")
+            else:
+                logger.warning("SIM status after PIN: {}".format(status_after or "unknown"))
+        else:
+            logger.warning("SIM PIN required but no PIN configured.")
+    elif status_before == "SIM PUK":
+        logger.error("SIM PUK required; SIM is blocked.")
+    elif status_before == "READY":
+        logger.info("SIM is ready (no PIN needed).")
+    else:
+        logger.warning("SIM status: {}".format(status_before or "unknown"))
+    return info
+
+
+def collect_sim(at, config, sim_status=None, pin_info=None):
     sim = {}
-    sim["status"] = parse_cpin(at.send("AT+CPIN?")["lines"])
+    sim["status"] = sim_status or parse_cpin(at.send("AT+CPIN?")["lines"])
     sim["iccid"] = parse_ccid(at.send("AT+CCID")["lines"])
     sim["imsi"] = extract_first_numeric(at.send("AT+CIMI")["lines"])
     sim["valid"] = sim["status"] == "READY" if sim["status"] else False
-    sim["pin_required"] = sim["status"] == "SIM PIN"
+    sim["pin_required"] = sim["status"] in ("SIM PIN", "SIM PIN2")
     sim["blocked"] = sim["status"] == "SIM PUK"
+    sim["pin_configured"] = bool((config.get("sim", {}) or {}).get("pin"))
+    if pin_info:
+        sim["pin_check"] = pin_info
     sim["files"] = []
     if config["features"].get("sim_read"):
         sim["files"] = read_sim_files(at, config)
@@ -662,7 +1175,7 @@ def diagnose(results):
     return issues
 
 
-def print_summary(results, config):
+def print_summary(results, config, logger):
     info = results.get("info", {})
     sim = results.get("sim", {})
     network = results.get("network", {})
@@ -672,98 +1185,128 @@ def print_summary(results, config):
     cops = network.get("cops_current", {})
     csq = network.get("csq", {})
 
-    print("Wardriving test mode")
-    print("Port: {} baud {}".format(
+    logger.section("Wardriving test mode", "test")
+    logger.print_line("Port: {} baud {}".format(
         config["serial"]["port"],
-        config["serial"]["baudrate"])
+        config["serial"]["baudrate"]),
+        color="cyan"
     )
-    print("")
-    print("Modem info")
-    print("  Manufacturer: {}".format(info.get("manufacturer") or "unknown"))
-    print("  Model: {}".format(info.get("model") or "unknown"))
-    print("  Revision: {}".format(info.get("revision") or "unknown"))
-    print("  IMEI: {}".format(info.get("imei") or "unknown"))
+    if results.get("meta", {}).get("log_file"):
+        logger.print_line("Log file: {}".format(results["meta"]["log_file"]), color="gray")
+    logger.print_line("")
+    logger.section("Modem info", "modem")
+    logger.print_line("  Manufacturer: {}".format(info.get("manufacturer") or "unknown"))
+    logger.print_line("  Model: {}".format(info.get("model") or "unknown"))
+    logger.print_line("  Revision: {}".format(info.get("revision") or "unknown"))
+    logger.print_line("  IMEI: {}".format(info.get("imei") or "unknown"))
     if info.get("ati"):
-        print("  ATI: {}".format(" | ".join(info["ati"])))
-    print("")
-    print("SIM")
-    print("  Status: {}".format(sim.get("status") or "unknown"))
-    print("  ICCID: {}".format(sim.get("iccid") or "unknown"))
-    print("  IMSI: {}".format(sim.get("imsi") or "unknown"))
-    print("  Valid: {}".format("yes" if sim.get("valid") else "no"))
+        logger.print_line("  ATI: {}".format(" | ".join(info["ati"])))
+    logger.print_line("")
+    logger.section("SIM", "sim")
+    logger.print_line("  Status: {}".format(sim.get("status") or "unknown"))
+    logger.print_line("  ICCID: {}".format(sim.get("iccid") or "unknown"))
+    logger.print_line("  IMSI: {}".format(sim.get("imsi") or "unknown"))
+    valid = sim.get("valid")
+    if valid is True:
+        logger.print_line("  {}".format(logger.with_emoji("success", "Valid: yes")), color="green")
+    elif valid is False:
+        logger.print_line("  {}".format(logger.with_emoji("error", "Valid: no")), color="red")
+    else:
+        logger.print_line("  {}".format(logger.with_emoji("warning", "Valid: unknown")), color="yellow")
+    pin_configured = sim.get("pin_configured")
+    if pin_configured is True:
+        logger.print_line("  PIN configured: yes")
+    elif pin_configured is False:
+        logger.print_line("  PIN configured: no")
     if sim.get("pin_required"):
-        print("  PIN required: yes")
+        logger.print_line("  {}".format(logger.with_emoji("warning", "PIN required: yes")), color="yellow")
     if sim.get("blocked"):
-        print("  SIM blocked (PUK): yes")
+        logger.print_line("  {}".format(logger.with_emoji("error", "SIM blocked (PUK): yes")), color="red")
+    pin_check = sim.get("pin_check") or {}
+    if pin_check.get("pin_attempted"):
+        if pin_check.get("pin_ok") and pin_check.get("status_after") == "READY":
+            logger.print_line("  {}".format(logger.with_emoji("success", "PIN unlock: success")), color="green")
+        else:
+            status_after = pin_check.get("status_after") or "unknown"
+            logger.print_line("  {}".format(logger.with_emoji("error", "PIN unlock: failed ({})".format(status_after))), color="red")
+    elif pin_check.get("status_before") in ("SIM PIN", "SIM PIN2") and not pin_check.get("pin_configured"):
+        logger.print_line("  {}".format(logger.with_emoji("warning", "PIN not provided")), color="yellow")
     if sim.get("files"):
-        print("  SIM files:")
+        logger.print_line("  SIM files:")
         for item in sim["files"]:
             status = "ok" if item.get("ok") else "error"
             file_id = item.get("file_id")
-            print("    {} ({}): {}".format(item.get("name") or "file", file_id, status))
-    print("")
-    print("Network")
+            color = "green" if item.get("ok") else "red"
+            logger.print_line("    {} ({}): {}".format(item.get("name") or "file", file_id, status), color=color)
+    logger.print_line("")
+    logger.section("Network", "network")
     if csq:
-        print("  Signal: rssi={} dBm={} ber={}".format(
+        logger.print_line("  Signal: rssi={} dBm={} ber={}".format(
             csq.get("rssi"),
             csq.get("rssi_dbm"),
             csq.get("ber"),
         ))
     if reg:
-        print("  Registration: {} ({})".format(
+        logger.print_line("  Registration: {} ({})".format(
             reg.get("stat_text"),
             reg.get("stat_code"),
         ))
         if reg.get("rat"):
-            print("  RAT: {}".format(reg.get("rat")))
+            logger.print_line("  RAT: {}".format(reg.get("rat")))
         if reg.get("lac_tac") is not None:
-            print("  LAC/TAC: {}".format(reg.get("lac_tac")))
+            logger.print_line("  LAC/TAC: {}".format(reg.get("lac_tac")))
         if reg.get("cell_id") is not None:
-            print("  Cell ID: {}".format(reg.get("cell_id")))
+            logger.print_line("  Cell ID: {}".format(reg.get("cell_id")))
     if cops:
-        print("  Operator: {} (act {})".format(
+        logger.print_line("  Operator: {} (act {})".format(
             cops.get("operator") or "unknown",
             cops.get("act") if cops.get("act") is not None else "unknown",
         ))
     if network.get("operators_available"):
-        print("  Operators found: {}".format(len(network["operators_available"])))
+        logger.print_line("  Operators found: {}".format(len(network["operators_available"])))
     if vendor.get("qnwinfo"):
         qnw = vendor["qnwinfo"]
         if qnw.get("band"):
-            print("  Band: {}".format(qnw.get("band")))
-    print("")
-    print("GPS")
+            logger.print_line("  Band: {}".format(qnw.get("band")))
+    logger.print_line("")
+    logger.section("GPS", "gps")
     if gps.get("cgnsinf"):
         cgns = gps["cgnsinf"]
         if cgns.get("fix_status") is not None:
-            print("  CGNS fix status: {}".format(cgns.get("fix_status")))
+            logger.print_line("  CGNS fix status: {}".format(cgns.get("fix_status")))
         if cgns.get("lat") is not None and cgns.get("lon") is not None:
-            print("  Location: {}, {}".format(cgns.get("lat"), cgns.get("lon")))
+            logger.print_line("  Location: {}, {}".format(cgns.get("lat"), cgns.get("lon")))
     else:
-        print("  No GPS info detected.")
-    print("")
+        logger.print_line("  No GPS info detected.")
+    logger.print_line("")
     if results.get("diagnostics"):
-        print("Diagnostics")
+        logger.section("Diagnostics", "diag")
         for issue in results["diagnostics"]:
-            print("  - {}".format(issue))
+            logger.print_line("  - {}".format(issue), color="yellow")
 
     if config["output"].get("raw"):
-        print("")
-        print("Raw command log")
+        logger.print_line("")
+        logger.section("Raw command log", "debug")
         for entry in results["command_log"]:
-            print("  {} -> {} ({})".format(
+            status = "OK" if entry["ok"] else "ERR"
+            color = "green" if entry["ok"] else "red"
+            logger.print_line("  {} -> {} ({})".format(
                 entry["command"],
-                "OK" if entry["ok"] else "ERR",
+                status,
                 entry["error"] or "ok"
-            ))
+            ), color=color)
             for line in entry["lines"]:
-                print("    {}".format(line))
+                logger.print_line("    {}".format(line), color="gray")
 
 
-def require_dependency(module, name):
+def require_dependency(module, name, logger=None):
     if module is None:
-        eprint("Missing dependency: {}. Install with pip.".format(name))
-        sys.exit(1)
+        message = "Missing dependency: {}. Install with pip.".format(name)
+        if logger:
+            logger.error(message)
+        else:
+            eprint(message)
+        raise RuntimeError(message)
 
 
 def parse_args(argv):
@@ -776,18 +1319,38 @@ def parse_args(argv):
     parser.add_argument("--write-timeout-s", type=float, help="Serial write timeout in seconds.")
     parser.add_argument("--init-delay-s", type=float, help="Delay after opening the port.")
     parser.add_argument("--inter-command-delay-s", type=float, help="Delay between AT commands.")
+    parser.add_argument("--init-retries", type=int, help="Retries for AT init ping.")
+    parser.add_argument("--retry-delay-s", type=float, help="Delay between retries.")
     parser.add_argument("--operator-scan", action="store_true", help="Enable operator scan.")
     parser.add_argument("--no-operator-scan", action="store_true", help="Disable operator scan.")
     parser.add_argument("--operator-scan-timeout-s", type=float, help="Timeout for AT+COPS=?")
+    parser.add_argument("--default-timeout-s", type=float, help="Default timeout for AT commands.")
+    parser.add_argument("--gps-timeout-s", type=float, help="Timeout for GPS AT commands.")
+    parser.add_argument("--sim-read-timeout-s", type=float, help="Timeout for SIM file reads.")
+    parser.add_argument("--vendor-timeout-s", type=float, help="Timeout for vendor-specific commands.")
     parser.add_argument("--gps", action="store_true", help="Enable GPS queries.")
     parser.add_argument("--no-gps", action="store_true", help="Disable GPS queries.")
     parser.add_argument("--vendor-specific", action="store_true", help="Enable vendor-specific commands.")
     parser.add_argument("--no-vendor-specific", action="store_true", help="Disable vendor-specific commands.")
     parser.add_argument("--sim-read", action="store_true", help="Enable SIM file reads via AT+CRSM.")
     parser.add_argument("--no-sim-read", action="store_true", help="Disable SIM file reads.")
+    parser.add_argument("--sim-pin", help="SIM PIN (if required).")
+    parser.add_argument("--sim-read-file", action="append", help="SIM file to read: name,file_id,length")
+    parser.add_argument("--clear-sim-read-files", action="store_true", help="Clear SIM read file list.")
     parser.add_argument("--extra-command", action="append", help="Extra AT command to run.")
     parser.add_argument("--output-json", help="Write full results to JSON file.")
     parser.add_argument("--output-raw", action="store_true", help="Print raw command log.")
+    parser.add_argument("--log-dir", help="Directory for log files.")
+    parser.add_argument("--log-file", help="Explicit log file path.")
+    parser.add_argument("--log-level", choices=LEVELS.keys(), help="Log level for file output.")
+    parser.add_argument("--console-level", choices=LEVELS.keys(), help="Log level for console output.")
+    parser.add_argument("--no-log", action="store_true", help="Disable log file creation.")
+    parser.add_argument("--color", action="store_true", help="Force colored output.")
+    parser.add_argument("--no-color", action="store_true", help="Disable colored output.")
+    parser.add_argument("--emoji", action="store_true", help="Force emoji output.")
+    parser.add_argument("--no-emoji", action="store_true", help="Disable emoji output.")
+    parser.add_argument("--interactive", action="store_true", help="Prompt before each step.")
+    parser.add_argument("--no-interactive", action="store_true", help="Disable step prompts.")
     return parser.parse_args(argv)
 
 
@@ -798,62 +1361,95 @@ def main(argv):
     except Exception as exc:
         eprint("Config error: {}".format(exc))
         return 2
-
-    require_dependency(serial, "pyserial")
-    if args.config or os.path.exists("config.yaml"):
-        require_dependency(yaml, "pyyaml")
-
+    logger = RunLogger(config)
+    exit_code = 0
     try:
-        ser = serial.Serial(
-            port=config["serial"]["port"],
-            baudrate=config["serial"]["baudrate"],
-            timeout=config["serial"]["timeout_s"],
-            write_timeout=config["serial"]["write_timeout_s"],
-        )
-    except Exception as exc:
-        eprint("Failed to open serial port: {}".format(exc))
-        return 2
-
-    results = {
-        "meta": {
-            "mode": config["mode"],
-            "port": config["serial"]["port"],
-            "baudrate": config["serial"]["baudrate"],
-        },
-        "info": {},
-        "sim": {},
-        "network": {},
-        "vendor": {},
-        "gps": {},
-        "errors": {},
-        "diagnostics": [],
-        "command_log": [],
-    }
-
-    with ser:
-        at = ATClient(ser, config)
-        results["meta"]["at_ok"] = at.initialize()
-        results["info"] = collect_info(at)
-        results["sim"] = collect_sim(at, config)
-        results["network"] = collect_network(at, config)
-        results["vendor"] = collect_vendor_info(at, config)
-        results["gps"] = collect_gps(at, config)
-        results["errors"] = collect_errors(at)
-        results["extra"] = run_extra_commands(at, config)
-        results["command_log"] = at.command_log
-
-    results["diagnostics"] = diagnose(results)
-    print_summary(results, config)
-
-    if args.output_json:
+        logger.info("Starting wardriving test mode.")
+        config_path = args.config or ("config.yaml" if os.path.exists("config.yaml") else "")
+        if config_path:
+            logger.info("Config file: {}".format(config_path))
+        logger.debug("Effective config: {}".format(json.dumps(redact_config(config), indent=2)))
+        if logger.file_path and logger.enabled:
+            logger.info("Log file: {}".format(logger.file_path))
         try:
-            with open(args.output_json, "w", encoding="utf-8") as handle:
-                json.dump(results, handle, indent=2)
-        except Exception as exc:
-            eprint("Failed to write JSON output: {}".format(exc))
+            require_dependency(serial, "pyserial", logger)
+            if args.config or os.path.exists("config.yaml"):
+                require_dependency(yaml, "pyyaml", logger)
+        except RuntimeError:
             return 2
 
-    return 0
+        logger.step("Open serial port {}".format(config["serial"]["port"]))
+        try:
+            ser = serial.Serial(
+                port=config["serial"]["port"],
+                baudrate=config["serial"]["baudrate"],
+                timeout=config["serial"]["timeout_s"],
+                write_timeout=config["serial"]["write_timeout_s"],
+            )
+        except Exception as exc:
+            logger.error("Failed to open serial port: {}".format(exc))
+            return 2
+
+        results = {
+            "meta": {
+                "mode": config["mode"],
+                "port": config["serial"]["port"],
+                "baudrate": config["serial"]["baudrate"],
+                "log_file": logger.file_path if logger.enabled else "",
+            },
+            "info": {},
+            "sim": {},
+            "network": {},
+            "vendor": {},
+            "gps": {},
+            "errors": {},
+            "diagnostics": [],
+            "command_log": [],
+        }
+
+        with ser:
+            at = ATClient(ser, config, logger)
+            logger.step("Initialize modem")
+            results["meta"]["at_ok"] = at.initialize()
+            if not results["meta"]["at_ok"]:
+                logger.warning("No AT response during initialization.")
+            logger.step("Collect modem info")
+            results["info"] = collect_info(at)
+            logger.step("Check SIM PIN state")
+            pin_info = ensure_sim_ready(at, config, logger)
+            logger.step("Collect SIM info")
+            results["sim"] = collect_sim(at, config, sim_status=pin_info.get("status_after"), pin_info=pin_info)
+            logger.step("Collect network info")
+            results["network"] = collect_network(at, config)
+            if config.get("features", {}).get("vendor_specific"):
+                logger.step("Collect vendor-specific info")
+            results["vendor"] = collect_vendor_info(at, config)
+            if config.get("features", {}).get("gps"):
+                logger.step("Collect GPS info")
+            results["gps"] = collect_gps(at, config)
+            logger.step("Collect error status")
+            results["errors"] = collect_errors(at)
+            if config.get("extra_commands"):
+                logger.step("Run extra commands")
+            results["extra"] = run_extra_commands(at, config)
+            results["command_log"] = at.command_log
+
+        results["diagnostics"] = diagnose(results)
+        print_summary(results, config, logger)
+
+        json_path = config.get("output", {}).get("json_path")
+        if json_path:
+            try:
+                with open(json_path, "w", encoding="utf-8") as handle:
+                    json.dump(results, handle, indent=2)
+                logger.info("Wrote JSON output to {}".format(json_path))
+            except Exception as exc:
+                logger.error("Failed to write JSON output: {}".format(exc))
+                return 2
+    finally:
+        logger.close()
+
+    return exit_code
 
 
 if __name__ == "__main__":
