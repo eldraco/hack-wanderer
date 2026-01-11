@@ -74,6 +74,9 @@ DEFAULT_CONFIG = {
         "raw": False,
         "json_path": ""
     },
+    "status_page": {
+        "json_path": "status/status.json",
+    },
     "logging": {
         "enabled": True,
         "dir": "logs",
@@ -1687,6 +1690,28 @@ def write_jsonl(handle, obj):
     handle.flush()
 
 
+def write_status_snapshot(path, snapshot, logger):
+    if not path:
+        return
+    try:
+        directory = os.path.dirname(path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        payload = {
+            "timestamp_utc": snapshot.get("timestamp_utc"),
+            "location": snapshot.get("location"),
+            "network": snapshot.get("network"),
+            "towers": snapshot.get("towers"),
+            "gps_lte_modem": snapshot.get("gps"),
+            "gps_device": snapshot.get("gps_device"),
+            "sim_status": snapshot.get("sim_status"),
+        }
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=True, indent=2)
+    except Exception as exc:
+        logger.warning("Failed to write status snapshot to {}: {}".format(path, exc))
+
+
 def write_wigle_header(handle):
     handle.write("WigleWifi-1.6,appRelease=hack-wanderer,model=cellular,release=1,device=modem,display=cellular,board=unknown,brand=unknown\n")
     handle.write("MAC,SSID,AuthMode,FirstSeen,Channel,RSSI,CurrentLatitude,CurrentLongitude,AltitudeMeters,AccuracyMeters,Type\n")
@@ -2094,6 +2119,8 @@ def main(argv):
                             snapshot = build_snapshot(at, config, logger)
                             snapshot["sim_status"] = pin_info.get("status_after")
                             write_jsonl(jsonl_handle, snapshot)
+                            status_path = (config.get("status_page") or {}).get("json_path") or ""
+                            write_status_snapshot(status_path, snapshot, logger)
                             if wigle_handle:
                                 for row in snapshot_to_wigle_rows(snapshot):
                                     wigle_handle.write(",".join([
