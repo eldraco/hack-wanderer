@@ -17,10 +17,22 @@ timeouts:
   vendor_s: 5.0
 
 features:
-  operator_scan: true
+  operator_scan: false
   gps: true
   vendor_specific: true
   sim_read: true
+  auto_register: true
+
+sim:
+  pin: ""
+  pin_env_key: SIM_PIN
+  env_file: .env
+
+wardrive:
+  interval_s: 5.0
+  duration_s: 60.0
+  jsonl_path: wardrive.jsonl
+  wigle_csv_path: ""
 
 sim_read:
   files:
@@ -37,3 +49,16 @@ sim_read:
 extra_commands: []
 output:
   raw: false
+  json_path: ""
+
+logging:
+  enabled: true
+  dir: logs
+  file: ""
+  file_level: debug
+  console_level: info
+
+ui:
+  color: true
+  emoji: true
+  interactive: false
