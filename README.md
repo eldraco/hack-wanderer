@@ -73,6 +73,14 @@ features:
   sim_read: true
   auto_register: true
 
+external_gps:
+  enabled: true
+  port: /dev/ttyACM0
+  baudrate: 9600
+  timeout_s: 0.5
+  read_duration_s: 2.0
+  max_lines: 200
+
 sim:
   pin: ""
   pin_env_key: SIM_PIN
@@ -113,6 +121,8 @@ ui:
   emoji: true
   interactive: false
 ```
+
+An external NMEA GPS receiver (defaults to `/dev/ttyACM0`) is sampled alongside the modem's LTE/GNSS. Configure it under `external_gps` or via `--gps-device-*` flags, or disable with `--no-gps-device`.
 
 ## What the script checks
 
@@ -161,6 +171,7 @@ Run `python hack-wanderer.py --help` for the full list. Key flags:
 - `--port`, `--baudrate`
 - `--operator-scan` / `--no-operator-scan`
 - `--gps` / `--no-gps`
+- `--gps-device` / `--no-gps-device`, `--gps-device-port`, `--gps-device-baudrate`, `--gps-device-timeout-s`, `--gps-device-read-duration-s`
 - `--vendor-specific` / `--no-vendor-specific`
 - `--auto-register` / `--no-auto-register`
 - `--sim-read` / `--no-sim-read`
@@ -177,3 +188,15 @@ Run `python hack-wanderer.py --help` for the full list. Key flags:
 - `--no-log` to disable log files
 - `--color` / `--no-color`, `--emoji` / `--no-emoji`
 - `--interactive` / `--no-interactive`
+
+## Autostart on boot (systemd)
+
+1. Adjust `config.yaml` (or CLI flags in the service file) so `mode` is `wardrive` and `duration_s` is `0` (run forever).
+2. Copy the unit file into place and enable it:
+   ```bash
+   sudo cp /home/pi/code/hack-wanderer/hack-wanderer.service /etc/systemd/system/hack-wanderer.service
+   sudo systemctl daemon-reload
+   sudo systemctl enable hack-wanderer.service
+   sudo systemctl start hack-wanderer.service
+   ```
+3. Logs go to `logs/service.log` and `logs/service.err` (plus the normal run logs). Check status with `sudo systemctl status hack-wanderer.service`.
