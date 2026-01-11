@@ -131,6 +131,7 @@ ui:
 - SIM file reads are limited to a small list of common EF files. Full SIM exploration requires APDU workflows (e.g., `AT+CSIM`), which are not implemented yet.
 - GPS commands are queried only (no power-on commands are issued).
 - If you see `SIM PIN` or `SIM PUK`, the SIM is locked or blocked. The tool only reports it.
+- Raspberry Pi + SIM7600: to expose the USB Ethernet interface and AT command ports, set the USB composition once with `AT+CUSBPIDSWITCH=9011,1,1` (run via UART or an existing AT port, then reboot the modem). This switches the modem into a composite mode that presents ECM/NCM networking plus AT serial devices.
 
 ## Logging and verbosity
 
