@@ -1,0 +1,17 @@
+[Unit]
+Description=Hack-Wanderer local status display
+After=graphical.target
+Wants=hack-wanderer.service
+
+[Service]
+Type=simple
+User=pi
+Environment=DISPLAY=:0
+Environment=XAUTHORITY=/home/pi/.Xauthority
+WorkingDirectory=/home/pi/code/hack-wanderer/status
+ExecStart=/usr/bin/chromium-browser --kiosk --disable-session-crashed-bubble --disable-infobars --noerrdialogs --allow-file-access-from-files http://127.0.0.1:8800/
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=graphical.target
