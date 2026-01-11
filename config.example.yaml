@@ -1,0 +1,39 @@
+mode: test
+serial:
+  port: /dev/cu.SLAB_USBtoUART
+  baudrate: 115200
+  timeout_s: 1.0
+  write_timeout_s: 1.0
+  init_delay_s: 0.5
+  inter_command_delay_s: 0.1
+  init_retries: 3
+  retry_delay_s: 0.5
+
+timeouts:
+  default_s: 4.0
+  operator_scan_s: 120.0
+  gps_s: 6.0
+  sim_read_s: 4.0
+  vendor_s: 5.0
+
+features:
+  operator_scan: true
+  gps: true
+  vendor_specific: true
+  sim_read: true
+
+sim_read:
+  files:
+    - name: iccid
+      file_id: "2FE2"
+      length: 10
+    - name: spn
+      file_id: "6F46"
+      length: 17
+    - name: ad
+      file_id: "6FAD"
+      length: 4
+
+extra_commands: []
+output:
+  raw: false
