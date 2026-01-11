@@ -36,7 +36,7 @@ DEFAULT_CONFIG = {
         "vendor_s": 5.0,
     },
     "features": {
-        "operator_scan": True,
+        "operator_scan": False,
         "gps": True,
         "vendor_specific": True,
         "sim_read": True,
@@ -834,6 +834,101 @@ def parse_crsm(lines):
     return {"raw": value}
 
 
+def parse_qeng_servingcell(lines):
+    towers = []
+    for line in lines:
+        if not line.startswith('+QENG: "servingcell"'):
+            continue
+        payload = line.split(":", 1)[1].strip()
+        parts = split_fields(payload)
+        if len(parts) < 6:
+            continue
+        # Expected patterns vary; parse best-effort for LTE/NR and GSM/UMTS.
+        mode = strip_quotes(parts[1]) if len(parts) > 1 else None
+        rat = strip_quotes(parts[2]) if len(parts) > 2 else None
+        entry = {
+            "source": "qeng_servingcell",
+            "mode": mode,
+            "rat": rat,
+            "raw": line,
+        }
+        # Common LTE format: mode, rat, fdd/tdd, mcc, mnc, cellid, pci, earfcn, band, bw, rsrp, rsrq, rssi, sinr
+        if rat in ("LTE", "CAT-M1", "CAT-NB1", "NB-IOT", "NR5G"):
+            entry.update({
+                "duplex": strip_quotes(parts[3]) if len(parts) > 3 else None,
+                "mcc": safe_int(parts[4]) if len(parts) > 4 else None,
+                "mnc": safe_int(parts[5]) if len(parts) > 5 else None,
+                "cell_id": parse_hex_or_int(parts[6]) if len(parts) > 6 else None,
+                "pci": safe_int(parts[7]) if len(parts) > 7 else None,
+                "earfcn": safe_int(parts[8]) if len(parts) > 8 else None,
+                "band": strip_quotes(parts[9]) if len(parts) > 9 else None,
+                "bandwidth": strip_quotes(parts[10]) if len(parts) > 10 else None,
+                "rsrp": safe_int(parts[11]) if len(parts) > 11 else None,
+                "rsrq": safe_int(parts[12]) if len(parts) > 12 else None,
+                "rssi": safe_int(parts[13]) if len(parts) > 13 else None,
+                "sinr": safe_int(parts[14]) if len(parts) > 14 else None,
+            })
+        else:
+            # Fallback: just capture mcc/mnc/cell if present.
+            entry.update({
+                "mcc": safe_int(parts[3]) if len(parts) > 3 else None,
+                "mnc": safe_int(parts[4]) if len(parts) > 4 else None,
+                "cell_id": parse_hex_or_int(parts[5]) if len(parts) > 5 else None,
+            })
+        towers.append(entry)
+    return towers
+
+
+def parse_qeng_neighborcell(lines):
+    towers = []
+    for line in lines:
+        if not line.startswith('+QENG: "neighbourcell'):
+            continue
+        payload = line.split(":", 1)[1].strip()
+        parts = split_fields(payload)
+        if len(parts) < 3:
+            continue
+        category = strip_quotes(parts[0]) if parts else None
+        rat = strip_quotes(parts[1]) if len(parts) > 1 else None
+        entry = {
+            "source": "qeng_neighborcell",
+            "category": category,
+            "rat": rat,
+            "raw": line,
+        }
+        # LTE neighbor: rat, mcc, mnc, earfcn, pci, rsrq, rsrp, rssi, sinr
+        entry.update({
+            "mcc": safe_int(parts[2]) if len(parts) > 2 else None,
+            "mnc": safe_int(parts[3]) if len(parts) > 3 else None,
+            "earfcn": safe_int(parts[4]) if len(parts) > 4 else None,
+            "pci": safe_int(parts[5]) if len(parts) > 5 else None,
+            "rsrq": safe_int(parts[6]) if len(parts) > 6 else None,
+            "rsrp": safe_int(parts[7]) if len(parts) > 7 else None,
+            "rssi": safe_int(parts[8]) if len(parts) > 8 else None,
+            "sinr": safe_int(parts[9]) if len(parts) > 9 else None,
+        })
+        towers.append(entry)
+    return towers
+
+
+def build_towers_snapshot(network, vendor):
+    towers = []
+    reg = best_registration(network)
+    if reg:
+        towers.append({
+            "source": "registration",
+            "rat": reg.get("rat"),
+            "cell_id": reg.get("cell_id"),
+            "tac_lac": reg.get("lac_tac"),
+            "stat": reg.get("stat_text"),
+        })
+    qeng_serving = parse_qeng_servingcell(vendor.get("qeng_servingcell", []))
+    qeng_neighbor = parse_qeng_neighborcell(vendor.get("qeng_neighborcell", []))
+    towers.extend(qeng_serving)
+    towers.extend(qeng_neighbor)
+    return towers
+
+
 def summarize_response(cmd, lines):
     key = command_key(cmd.upper())
     if key in ("AT+CGMI", "AT+CGMM", "AT+CGMR"):
@@ -1199,11 +1294,14 @@ def run_extra_commands(at, config):
 
 
 def build_snapshot(at, config):
+    network = collect_network(at, config)
+    vendor = collect_vendor_info(at, config)
     snapshot = {
         "timestamp_utc": iso_timestamp(),
-        "network": collect_network(at, config),
-        "vendor": collect_vendor_info(at, config),
+        "network": network,
+        "vendor": vendor,
         "gps": collect_gps(at, config),
+        "towers": build_towers_snapshot(network, vendor),
     }
     return snapshot
 
