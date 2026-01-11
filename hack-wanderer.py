@@ -45,7 +45,7 @@ DEFAULT_CONFIG = {
     "wardrive": {
         "interval_s": 5.0,
         "duration_s": 60.0,
-        "jsonl_path": "wardrive.jsonl",
+        "jsonl_path": "hack-wanderer.jsonl",
         "wigle_csv_path": "",
     },
     "sim": {
@@ -268,7 +268,7 @@ class RunLogger:
             return custom
         directory = log_cfg.get("dir") or "."
         stamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
-        filename = "wardriving_{}.log".format(stamp)
+        filename = "hack-wanderer_{}.log".format(stamp)
         return os.path.join(directory, filename)
 
     def close(self):
@@ -1312,7 +1312,7 @@ def write_jsonl(handle, obj):
 
 
 def write_wigle_header(handle):
-    handle.write("WigleWifi-1.6,appRelease=wardriving,model=cellular,release=1,device=modem,display=cellular,board=unknown,brand=unknown\n")
+    handle.write("WigleWifi-1.6,appRelease=hack-wanderer,model=cellular,release=1,device=modem,display=cellular,board=unknown,brand=unknown\n")
     handle.write("MAC,SSID,AuthMode,FirstSeen,Channel,RSSI,CurrentLatitude,CurrentLongitude,AltitudeMeters,AccuracyMeters,Type\n")
     handle.flush()
 
@@ -1392,7 +1392,7 @@ def print_summary(results, config, logger):
     cops = network.get("cops_current", {})
     csq = network.get("csq", {})
 
-    logger.section("Wardriving test mode", "test")
+    logger.section("Hack-Wanderer test mode", "test")
     logger.print_line("Port: {} baud {}".format(
         config["serial"]["port"],
         config["serial"]["baudrate"]),
@@ -1517,7 +1517,7 @@ def require_dependency(module, name, logger=None):
 
 
 def parse_args(argv):
-    parser = argparse.ArgumentParser(description="Cellular wardriving test and diagnostics tool.")
+    parser = argparse.ArgumentParser(description="Hack-Wanderer cellular diagnostics and wardriving tool.")
     parser.add_argument("--config", help="Path to YAML config file.")
     parser.add_argument("--mode", choices=["test", "wardrive"], help="Mode to run.")
     parser.add_argument("--port", help="Serial port (e.g. /dev/cu.SLAB_USBtoUART).")
@@ -1577,7 +1577,7 @@ def main(argv):
     logger = RunLogger(config)
     exit_code = 0
     try:
-        logger.info("Starting wardriving test mode.")
+        logger.info("Starting hack-wanderer {}".format(config["mode"]))
         config_path = args.config or ("config.yaml" if os.path.exists("config.yaml") else "")
         env_file = config.get("sim", {}).get("env_file")
         if config_path:
