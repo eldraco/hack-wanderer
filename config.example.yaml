@@ -59,6 +59,9 @@ output:
   raw: false
   json_path: ""
 
+status_page:
+  json_path: status/status.json
+
 logging:
   enabled: true
   dir: logs
