@@ -1,5 +1,5 @@
 __pycache__/
 .env
 logs/
-wardrive.jsonl
 venv
+*.jsonl
