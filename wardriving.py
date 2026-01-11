@@ -40,9 +40,18 @@ DEFAULT_CONFIG = {
         "gps": True,
         "vendor_specific": True,
         "sim_read": True,
+        "auto_register": True,
+    },
+    "wardrive": {
+        "interval_s": 5.0,
+        "duration_s": 60.0,
+        "jsonl_path": "wardrive.jsonl",
+        "wigle_csv_path": "",
     },
     "sim": {
         "pin": "",
+        "pin_env_key": "SIM_PIN",
+        "env_file": ".env",
     },
     "sim_read": {
         "files": [
@@ -192,6 +201,7 @@ def describe_command(cmd):
         "AT+CGREG?": ("GPRS registration", "Read GPRS registration status."),
         "AT+CEREG?": ("EPS registration", "Read LTE/NR registration status."),
         "AT+COPS?": ("Current operator", "Read current operator and RAT."),
+        "AT+COPS=0": ("Auto registration", "Register automatically to available operator."),
         "AT+COPS=?": ("Operator scan", "Scan for nearby operators."),
         "AT+CEER": ("Last error", "Read last extended error report."),
         "AT+QNWINFO": ("QNWINFO", "Read RAT, band, and operator (Quectel)."),
@@ -396,6 +406,24 @@ def load_yaml_config(path):
     return data
 
 
+def load_env_file(path):
+    if not path or not os.path.exists(path):
+        return {}
+    data = {}
+    with open(path, "r", encoding="utf-8") as handle:
+        for line in handle:
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            if "=" not in stripped:
+                continue
+            key, value = stripped.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            data[key] = value
+    return data
+
+
 def redact_config(config):
     cleaned = json.loads(json.dumps(config))
     sim_cfg = cleaned.get("sim", {})
@@ -410,6 +438,10 @@ def mask_command(cmd):
     if upper.startswith("AT+CPIN="):
         return "AT+CPIN=****"
     return cmd
+
+
+def iso_timestamp():
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
 def parse_sim_read_file(value):
@@ -435,6 +467,12 @@ def resolve_config(args):
         config_path = "config.yaml"
     if config_path:
         config = deep_merge(config, load_yaml_config(config_path))
+
+    env_file = config.get("sim", {}).get("env_file")
+    env_values = load_env_file(env_file) if env_file else {}
+    env_key = config.get("sim", {}).get("pin_env_key", "SIM_PIN")
+    if env_key in env_values and env_values.get(env_key):
+        config["sim"]["pin"] = env_values[env_key]
 
     if args.mode:
         config["mode"] = args.mode
@@ -472,6 +510,12 @@ def resolve_config(args):
         config["features"]["vendor_specific"] = True
     if args.no_vendor_specific:
         config["features"]["vendor_specific"] = False
+    if args.auto_register and args.no_auto_register:
+        raise ValueError("Choose only one of --auto-register or --no-auto-register.")
+    if args.auto_register:
+        config["features"]["auto_register"] = True
+    if args.no_auto_register:
+        config["features"]["auto_register"] = False
     if args.sim_read and args.no_sim_read:
         raise ValueError("Choose only one of --sim-read or --no-sim-read.")
     if args.sim_read:
@@ -531,6 +575,14 @@ def resolve_config(args):
         for value in args.sim_read_file:
             entries.append(parse_sim_read_file(value))
         config["sim_read"]["files"] = config.get("sim_read", {}).get("files", []) + entries
+    if args.duration_s is not None:
+        config["wardrive"]["duration_s"] = args.duration_s
+    if args.interval_s is not None:
+        config["wardrive"]["interval_s"] = args.interval_s
+    if args.jsonl_path:
+        config["wardrive"]["jsonl_path"] = args.jsonl_path
+    if args.wigle_csv:
+        config["wardrive"]["wigle_csv_path"] = args.wigle_csv
 
     return config
 
@@ -1086,6 +1138,9 @@ def collect_network(at, config):
     at.send("AT+CGREG=2")
     at.send("AT+CEREG=2")
 
+    if config["features"].get("auto_register"):
+        at.send("AT+COPS=0", timeout_s=config["timeouts"]["operator_scan_s"])
+
     network["csq"] = parse_csq(at.send("AT+CSQ")["lines"])
     network["creg"] = parse_reg(at.send("AT+CREG?")["lines"], "CREG")
     network["cgreg"] = parse_reg(at.send("AT+CGREG?")["lines"], "CGREG")
@@ -1141,6 +1196,60 @@ def run_extra_commands(at, config):
     for cmd in config.get("extra_commands", []):
         extra_results.append(at.send(cmd))
     return extra_results
+
+
+def build_snapshot(at, config):
+    snapshot = {
+        "timestamp_utc": iso_timestamp(),
+        "network": collect_network(at, config),
+        "vendor": collect_vendor_info(at, config),
+        "gps": collect_gps(at, config),
+    }
+    return snapshot
+
+
+def write_jsonl(handle, obj):
+    handle.write(json.dumps(obj, ensure_ascii=True) + "\n")
+    handle.flush()
+
+
+def write_wigle_header(handle):
+    handle.write("WigleWifi-1.6,appRelease=wardriving,model=cellular,release=1,device=modem,display=cellular,board=unknown,brand=unknown\n")
+    handle.write("MAC,SSID,AuthMode,FirstSeen,Channel,RSSI,CurrentLatitude,CurrentLongitude,AltitudeMeters,AccuracyMeters,Type\n")
+    handle.flush()
+
+
+def snapshot_to_wigle_rows(snapshot):
+    rows = []
+    gps = snapshot.get("gps", {}).get("cgnsinf", {})
+    lat = gps.get("lat")
+    lon = gps.get("lon")
+    alt = gps.get("alt_m")
+    if lat is None or lon is None:
+        return rows
+    network = snapshot.get("network", {})
+    csq = network.get("csq", {})
+    reg = best_registration(network)
+    operator = (network.get("cops_current") or {}).get("operator") or "unknown"
+    cell_id = reg.get("cell_id") if reg else None
+    mac = "CELL-{}".format(cell_id) if cell_id is not None else "CELL-UNKNOWN"
+    ssid = "CELL-{}".format(operator)
+    rssi = csq.get("rssi_dbm") if csq else None
+    row = {
+        "MAC": mac,
+        "SSID": ssid,
+        "AuthMode": "CELL",
+        "FirstSeen": snapshot.get("timestamp_utc"),
+        "Channel": "",
+        "RSSI": rssi if rssi is not None else "",
+        "CurrentLatitude": lat,
+        "CurrentLongitude": lon,
+        "AltitudeMeters": alt if alt is not None else "",
+        "AccuracyMeters": "",
+        "Type": "CELL",
+    }
+    rows.append(row)
+    return rows
 
 
 def best_registration(network):
@@ -1312,7 +1421,7 @@ def require_dependency(module, name, logger=None):
 def parse_args(argv):
     parser = argparse.ArgumentParser(description="Cellular wardriving test and diagnostics tool.")
     parser.add_argument("--config", help="Path to YAML config file.")
-    parser.add_argument("--mode", choices=["test"], help="Mode to run. Only 'test' is implemented.")
+    parser.add_argument("--mode", choices=["test", "wardrive"], help="Mode to run.")
     parser.add_argument("--port", help="Serial port (e.g. /dev/cu.SLAB_USBtoUART).")
     parser.add_argument("--baudrate", type=int, help="Serial baudrate.")
     parser.add_argument("--timeout-s", type=float, help="Serial read timeout in seconds.")
@@ -1332,6 +1441,8 @@ def parse_args(argv):
     parser.add_argument("--no-gps", action="store_true", help="Disable GPS queries.")
     parser.add_argument("--vendor-specific", action="store_true", help="Enable vendor-specific commands.")
     parser.add_argument("--no-vendor-specific", action="store_true", help="Disable vendor-specific commands.")
+    parser.add_argument("--auto-register", action="store_true", help="Enable automatic network registration.")
+    parser.add_argument("--no-auto-register", action="store_true", help="Disable automatic network registration.")
     parser.add_argument("--sim-read", action="store_true", help="Enable SIM file reads via AT+CRSM.")
     parser.add_argument("--no-sim-read", action="store_true", help="Disable SIM file reads.")
     parser.add_argument("--sim-pin", help="SIM PIN (if required).")
@@ -1340,6 +1451,10 @@ def parse_args(argv):
     parser.add_argument("--extra-command", action="append", help="Extra AT command to run.")
     parser.add_argument("--output-json", help="Write full results to JSON file.")
     parser.add_argument("--output-raw", action="store_true", help="Print raw command log.")
+    parser.add_argument("--duration-s", type=float, help="Wardrive duration in seconds (0 = forever).")
+    parser.add_argument("--interval-s", type=float, help="Wardrive sampling interval in seconds.")
+    parser.add_argument("--jsonl-path", help="Wardrive JSONL output path.")
+    parser.add_argument("--wigle-csv", help="Wigle CSV output path (draft).")
     parser.add_argument("--log-dir", help="Directory for log files.")
     parser.add_argument("--log-file", help="Explicit log file path.")
     parser.add_argument("--log-level", choices=LEVELS.keys(), help="Log level for file output.")
@@ -1366,8 +1481,11 @@ def main(argv):
     try:
         logger.info("Starting wardriving test mode.")
         config_path = args.config or ("config.yaml" if os.path.exists("config.yaml") else "")
+        env_file = config.get("sim", {}).get("env_file")
         if config_path:
             logger.info("Config file: {}".format(config_path))
+        if env_file:
+            logger.info("Env file: {}".format(env_file))
         logger.debug("Effective config: {}".format(json.dumps(redact_config(config), indent=2)))
         if logger.file_path and logger.enabled:
             logger.info("Log file: {}".format(logger.file_path))
@@ -1417,25 +1535,75 @@ def main(argv):
             results["info"] = collect_info(at)
             logger.step("Check SIM PIN state")
             pin_info = ensure_sim_ready(at, config, logger)
-            logger.step("Collect SIM info")
-            results["sim"] = collect_sim(at, config, sim_status=pin_info.get("status_after"), pin_info=pin_info)
-            logger.step("Collect network info")
-            results["network"] = collect_network(at, config)
-            if config.get("features", {}).get("vendor_specific"):
-                logger.step("Collect vendor-specific info")
-            results["vendor"] = collect_vendor_info(at, config)
-            if config.get("features", {}).get("gps"):
-                logger.step("Collect GPS info")
-            results["gps"] = collect_gps(at, config)
-            logger.step("Collect error status")
-            results["errors"] = collect_errors(at)
-            if config.get("extra_commands"):
-                logger.step("Run extra commands")
-            results["extra"] = run_extra_commands(at, config)
-            results["command_log"] = at.command_log
+            if config["mode"] == "test":
+                logger.step("Collect SIM info")
+                results["sim"] = collect_sim(at, config, sim_status=pin_info.get("status_after"), pin_info=pin_info)
+                logger.step("Collect network info")
+                results["network"] = collect_network(at, config)
+                if config.get("features", {}).get("vendor_specific"):
+                    logger.step("Collect vendor-specific info")
+                results["vendor"] = collect_vendor_info(at, config)
+                if config.get("features", {}).get("gps"):
+                    logger.step("Collect GPS info")
+                results["gps"] = collect_gps(at, config)
+                logger.step("Collect error status")
+                results["errors"] = collect_errors(at)
+                if config.get("extra_commands"):
+                    logger.step("Run extra commands")
+                results["extra"] = run_extra_commands(at, config)
+                results["command_log"] = at.command_log
+            else:
+                duration_s = config.get("wardrive", {}).get("duration_s", 0)
+                interval_s = config.get("wardrive", {}).get("interval_s", 5.0)
+                jsonl_path = config.get("wardrive", {}).get("jsonl_path") or "wardrive.jsonl"
+                wigle_path = config.get("wardrive", {}).get("wigle_csv_path") or ""
+                if duration_s and duration_s < 0:
+                    logger.warning("Negative duration ignored; running forever.")
+                    duration_s = 0
+                end_time = time.monotonic() + duration_s if duration_s else None
+                logger.step("Start wardriving loop")
+                logger.info("Wardrive JSONL: {}".format(jsonl_path))
+                wigle_handle = None
+                if wigle_path:
+                    logger.info("Wigle CSV (draft): {}".format(wigle_path))
+                with open(jsonl_path, "a", encoding="utf-8") as jsonl_handle:
+                    if wigle_path:
+                        wigle_handle = open(wigle_path, "a", encoding="utf-8")
+                        if wigle_handle.tell() == 0:
+                            write_wigle_header(wigle_handle)
+                    try:
+                        while True:
+                            if end_time and time.monotonic() >= end_time:
+                                logger.info("Wardrive duration reached; stopping.")
+                                break
+                            snapshot = build_snapshot(at, config)
+                            snapshot["sim_status"] = pin_info.get("status_after")
+                            write_jsonl(jsonl_handle, snapshot)
+                            if wigle_handle:
+                                for row in snapshot_to_wigle_rows(snapshot):
+                                    wigle_handle.write(",".join([
+                                        str(row.get("MAC", "")),
+                                        str(row.get("SSID", "")),
+                                        str(row.get("AuthMode", "")),
+                                        str(row.get("FirstSeen", "")),
+                                        str(row.get("Channel", "")),
+                                        str(row.get("RSSI", "")),
+                                        str(row.get("CurrentLatitude", "")),
+                                        str(row.get("CurrentLongitude", "")),
+                                        str(row.get("AltitudeMeters", "")),
+                                        str(row.get("AccuracyMeters", "")),
+                                        str(row.get("Type", "")),
+                                    ]) + "\n")
+                                    wigle_handle.flush()
+                            logger.info("Snapshot saved at {}".format(snapshot["timestamp_utc"]))
+                            time.sleep(interval_s)
+                    finally:
+                        if wigle_handle:
+                            wigle_handle.close()
 
-        results["diagnostics"] = diagnose(results)
-        print_summary(results, config, logger)
+        if config["mode"] == "test":
+            results["diagnostics"] = diagnose(results)
+            print_summary(results, config, logger)
 
         json_path = config.get("output", {}).get("json_path")
         if json_path:
