@@ -17,7 +17,7 @@
     html, body { height: 100%; }
     body {
       margin: 0;
-      padding: 10px;
+      padding: 6px;
       font-family: "Segoe UI", sans-serif;
       background: radial-gradient(circle at 20% 20%, #1f2937 0%, #0f172a 45%);
       color: var(--text);
@@ -25,41 +25,63 @@
       -webkit-overflow-scrolling: touch;
       touch-action: pan-y;
     }
-    h1 { margin: 0 0 4px; font-size: 10px; letter-spacing: 0.4px; }
+    h1 { margin: 0 0 4px; font-size: 13px; letter-spacing: 0.3px; display: flex; align-items: center; gap: 8px; }
     .panel {
       background: var(--card);
       border: 1px solid #1f2937;
-      border-radius: 8px;
-      padding: 8px;
+      border-radius: 6px;
+      padding: 6px;
       box-shadow: 0 10px 30px rgba(0,0,0,0.35);
     }
-    .row { display: grid; grid-template-columns: 26% 74%; gap: 4px; align-items: center; margin-bottom: 4px; }
-    .label { color: var(--muted); font-size: 9px; text-transform: uppercase; letter-spacing: 0.06em; }
-    .value { font-size: 10px; margin: 0; word-break: break-word; }
-    .pill {
-      display: inline-block;
-      padding: 1px 4px;
-      border-radius: 6px;
-      background: rgba(34,211,238,0.2);
-      border: 1px solid var(--accent);
-      color: var(--accent);
-      font-size: 9px;
+    .line { font-size: 11px; margin: 0 0 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .lights { display: flex; gap: 8px; align-items: center; }
+    .dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: #374151;
+      border: 1px solid #111;
+      box-shadow: 0 0 6px rgba(0,0,0,0.4);
     }
-    .warn { color: var(--warn); }
+    .on { background: #22c55e; box-shadow: 0 0 10px rgba(34,197,94,0.9); animation: pulse 1.4s infinite; }
+    .warn { background: #fbbf24; box-shadow: 0 0 10px rgba(251,191,36,0.9); }
+    .off { background: #ef4444; box-shadow: 0 0 10px rgba(239,68,68,0.9); }
+    .icon { font-size: 9px; color: var(--muted); }
+    @keyframes pulse {
+      0% { transform: scale(0.9); }
+      50% { transform: scale(1.05); }
+      100% { transform: scale(0.9); }
+    }
+    table { width: 100%; border-collapse: collapse; margin-top: 4px; }
+    th, td { font-size: 11px; padding: 3px 2px; text-align: left; }
+    th { color: var(--muted); border-bottom: 1px solid #1f2937; }
+    tr:nth-child(every) { background: transparent; }
   </style>
 </head>
 <body>
-  <h1>Hack-Wanderer</h1>
+  <h1>
+    Hack-Wanderer
+    <span class="lights">
+      <span class="icon">LTE</span><span class="dot" id="light-lte" title="LTE"></span>
+      <span class="icon">GPSd</span><span class="dot" id="light-gpsdev" title="GPS device"></span>
+      <span class="icon">GPSm</span><span class="dot" id="light-gpsmodem" title="GPS modem"></span>
+      <span class="icon">SIM</span><span class="dot" id="light-sim" title="SIM"></span>
+    </span>
+  </h1>
   <div class="panel" id="panel">
-    <div class="row"><div class="label">Time</div><div id="updated" class="value">--</div></div>
-    <div class="row"><div class="label">Loc</div><div id="location" class="value">--</div></div>
-    <div class="row"><div class="label">GPS dev</div><div id="gps-device" class="value">--</div></div>
-    <div class="row"><div class="label">GPS LTE</div><div id="gps-lte" class="value">--</div></div>
-    <div class="row"><div class="label">Net</div><div id="network" class="value">--</div></div>
-    <div class="row"><div class="label">Sig</div><div id="signal" class="value">--</div></div>
-    <div class="row"><div class="label">SIM</div><div id="sim" class="value">--</div></div>
-    <div class="row"><div class="label">Towers</div><div id="towers" class="value">--</div></div>
-    <div class="row"><div class="label">Top</div><div id="towers-detail" class="value">--</div></div>
+    <div id="l1" class="line">--</div>
+    <div id="l2" class="line">--</div>
+    <div id="l3" class="line">--</div>
+    <div id="l4" class="line">--</div>
+    <div id="l5" class="line">--</div>
+    <table id="towers-table">
+      <thead>
+        <tr><th>RAT</th><th>Cell</th><th>Lat/Lon</th><th>Time</th></tr>
+      </thead>
+      <tbody id="towers-body">
+        <tr><td colspan="4">--</td></tr>
+      </tbody>
+    </table>
   </div>
   <script>
     async function loadStatus() {
@@ -75,18 +97,21 @@
 
     function render(data) {
       const updated = data.timestamp_utc || '--';
+      const timeShort = updated && updated.indexOf('T') >= 0 ? updated.split('T')[1].replace('Z','') : (updated || '--');
+      const towers = data.towers || [];
       const loc = data.location || {};
       const locText = (loc.lat != null && loc.lon != null) ?
-        `${loc.lat.toFixed(6)}, ${loc.lon.toFixed(6)}${loc.alt_m != null ? '  alt ' + loc.alt_m + 'm' : ''}` : 'No fix';
+        `${loc.lat.toFixed(5)},${loc.lon.toFixed(5)}${loc.alt_m != null ? ' ' + loc.alt_m + 'm' : ''}` : 'No fix';
+      const locShort = (loc.lat != null && loc.lon != null) ? `${loc.lat.toFixed(4)},${loc.lon.toFixed(4)}` : '--';
       const gpsDevice = data.gps_device || {};
       const gpsDeviceLoc = (gpsDevice.location || {});
       const gpsDeviceText = (gpsDeviceLoc.lat != null && gpsDeviceLoc.lon != null)
-        ? `${gpsDeviceLoc.lat.toFixed(5)}, ${gpsDeviceLoc.lon.toFixed(5)} (sats ${((gpsDevice.satellites||{}).in_use)||'?'}/${((gpsDevice.satellites||{}).in_view)||'?'})`
+        ? `${gpsDeviceLoc.lat.toFixed(5)},${gpsDeviceLoc.lon.toFixed(5)} s${((gpsDevice.satellites||{}).in_use)||'?'}/${((gpsDevice.satellites||{}).in_view)||'?'}` 
       : 'No fix';
       const gpsModem = data.gps_lte_modem || {};
       const gpsModemInfo = gpsModem.cgnsinf || {};
       const gpsModemText = (gpsModemInfo.lat != null && gpsModemInfo.lon != null)
-        ? `${Number(gpsModemInfo.lat).toFixed(5)}, ${Number(gpsModemInfo.lon).toFixed(5)} (fix ${gpsModemInfo.fix_status||'?'})`
+        ? `${Number(gpsModemInfo.lat).toFixed(5)},${Number(gpsModemInfo.lon).toFixed(5)} f${gpsModemInfo.fix_status||'?'}` 
         : 'No fix';
 
       const net = data.network || {};
@@ -94,24 +119,48 @@
       const reg = (net.cereg && net.cereg.stat_text) ? net.cereg : (net.cgreg && net.cgreg.stat_text ? net.cgreg : net.creg || {});
       const signal = net.csq || {};
 
-      document.getElementById('updated').textContent = updated;
-      document.getElementById('location').textContent = locText;
-      document.getElementById('gps-device').textContent = gpsDeviceText + ' source=device';
-      document.getElementById('gps-lte').textContent = gpsModemText + ' source=lte_modem';
-      document.getElementById('network').textContent = `${cops.operator || 'unknown'}  RAT ${(cops.act!=null)?cops.act:'?'}  Reg ${(reg.stat_text)||'unknown'}`;
-      document.getElementById('signal').textContent = (signal.rssi_dbm!=null) ? `${signal.rssi_dbm} dBm (rssi ${signal.rssi})` : 'Unknown';
-      document.getElementById('sim').textContent = data.sim_status || 'unknown';
+      const l1 = `T:${timeShort} Loc:${locText}`;
+      const l2 = `GPSd:${gpsDeviceText} | GPSm:${gpsModemText}`;
+      const l3 = `Net:${cops.operator||'unk'} act:${cops.act!=null?cops.act:'?'} reg:${reg.stat_text||'?'} | Sig:${signal.rssi_dbm!=null?signal.rssi_dbm+'dBm':'?' } r:${signal.rssi??'?' } SIM:${data.sim_status||'?'}`;
+      const l4 = '';
+      const l5 = `Tw:${towers.length||0}`;
 
-      const towers = data.towers || [];
-      const towersText = towers.length ? `${towers.length} found` : 'None';
-      const top = towers.slice(0, 3).map(t => {
-        const id = t.cell_id != null ? t.cell_id : 'unk';
-        const rat = t.rat || t.mode || '?';
-        const tac = t.tac_lac != null ? `/${t.tac_lac}` : '';
-        return `${rat}:${id}${tac}`;
-      }).join(' | ');
-      document.getElementById('towers').textContent = towersText;
-      document.getElementById('towers-detail').textContent = top || '--';
+      const reversed = towers.slice().reverse(); // latest first if appended
+      const tbody = document.getElementById('towers-body');
+      tbody.innerHTML = '';
+      if (!reversed.length) {
+        const tr = document.createElement('tr');
+        tr.innerHTML = '<td colspan="4">No towers</td>';
+        tbody.appendChild(tr);
+      } else {
+        reversed.forEach(t => {
+          const tr = document.createElement('tr');
+          const rat = t.rat || t.mode || '?';
+          const id = t.cell_id != null ? t.cell_id : 'unk';
+          tr.innerHTML = `<td>${rat}</td><td>${id}</td><td>${locShort}</td><td>${timeShort}</td>`;
+          tbody.appendChild(tr);
+        });
+      }
+
+      document.getElementById('l1').textContent = l1;
+      document.getElementById('l2').textContent = l2;
+      document.getElementById('l3').textContent = l3;
+      document.getElementById('l4').textContent = l4;
+      document.getElementById('l5').textContent = l5;
+
+      // lights
+      const light = (id, state) => {
+        const el = document.getElementById(id);
+        el.classList.remove('on','warn','off');
+        el.classList.add(state ? 'on' : 'off');
+      };
+      light('light-sim', (data.sim_status||'').toUpperCase() === 'READY');
+      const regOk = (reg.stat_text||'').toLowerCase().includes('registered');
+      light('light-lte', regOk);
+      const gpsDevFix = gpsDeviceLoc.lat != null && gpsDeviceLoc.lon != null;
+      light('light-gpsdev', gpsDevFix);
+      const gpsModFix = gpsModemInfo.lat != null && gpsModemInfo.lon != null;
+      light('light-gpsmodem', gpsModFix);
     }
 
     loadStatus();
