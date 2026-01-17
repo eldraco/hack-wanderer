@@ -34,7 +34,7 @@ DEFAULT_CONFIG = {
         "operator_scan_s": 120.0,
         "gps_s": 6.0,
         "sim_read_s": 4.0,
-        "vendor_s": 5.0,
+        "vendor_s": 10.0,
     },
     "features": {
         "operator_scan": False,
@@ -42,6 +42,15 @@ DEFAULT_CONFIG = {
         "vendor_specific": True,
         "sim_read": True,
         "auto_register": True,
+    },
+    "tower_scan": {
+        "enabled": True,
+        "passes": 2,
+        "detach_before_scan": False,
+        "dwell_s": 1.0,
+        "qeng_timeout_s": 10.0,
+        "qeng_retries": 1,
+        "operator_scan_each_loop": False,
     },
     "external_gps": {
         "enabled": True,
@@ -1491,16 +1500,63 @@ def collect_network(at, config):
     return network
 
 
-def collect_vendor_info(at, config):
+def collect_vendor_info(at, config, logger):
     if not config["features"].get("vendor_specific"):
         return {}
     vendor = {}
-    qnw = at.send("AT+QNWINFO", timeout_s=config["timeouts"]["vendor_s"])
+    vendor_timeout = config["timeouts"]["vendor_s"]
+    qeng_timeout = max(vendor_timeout, 10.0)
+    qeng_retries = 1
+    tower_cfg = config.get("tower_scan", {}) or {}
+    passes = max(1, safe_int(tower_cfg.get("passes")) or 1)
+    detach_before_scan = bool(tower_cfg.get("detach_before_scan"))
+    dwell_s = tower_cfg.get("dwell_s", 1.0)
+    qeng_timeout = max(qeng_timeout, tower_cfg.get("qeng_timeout_s", qeng_timeout))
+    qeng_retries = max(qeng_retries, safe_int(tower_cfg.get("qeng_retries")) or 1)
+    do_operator_scan = bool(tower_cfg.get("operator_scan_each_loop"))
+    scan_actions = []
+
+    qnw = at.send("AT+QNWINFO", timeout_s=vendor_timeout)
     vendor["qnwinfo"] = parse_qnwinfo(qnw["lines"])
     vendor["qnwinfo_raw"] = qnw["lines"]
-    vendor["qeng_servingcell"] = at.send('AT+QENG="servingcell"', timeout_s=config["timeouts"]["vendor_s"])["lines"]
-    vendor["qeng_neighborcell"] = at.send('AT+QENG="neighbourcell"', timeout_s=config["timeouts"]["vendor_s"])["lines"]
-    vendor["qcsq"] = at.send("AT+QCSQ", timeout_s=config["timeouts"]["vendor_s"])["lines"]
+    vendor["qcsq"] = at.send("AT+QCSQ", timeout_s=vendor_timeout)["lines"]
+
+    serving_all = []
+    neighbor_all = []
+
+    if detach_before_scan:
+        scan_actions.append("detach/reattach")
+        logger.info("Tower scan: detaching (AT+COPS=2) before neighbor/serving queries.")
+        at.send("AT+COPS=2", timeout_s=config["timeouts"]["operator_scan_s"])
+        time.sleep(dwell_s)
+        at.send("AT+COPS=0", timeout_s=config["timeouts"]["operator_scan_s"])
+        time.sleep(dwell_s)
+
+    if do_operator_scan:
+        scan_actions.append("operator_scan")
+        logger.info("Tower scan: running operator scan to refresh PLMN list.")
+        at.send("AT+COPS=?", timeout_s=config["timeouts"]["operator_scan_s"])
+
+    for idx in range(passes):
+        logger.info("Tower scan pass {}/{} (qeng)".format(idx + 1, passes))
+        res_serv = at.send('AT+QENG="servingcell"', timeout_s=qeng_timeout, retries=qeng_retries)
+        res_nei = at.send('AT+QENG="neighbourcell"', timeout_s=qeng_timeout, retries=qeng_retries)
+        if res_serv["lines"]:
+            serving_all.extend(res_serv["lines"])
+        if res_nei["lines"]:
+            neighbor_all.extend(res_nei["lines"])
+        if dwell_s:
+            time.sleep(dwell_s)
+
+    vendor["qeng_servingcell"] = serving_all
+    vendor["qeng_neighborcell"] = neighbor_all
+    vendor["scan_activity"] = "passes={} detach={} op_scan={} qeng_timeout={} retries={}".format(
+        passes,
+        detach_before_scan,
+        do_operator_scan,
+        qeng_timeout,
+        qeng_retries,
+    )
     return vendor
 
 
@@ -1669,7 +1725,7 @@ def run_extra_commands(at, config):
 
 def build_snapshot(at, config, logger):
     network = collect_network(at, config)
-    vendor = collect_vendor_info(at, config)
+    vendor = collect_vendor_info(at, config, logger)
     gps_modem = collect_gps(at, config)
     gps_device = collect_external_gps(config, logger)
     log_modem_gps(logger, gps_modem)
@@ -1679,6 +1735,7 @@ def build_snapshot(at, config, logger):
         "vendor": vendor,
         "gps": gps_modem,
         "gps_device": gps_device,
+        "scan_activity": vendor.get("scan_activity"),
         "location": best_location_from_sources(gps_modem, gps_device),
         "towers": build_towers_snapshot(network, vendor),
     }
@@ -1705,6 +1762,7 @@ def write_status_snapshot(path, snapshot, logger):
             "gps_lte_modem": snapshot.get("gps"),
             "gps_device": snapshot.get("gps_device"),
             "sim_status": snapshot.get("sim_status"),
+            "scan_status": snapshot.get("scan_activity"),
         }
         with open(path, "w", encoding="utf-8") as handle:
             json.dump(payload, handle, ensure_ascii=True, indent=2)
@@ -2031,18 +2089,6 @@ def main(argv):
         except RuntimeError:
             return 2
 
-        logger.step("Open serial port {}".format(config["serial"]["port"]))
-        try:
-            ser = serial.Serial(
-                port=config["serial"]["port"],
-                baudrate=config["serial"]["baudrate"],
-                timeout=config["serial"]["timeout_s"],
-                write_timeout=config["serial"]["write_timeout_s"],
-            )
-        except Exception as exc:
-            logger.error("Failed to open serial port: {}".format(exc))
-            return 2
-
         results = {
             "meta": {
                 "mode": config["mode"],
@@ -2061,12 +2107,32 @@ def main(argv):
             "command_log": [],
         }
 
-        with ser:
+        ser = None
+        at = None
+
+        def open_modem():
+            nonlocal ser, at
+            logger.step("Open serial port {}".format(config["serial"]["port"]))
+            ser = serial.Serial(
+                port=config["serial"]["port"],
+                baudrate=config["serial"]["baudrate"],
+                timeout=config["serial"]["timeout_s"],
+                write_timeout=config["serial"]["write_timeout_s"],
+            )
             at = ATClient(ser, config, logger)
             logger.step("Initialize modem")
             results["meta"]["at_ok"] = at.initialize()
             if not results["meta"]["at_ok"]:
                 logger.warning("No AT response during initialization.")
+            return at
+
+        try:
+            open_modem()
+        except Exception as exc:
+            logger.error("Failed to open serial port: {}".format(exc))
+            return 2
+
+        try:
             logger.step("Collect modem info")
             results["info"] = collect_info(at)
             logger.step("Check SIM PIN state")
@@ -2078,7 +2144,7 @@ def main(argv):
                 results["network"] = collect_network(at, config)
                 if config.get("features", {}).get("vendor_specific"):
                     logger.step("Collect vendor-specific info")
-                results["vendor"] = collect_vendor_info(at, config)
+                results["vendor"] = collect_vendor_info(at, config, logger)
                 if config.get("features", {}).get("gps"):
                     logger.step("Collect GPS info")
                 results["gps"] = collect_gps(at, config)
@@ -2116,7 +2182,24 @@ def main(argv):
                             if end_time and time.monotonic() >= end_time:
                                 logger.info("Wardrive duration reached; stopping.")
                                 break
-                            snapshot = build_snapshot(at, config, logger)
+                            try:
+                                snapshot = build_snapshot(at, config, logger)
+                            except (serial.SerialException, OSError, AttributeError) as exc:
+                                logger.error("Serial connection lost: {}. Attempting reopen...".format(exc))
+                                try:
+                                    if ser:
+                                        ser.close()
+                                except Exception:
+                                    pass
+                                time.sleep(2)
+                                try:
+                                    open_modem()
+                                    continue
+                                except Exception as reopen_exc:
+                                    logger.error("Reopen failed: {}. Retrying in 5s.".format(reopen_exc))
+                                    time.sleep(5)
+                                    continue
+
                             snapshot["sim_status"] = pin_info.get("status_after")
                             write_jsonl(jsonl_handle, snapshot)
                             status_path = (config.get("status_page") or {}).get("json_path") or ""
@@ -2142,6 +2225,12 @@ def main(argv):
                     finally:
                         if wigle_handle:
                             wigle_handle.close()
+        finally:
+            try:
+                if ser:
+                    ser.close()
+            except Exception:
+                pass
 
         if config["mode"] == "test":
             results["diagnostics"] = diagnose(results)
