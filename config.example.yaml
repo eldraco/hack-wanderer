@@ -14,7 +14,7 @@ timeouts:
   operator_scan_s: 120.0
   gps_s: 6.0
   sim_read_s: 4.0
-  vendor_s: 5.0
+  vendor_s: 10.0
 
 features:
   operator_scan: false
@@ -22,6 +22,15 @@ features:
   vendor_specific: true
   sim_read: true
   auto_register: true
+
+tower_scan:
+  enabled: true
+  passes: 2
+  detach_before_scan: false
+  dwell_s: 1.0
+  qeng_timeout_s: 10.0
+  qeng_retries: 1
+  operator_scan_each_loop: false
 
 external_gps:
   enabled: true
