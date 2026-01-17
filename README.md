@@ -192,6 +192,13 @@ Run `python hack-wanderer.py --help` for the full list. Key flags:
 - `--color` / `--no-color`, `--emoji` / `--no-emoji`
 - `--interactive` / `--no-interactive`
 
+## Aggressive tower collection + reconnect
+
+- Multiple QENG passes per interval (serving + neighbor) with longer timeouts/retries, configurable under `tower_scan` (passes, qeng_timeout_s, qeng_retries, dwell_s, operator_scan_each_loop, detach_before_scan). This helps surface weak/ephemeral cells.
+- Optional operator scan each loop is available but slow; leave it off unless you need PLMN refresh.
+- Optional detach/reattach before scans can provoke reselection but may interrupt service; default is off.
+- If the USB/serial link to the modem drops, wardrive now auto-closes and reopens the port, re-initializes, and resumes snapshots instead of requiring a manual unplug.
+
 ## Local status page (small display)
 
 - The wardrive loop writes a live snapshot to `status/status.json` and a matching display at `status/index.html` (auto-refresh every 3s).
