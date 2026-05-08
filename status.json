@@ -1,0 +1,430 @@
+{
+  "timestamp_utc": "2026-01-18T13:51:22Z",
+  "location": {
+    "lat": 50.0603983,
+    "lon": 14.3995083,
+    "alt_m": null,
+    "speed_knots": 0.0,
+    "course_deg": 313.19,
+    "timestamp_utc": "2026-01-18T13:51:22Z",
+    "source": "gps_device"
+  },
+  "network": {
+    "csq": {
+      "rssi": 31,
+      "rssi_dbm": -51,
+      "ber": 99
+    },
+    "creg": {
+      "stat_code": 1,
+      "stat_text": "registered_home",
+      "lac_tac": 65534,
+      "cell_id": 153825646,
+      "act": null,
+      "rat": null
+    },
+    "cgreg": {
+      "stat_code": 1,
+      "stat_text": "registered_home",
+      "lac_tac": 481,
+      "cell_id": 153825646,
+      "act": null,
+      "rat": null
+    },
+    "cereg": {
+      "stat_code": 1,
+      "stat_text": "registered_home",
+      "lac_tac": 481,
+      "cell_id": 153825646,
+      "act": 7,
+      "rat": "LTE"
+    },
+    "cops_current": {
+      "mode": 0,
+      "format": 0,
+      "operator": "TESCO Mobile TESCO Mobile",
+      "act": 7
+    },
+    "operators_available": [],
+    "operators_raw": []
+  },
+  "towers": [
+    {
+      "source": "registration",
+      "rat": "LTE",
+      "rat_code": 7,
+      "cell_id": 153825646,
+      "tac_lac": 481,
+      "stat": "registered_home",
+      "mcc": null,
+      "mnc": null,
+      "eci": 153825646,
+      "enodeb_id": 600881,
+      "sector_id": 110
+    }
+  ],
+  "towers_all": [
+    {
+      "source": "registration",
+      "rat": "LTE",
+      "rat_code": 7,
+      "cell_id": 153825646,
+      "tac_lac": 481,
+      "stat": "registered_home",
+      "mcc": null,
+      "mnc": null,
+      "eci": 153825646,
+      "enodeb_id": 600881,
+      "sector_id": 110,
+      "seen_time_local": "2026-01-18T14:45:09.614933+01:00",
+      "seen_time_utc": "2026-01-18T13:45:09Z",
+      "seen_location": {
+        "lat": 50.0603633,
+        "lon": 14.3993383,
+        "alt_m": null,
+        "speed_knots": 0.0,
+        "course_deg": 313.19,
+        "timestamp_utc": "2026-01-18T13:45:09Z",
+        "source": "gps_device"
+      },
+      "key": "LTE|153825646|481|None|None",
+      "seen_count": 10
+    }
+  ],
+  "gps_lte_modem": {
+    "cgnspwr": [
+      "ERROR"
+    ],
+    "cgnsinf": {},
+    "cgps": [
+      "+CGPS: 0,1",
+      "OK"
+    ],
+    "cgpsinfo": [
+      "+CGPSINFO: ,,,,,,,,",
+      "OK"
+    ],
+    "qgps": [
+      "ERROR"
+    ],
+    "qgpsloc": [
+      "ERROR"
+    ],
+    "gpsinfo": [
+      "ERROR"
+    ]
+  },
+  "gps_device": {
+    "location": {
+      "lat": 50.0603983,
+      "lon": 14.3995083,
+      "alt_m": null,
+      "speed_knots": 0.0,
+      "course_deg": 313.19,
+      "timestamp_utc": "2026-01-18T13:51:22Z"
+    },
+    "location_source": "rmc",
+    "has_fix": true,
+    "timestamp_utc": "2026-01-18T13:51:22Z",
+    "status": "A",
+    "fix_quality": 1,
+    "fix_type": 3,
+    "hdop": 1.0,
+    "satellites": {
+      "in_use": 10,
+      "in_view": 12,
+      "used_prns": [
+        "26",
+        "29",
+        "11",
+        "31",
+        "28",
+        "18",
+        "05",
+        "25",
+        "04",
+        "12"
+      ]
+    },
+    "gga": {
+      "time_utc": "135121.000",
+      "timestamp_utc": "2026-01-18T13:51:21Z",
+      "lat": 50.0603983,
+      "lon": 14.3995083,
+      "fix_quality": 1,
+      "satellites": 10,
+      "hdop": 1.0,
+      "alt_m": 209.9,
+      "geoid_sep_m": 44.4,
+      "dgps_age_s": null,
+      "raw": "$GPGGA,135121.000,5003.6239,N,01423.9705,E,1,10,1.0,209.9,M,44.4,M,,0000*58"
+    },
+    "rmc": {
+      "time_utc": "135122.000",
+      "date": "180126",
+      "timestamp_utc": "2026-01-18T13:51:22Z",
+      "status": "A",
+      "lat": 50.0603983,
+      "lon": 14.3995083,
+      "speed_knots": 0.0,
+      "course_deg": 313.19,
+      "mag_var": null,
+      "raw": "$GPRMC,135122.000,A,5003.6239,N,01423.9705,E,0.00,313.19,180126,,,A*6A"
+    },
+    "gsa": {
+      "mode": "A",
+      "fix_type": 3,
+      "satellites": [
+        "26",
+        "29",
+        "11",
+        "31",
+        "28",
+        "18",
+        "05",
+        "25",
+        "04",
+        "12"
+      ],
+      "pdop": 1.6,
+      "hdop": 1.0,
+      "vdop": null,
+      "raw": "$GPGSA,A,3,26,29,11,31,28,18,05,25,04,12,,,1.6,1.0,1.3*3D"
+    },
+    "gsv": [
+      {
+        "message_index": 1,
+        "message_count": 3,
+        "in_view": 12,
+        "satellites": [
+          {
+            "prn": "04",
+            "elevation_deg": 7,
+            "azimuth_deg": 333,
+            "snr_db": 31
+          },
+          {
+            "prn": "05",
+            "elevation_deg": 16,
+            "azimuth_deg": 94,
+            "snr_db": 24
+          },
+          {
+            "prn": "11",
+            "elevation_deg": 21,
+            "azimuth_deg": 42,
+            "snr_db": 21
+          },
+          {
+            "prn": "12",
+            "elevation_deg": 12,
+            "azimuth_deg": 113,
+            "snr_db": null
+          }
+        ],
+        "raw": "$GPGSV,3,1,12,04,07,333,31,05,16,094,24,11,21,042,21,12,12,113,22*76"
+      },
+      {
+        "message_index": 2,
+        "message_count": 3,
+        "in_view": 12,
+        "satellites": [
+          {
+            "prn": "16",
+            "elevation_deg": 0,
+            "azimuth_deg": 293,
+            "snr_db": null
+          },
+          {
+            "prn": "18",
+            "elevation_deg": 27,
+            "azimuth_deg": 184,
+            "snr_db": 27
+          },
+          {
+            "prn": "21",
+            "elevation_deg": 15,
+            "azimuth_deg": 64,
+            "snr_db": 18
+          },
+          {
+            "prn": "25",
+            "elevation_deg": 50,
+            "azimuth_deg": 120,
+            "snr_db": null
+          }
+        ],
+        "raw": "$GPGSV,3,2,12,16,00,293,,18,27,184,27,21,15,064,18,25,50,120,31*7F"
+      },
+      {
+        "message_index": 3,
+        "message_count": 3,
+        "in_view": 12,
+        "satellites": [
+          {
+            "prn": "26",
+            "elevation_deg": 32,
+            "azimuth_deg": 297,
+            "snr_db": 24
+          },
+          {
+            "prn": "28",
+            "elevation_deg": 52,
+            "azimuth_deg": 242,
+            "snr_db": 9
+          },
+          {
+            "prn": "29",
+            "elevation_deg": 81,
+            "azimuth_deg": 56,
+            "snr_db": 16
+          },
+          {
+            "prn": "31",
+            "elevation_deg": 44,
+            "azimuth_deg": 290,
+            "snr_db": null
+          }
+        ],
+        "raw": "$GPGSV,3,3,12,26,32,297,24,28,52,242,09,29,81,056,16,31,44,290,24*7C"
+      },
+      {
+        "message_index": 1,
+        "message_count": 3,
+        "in_view": 12,
+        "satellites": [
+          {
+            "prn": "04",
+            "elevation_deg": 7,
+            "azimuth_deg": 333,
+            "snr_db": 31
+          },
+          {
+            "prn": "05",
+            "elevation_deg": 16,
+            "azimuth_deg": 94,
+            "snr_db": 23
+          },
+          {
+            "prn": "11",
+            "elevation_deg": 21,
+            "azimuth_deg": 42,
+            "snr_db": 20
+          },
+          {
+            "prn": "12",
+            "elevation_deg": 12,
+            "azimuth_deg": 113,
+            "snr_db": null
+          }
+        ],
+        "raw": "$GPGSV,3,1,12,04,07,333,31,05,16,094,23,11,21,042,20,12,12,113,23*71"
+      },
+      {
+        "message_index": 2,
+        "message_count": 3,
+        "in_view": 12,
+        "satellites": [
+          {
+            "prn": "16",
+            "elevation_deg": 0,
+            "azimuth_deg": 293,
+            "snr_db": null
+          },
+          {
+            "prn": "18",
+            "elevation_deg": 27,
+            "azimuth_deg": 184,
+            "snr_db": 27
+          },
+          {
+            "prn": "21",
+            "elevation_deg": 15,
+            "azimuth_deg": 64,
+            "snr_db": 17
+          },
+          {
+            "prn": "25",
+            "elevation_deg": 50,
+            "azimuth_deg": 120,
+            "snr_db": null
+          }
+        ],
+        "raw": "$GPGSV,3,2,12,16,00,293,,18,27,184,27,21,15,064,17,25,50,120,31*70"
+      },
+      {
+        "message_index": 3,
+        "message_count": 3,
+        "in_view": 12,
+        "satellites": [
+          {
+            "prn": "26",
+            "elevation_deg": 32,
+            "azimuth_deg": 297,
+            "snr_db": 23
+          },
+          {
+            "prn": "28",
+            "elevation_deg": 52,
+            "azimuth_deg": 242,
+            "snr_db": 11
+          },
+          {
+            "prn": "29",
+            "elevation_deg": 81,
+            "azimuth_deg": 56,
+            "snr_db": 16
+          },
+          {
+            "prn": "31",
+            "elevation_deg": 44,
+            "azimuth_deg": 290,
+            "snr_db": null
+          }
+        ],
+        "raw": "$GPGSV,3,3,12,26,32,297,23,28,52,242,11,29,81,056,16,31,44,290,25*73"
+      }
+    ],
+    "gll": {
+      "lat": 50.0603983,
+      "lon": 14.3995083,
+      "time_utc": "135121.000",
+      "timestamp_utc": "2026-01-18T13:51:21Z",
+      "status": "A",
+      "raw": "$GPGLL,5003.6239,N,01423.9705,E,135121.000,A,A*5B"
+    },
+    "raw_sample": [
+      "$GPTXT,01,01,02,u-blox ag - www.u-blox.com*50",
+      "$GPTXT,01,01,02,HW  UBX-G60xx  00040007 *52",
+      "$GPTXT,01,01,02,EXT CORE 7.03 (45970) Mar 17 2011 16:26:24*44",
+      "$GPTXT,01,01,02,ROM BASE 7.03 (45969) Mar 17 2011 16:18:34*57",
+      "$GPTXT,01,01,02,ANTSUPERV=AC SD PDoS SR*20",
+      "$GPTXT,01,01,02,ANTSTATUS=OK*3B",
+      "$GPRMC,135120.000,A,5003.6239,N,01423.9705,E,0.00,313.19,180126,,,A*68",
+      "$GPVTG,313.19,T,,M,0.00,N,0.0,K,A*04",
+      "$GPGGA,135120.000,5003.6239,N,01423.9705,E,1,09,1.1,209.9,M,44.4,M,,0000*50",
+      "$GPGSA,A,3,26,29,11,31,18,05,25,04,12,,,,1.7,1.1,1.3*37",
+      "$GPGSV,3,1,12,04,07,333,31,05,16,094,24,11,21,042,21,12,12,113,22*76",
+      "$GPGSV,3,2,12,16,00,293,,18,27,184,27,21,15,064,18,25,50,120,31*7F",
+      "$GPGSV,3,3,12,26,32,297,24,28,52,242,09,29,81,056,16,31,44,290,24*7C",
+      "$GPGLL,5003.6239,N,01423.9705,E,135120.000,A,A*5A",
+      "$GPRMC,135121.000,A,5003.6239,N,01423.9705,E,0.00,313.19,180126,,,A*69",
+      "$GPVTG,313.19,T,,M,0.00,N,0.0,K,A*04",
+      "$GPGGA,135121.000,5003.6239,N,01423.9705,E,1,10,1.0,209.9,M,44.4,M,,0000*58",
+      "$GPGSA,A,3,26,29,11,31,28,18,05,25,04,12,,,1.6,1.0,1.3*3D",
+      "$GPGSV,3,1,12,04,07,333,31,05,16,094,23,11,21,042,20,12,12,113,23*71",
+      "$GPGSV,3,2,12,16,00,293,,18,27,184,27,21,15,064,17,25,50,120,31*70"
+    ],
+    "source": "serial_nmea",
+    "port": "/dev/ttyACM0",
+    "baudrate": 9600,
+    "enabled": true,
+    "available": true
+  },
+  "sim_status": "READY",
+  "scan_status": "passes=2 detach=False op_scan=False qeng_timeout=10.0 retries=1",
+  "timezone": "Europe/Prague",
+  "local_time": "2026-01-18T14:51:22.112926+01:00",
+  "gps_time_utc": "2026-01-18T13:51:22Z",
+  "gps_time_local": "2026-01-18T14:51:22+01:00"
+}
