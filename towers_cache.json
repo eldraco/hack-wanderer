@@ -1,0 +1,28 @@
+[
+  {
+    "source": "registration",
+    "rat": "LTE",
+    "rat_code": 7,
+    "cell_id": 153825646,
+    "tac_lac": 481,
+    "stat": "registered_home",
+    "mcc": null,
+    "mnc": null,
+    "eci": 153825646,
+    "enodeb_id": 600881,
+    "sector_id": 110,
+    "seen_time_local": "2026-01-18T14:45:09.614933+01:00",
+    "seen_time_utc": "2026-01-18T13:45:09Z",
+    "seen_location": {
+      "lat": 50.0603633,
+      "lon": 14.3993383,
+      "alt_m": null,
+      "speed_knots": 0.0,
+      "course_deg": 313.19,
+      "timestamp_utc": "2026-01-18T13:45:09Z",
+      "source": "gps_device"
+    },
+    "key": "LTE|153825646|481|None|None",
+    "seen_count": 10
+  }
+]
