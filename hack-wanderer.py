@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import datetime
+import glob
 import json
 import os
 import sys
@@ -190,6 +191,8 @@ def command_key(cmd):
         return "AT+CPIN="
     if text.startswith("AT+CRSM="):
         return "AT+CRSM=176"
+    if text.startswith("AT+CPSI="):
+        return "AT+CPSI="
     if "=" in text and text.endswith("?"):
         return text
     if text.endswith("?"):
@@ -228,6 +231,9 @@ def describe_command(cmd):
         "AT+QNWINFO": ("QNWINFO", "Read RAT, band, and operator (Quectel)."),
         'AT+QENG="..."': ("QENG", "Serving/neighbor cell info (Quectel)."),
         "AT+QCSQ": ("QCSQ", "Extended signal quality (Quectel)."),
+        "AT+CPSI?": ("CPSI", "Read serving cell system info (SIMCom)."),
+        "AT+CPSI=": ("CPSI periodic", "Configure periodic CPSI reporting (SIMCom)."),
+        "AT+CNSMOD?": ("CNSMOD", "Read current system mode (SIMCom)."),
         "AT+CGNSPWR?": ("GNSS power", "Read GNSS power state."),
         "AT+CGNSINF": ("GNSS info", "Read GNSS fix and location."),
         "AT+CGPS?": ("GPS state", "Read GPS state (varies by vendor)."),
@@ -837,6 +843,71 @@ def parse_qnwinfo(lines):
     return {"raw": value}
 
 
+def parse_cpsi(lines):
+    """
+    Parse SIMCom +CPSI output into a structured dict.
+
+    Reference: SIM7500/SIM7600 AT Command Manual (AT+CPSI).
+    We store raw numeric values as reported; some metrics may be in 0.1 units depending on RAT.
+    """
+    for line in lines:
+        if not line.startswith("+CPSI:"):
+            continue
+        payload = line.split(":", 1)[1].strip()
+        parts = split_fields(payload)
+        if not parts:
+            continue
+
+        system_mode = strip_quotes(parts[0])
+        op_mode = strip_quotes(parts[1]) if len(parts) > 1 else None
+        plmn = strip_quotes(parts[2]) if len(parts) > 2 else None
+        mcc = None
+        mnc = None
+        if plmn and "-" in plmn:
+            left, right = plmn.split("-", 1)
+            mcc = safe_int(left)
+            mnc = safe_int(right)
+
+        entry = {
+            "system_mode": system_mode,
+            "operation_mode": op_mode,
+            "plmn": plmn,
+            "mcc": mcc,
+            "mnc": mnc,
+            "raw": line,
+        }
+
+        # LTE format:
+        # +CPSI: LTE,Online,<MCC>-<MNC>,<TAC>,<ScellID>,<PcellID>,<Frequency Band>,<earfcn>,
+        #        <dlbw>,<ulbw>,<RSRQ>,<RSRP>,<RSSI>,<RSSNR>
+        if system_mode == "LTE" and len(parts) >= 14:
+            entry.update(
+                {
+                    "tac": parse_hex_or_int(parts[3]),
+                    "scell_id": parse_hex_or_int(parts[4]),
+                    "pcell_id": parse_hex_or_int(parts[5]),
+                    "band": strip_quotes(parts[6]),
+                    "earfcn": safe_int(parts[7]),
+                    "dlbw": strip_quotes(parts[8]),
+                    "ulbw": strip_quotes(parts[9]),
+                    "rsrq": safe_float(parts[10]),
+                    "rsrp": safe_float(parts[11]),
+                    "rssi": safe_float(parts[12]),
+                    "rssnr": safe_float(parts[13]),
+                }
+            )
+        # GSM/WCDMA/TDS formats vary a lot; keep best-effort common identifiers.
+        elif system_mode in ("GSM", "WCDMA", "TDS") and len(parts) >= 6:
+            entry.update(
+                {
+                    "lac": parse_hex_or_int(parts[3]),
+                    "cell_id": parse_hex_or_int(parts[4]),
+                }
+            )
+        return entry
+    return {}
+
+
 def parse_cgnsinf(lines):
     value = extract_prefixed_value(lines, "+CGNSINF")
     if not value:
@@ -957,6 +1028,21 @@ def build_towers_snapshot(network, vendor):
             "tac_lac": reg.get("lac_tac"),
             "stat": reg.get("stat_text"),
         })
+    cpsi = vendor.get("cpsi") or {}
+    if isinstance(cpsi, dict) and cpsi.get("system_mode") == "LTE" and cpsi.get("scell_id") is not None:
+        towers.append({
+            "source": "cpsi",
+            "rat": "LTE",
+            "cell_id": cpsi.get("scell_id"),
+            "tac_lac": cpsi.get("tac"),
+            "pci": cpsi.get("pcell_id"),
+            "earfcn": cpsi.get("earfcn"),
+            "band": cpsi.get("band"),
+            "rsrp": cpsi.get("rsrp"),
+            "rsrq": cpsi.get("rsrq"),
+            "rssi": cpsi.get("rssi"),
+            "rssnr": cpsi.get("rssnr"),
+        })
     qeng_serving = parse_qeng_servingcell(vendor.get("qeng_servingcell", []))
     qeng_neighbor = parse_qeng_neighborcell(vendor.get("qeng_neighborcell", []))
     towers.extend(qeng_serving)
@@ -1027,6 +1113,24 @@ def summarize_response(cmd, lines):
                 qnw.get("operator") or "unknown",
             )
         return "QNWINFO not reported."
+    if key == "AT+CPSI?":
+        cpsi = parse_cpsi(lines)
+        if not cpsi:
+            return "CPSI not reported."
+        if cpsi.get("system_mode") == "LTE":
+            return "LTE PLMN: {} TAC: {} Cell: {} PCI: {} EARFCN: {}".format(
+                cpsi.get("plmn") or "unknown",
+                cpsi.get("tac"),
+                cpsi.get("scell_id"),
+                cpsi.get("pcell_id"),
+                cpsi.get("earfcn"),
+            )
+        return "System: {} PLMN: {} LAC/TAC: {} Cell: {}".format(
+            cpsi.get("system_mode") or "unknown",
+            cpsi.get("plmn") or "unknown",
+            cpsi.get("lac") or cpsi.get("tac"),
+            cpsi.get("cell_id") or cpsi.get("scell_id"),
+        )
     if key == "AT+CGNSINF":
         info = parse_cgnsinf(lines)
         if info:
@@ -1516,14 +1620,27 @@ def collect_vendor_info(at, config, logger):
     do_operator_scan = bool(tower_cfg.get("operator_scan_each_loop"))
     scan_actions = []
 
-    qnw = at.send("AT+QNWINFO", timeout_s=vendor_timeout)
+    # Vendor/capability probing:
+    # - Quectel devices support QNWINFO/QENG/QCSQ.
+    # - SIMCom SIM7600-class devices support CPSI/CNSMOD for serving-cell details.
+    qnw = at.send("AT+QNWINFO", timeout_s=vendor_timeout, retries=0)
     vendor["qnwinfo"] = parse_qnwinfo(qnw["lines"])
     vendor["qnwinfo_raw"] = qnw["lines"]
-    vendor["qcsq"] = at.send("AT+QCSQ", timeout_s=vendor_timeout)["lines"]
+    qcsq = at.send("AT+QCSQ", timeout_s=vendor_timeout, retries=0)
+    vendor["qcsq"] = qcsq["lines"]
+
+    cpsi_res = at.send("AT+CPSI?", timeout_s=vendor_timeout, retries=0)
+    vendor["cpsi"] = parse_cpsi(cpsi_res["lines"])
+    vendor["cpsi_raw"] = cpsi_res["lines"]
+    cnsmod_res = at.send("AT+CNSMOD?", timeout_s=vendor_timeout, retries=0)
+    vendor["cnsmod_raw"] = cnsmod_res["lines"]
 
     serving_all = []
     neighbor_all = []
 
+    # Only attempt QENG tower scanning if it appears supported; on SIM7600 these commands
+    # will usually return ERROR and can add noise to logs.
+    qeng_supported = bool(vendor.get("qnwinfo")) or (qnw.get("ok") and not any(l == "ERROR" for l in qnw.get("lines", [])))
     if detach_before_scan:
         scan_actions.append("detach/reattach")
         logger.info("Tower scan: detaching (AT+COPS=2) before neighbor/serving queries.")
@@ -1537,16 +1654,17 @@ def collect_vendor_info(at, config, logger):
         logger.info("Tower scan: running operator scan to refresh PLMN list.")
         at.send("AT+COPS=?", timeout_s=config["timeouts"]["operator_scan_s"])
 
-    for idx in range(passes):
-        logger.info("Tower scan pass {}/{} (qeng)".format(idx + 1, passes))
-        res_serv = at.send('AT+QENG="servingcell"', timeout_s=qeng_timeout, retries=qeng_retries)
-        res_nei = at.send('AT+QENG="neighbourcell"', timeout_s=qeng_timeout, retries=qeng_retries)
-        if res_serv["lines"]:
-            serving_all.extend(res_serv["lines"])
-        if res_nei["lines"]:
-            neighbor_all.extend(res_nei["lines"])
-        if dwell_s:
-            time.sleep(dwell_s)
+    if qeng_supported:
+        for idx in range(passes):
+            logger.info("Tower scan pass {}/{} (qeng)".format(idx + 1, passes))
+            res_serv = at.send('AT+QENG="servingcell"', timeout_s=qeng_timeout, retries=qeng_retries)
+            res_nei = at.send('AT+QENG="neighbourcell"', timeout_s=qeng_timeout, retries=qeng_retries)
+            if res_serv["lines"]:
+                serving_all.extend(res_serv["lines"])
+            if res_nei["lines"]:
+                neighbor_all.extend(res_nei["lines"])
+            if dwell_s:
+                time.sleep(dwell_s)
 
     vendor["qeng_servingcell"] = serving_all
     vendor["qeng_neighborcell"] = neighbor_all
@@ -1708,6 +1826,76 @@ def best_location_from_sources(gps_modem, gps_device):
             "source": "lte_modem",
         }
     return {}
+
+
+def serial_candidate_ports(config):
+    """
+    Return a list of likely serial device paths for AT commands.
+
+    Prefer stable udev paths when available (Linux), then common USB serial names.
+    """
+    configured = (config.get("serial", {}) or {}).get("port") or ""
+    candidates = []
+    if configured:
+        candidates.append(configured)
+
+    # Linux stable aliases
+    candidates.extend(sorted(glob.glob("/dev/serial/by-id/*")))
+    candidates.extend(sorted(glob.glob("/dev/serial/by-path/*")))
+
+    # Common USB-serial names
+    candidates.extend(sorted(glob.glob("/dev/ttyUSB*")))
+    candidates.extend(sorted(glob.glob("/dev/ttyACM*")))
+
+    # macOS / devfs (best-effort)
+    candidates.extend(sorted(glob.glob("/dev/tty.*")))
+    candidates.extend(sorted(glob.glob("/dev/cu.*")))
+
+    # Deduplicate while preserving order
+    seen = set()
+    unique = []
+    for port in candidates:
+        if port in seen:
+            continue
+        seen.add(port)
+        unique.append(port)
+    return unique
+
+
+def probe_at_port(port, baudrate, timeout_s=0.3):
+    """
+    Best-effort check whether a serial port appears to accept AT commands.
+    """
+    if serial is None:
+        return False
+    try:
+        ser = serial.Serial(port=port, baudrate=baudrate, timeout=timeout_s, write_timeout=timeout_s)
+    except Exception:
+        return False
+    try:
+        try:
+            ser.reset_input_buffer()
+            ser.reset_output_buffer()
+        except Exception:
+            pass
+        ser.write(b"AT\r")
+        ser.flush()
+        end = time.monotonic() + timeout_s
+        while time.monotonic() < end:
+            raw = ser.readline()
+            if not raw:
+                continue
+            text = raw.decode(errors="ignore").strip()
+            if not text:
+                continue
+            if text.upper() == "OK":
+                return True
+        return False
+    finally:
+        try:
+            ser.close()
+        except Exception:
+            pass
 
 
 def collect_errors(at):
@@ -2112,13 +2300,37 @@ def main(argv):
 
         def open_modem():
             nonlocal ser, at
-            logger.step("Open serial port {}".format(config["serial"]["port"]))
-            ser = serial.Serial(
-                port=config["serial"]["port"],
-                baudrate=config["serial"]["baudrate"],
-                timeout=config["serial"]["timeout_s"],
-                write_timeout=config["serial"]["write_timeout_s"],
-            )
+            configured_port = config["serial"]["port"]
+            baudrate = config["serial"]["baudrate"]
+
+            ports_to_try = [configured_port]
+            if not configured_port or configured_port.lower() == "auto" or not os.path.exists(configured_port):
+                ports_to_try = serial_candidate_ports(config)
+
+            opened = False
+            last_exc = None
+            for port in ports_to_try:
+                if not port:
+                    continue
+                if port != configured_port and not probe_at_port(port, baudrate):
+                    continue
+                logger.step("Open serial port {}".format(port))
+                try:
+                    ser = serial.Serial(
+                        port=port,
+                        baudrate=baudrate,
+                        timeout=config["serial"]["timeout_s"],
+                        write_timeout=config["serial"]["write_timeout_s"],
+                    )
+                    config["serial"]["port"] = port
+                    results["meta"]["port"] = port
+                    opened = True
+                    break
+                except Exception as exc:
+                    last_exc = exc
+                    continue
+            if not opened:
+                raise last_exc or RuntimeError("No usable serial port found for AT commands.")
             at = ATClient(ser, config, logger)
             logger.step("Initialize modem")
             results["meta"]["at_ok"] = at.initialize()
