@@ -1,0 +1,95 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Tower Observations</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    html, body, #map {
+      height: 100%;
+      margin: 0;
+      padding: 0;
+      font-family: Arial, sans-serif;
+    }
+    .info {
+      min-width: 260px;
+      line-height: 1.35;
+    }
+    .info h3 {
+      margin: 0 0 8px 0;
+      font-size: 16px;
+    }
+    .kv {
+      margin: 2px 0;
+    }
+    .muted {
+      color: #666;
+      font-size: 12px;
+      margin-top: 8px;
+    }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+
+  <script>
+    const MARKERS = [{"cell_id": 9, "tac_lac": 471, "rat": null, "stat": "registered_home", "first_seen": "2026-01-12T07:39:04Z", "last_seen": "2026-01-12T07:39:04Z", "count": 1, "lat": 50.0683783, "lon": 14.4021683}, {"cell_id": 9, "tac_lac": 481, "rat": null, "stat": "registered_home", "first_seen": "2026-01-13T08:36:57Z", "last_seen": "2026-01-16T05:34:33Z", "count": 8, "lat": 50.060360624999994, "lon": 14.399334175}, {"cell_id": 9, "tac_lac": 65534, "rat": null, "stat": "registered_home", "first_seen": "2026-01-12T17:45:41Z", "last_seen": "2026-01-15T00:46:24Z", "count": 4, "lat": 50.060432525, "lon": 14.39938375}, {"cell_id": 92, "tac_lac": 481, "rat": null, "stat": "registered_home", "first_seen": "2026-01-13T05:54:41Z", "last_seen": "2026-01-16T12:29:35Z", "count": 3, "lat": 50.0604878, "lon": 14.399340533333332}, {"cell_id": 92, "tac_lac": 65534, "rat": null, "stat": "registered_home", "first_seen": "2026-01-12T08:41:12Z", "last_seen": "2026-01-15T22:26:09Z", "count": 7, "lat": 50.06245167142857, "lon": 14.400444042857142}, {"cell_id": 2347, "tac_lac": 481, "rat": null, "stat": "registered_home", "first_seen": "2026-01-12T23:29:27Z", "last_seen": "2026-01-17T02:07:29Z", "count": 9, "lat": 50.06040926666666, "lon": 14.399372966666668}, {"cell_id": 2347, "tac_lac": 65534, "rat": null, "stat": "registered_home", "first_seen": "2026-01-13T19:14:40Z", "last_seen": "2026-01-16T12:42:40Z", "count": 2, "lat": 50.0603225, "lon": 14.399264200000001}, {"cell_id": 37555, "tac_lac": 481, "rat": null, "stat": "registered_home", "first_seen": "2026-01-13T03:02:47Z", "last_seen": "2026-01-16T05:36:11Z", "count": 6, "lat": 50.06038029999999, "lon": 14.399270549999999}, {"cell_id": 37555, "tac_lac": 65534, "rat": null, "stat": "registered_home", "first_seen": "2026-01-13T16:39:36Z", "last_seen": "2026-01-15T18:16:39Z", "count": 6, "lat": 50.060361650000004, "lon": 14.399391950000002}, {"cell_id": 600881, "tac_lac": 481, "rat": null, "stat": "registered_home", "first_seen": "2026-01-14T12:22:13Z", "last_seen": "2026-01-16T21:28:04Z", "count": 5, "lat": 50.060417, "lon": 14.399271000000002}, {"cell_id": 600881, "tac_lac": 65534, "rat": null, "stat": "registered_home", "first_seen": "2026-01-13T19:55:46Z", "last_seen": "2026-01-17T04:11:16Z", "count": 4, "lat": 50.0602704, "lon": 14.399337500000001}, {"cell_id": 9614102, "tac_lac": 481, "rat": null, "stat": "registered_home", "first_seen": "2026-01-13T17:10:28Z", "last_seen": "2026-01-15T04:00:58Z", "count": 6, "lat": 50.0603328, "lon": 14.399337233333332}, {"cell_id": 9614102, "tac_lac": 65534, "rat": null, "stat": "registered_home", "first_seen": "2026-01-14T06:09:08Z", "last_seen": "2026-01-17T05:11:13Z", "count": 4, "lat": 50.060319175000004, "lon": 14.399296225}, {"cell_id": 153825616, "tac_lac": 481, "rat": "LTE", "stat": "registered_home", "first_seen": "2026-01-11T22:03:01Z", "last_seen": "2026-01-14T08:00:48Z", "count": 36, "lat": 50.06044282777777, "lon": 14.399331986111113}, {"cell_id": 153825626, "tac_lac": 481, "rat": "LTE", "stat": "registered_home", "first_seen": "2026-01-11T19:50:10Z", "last_seen": "2026-01-13T15:21:04Z", "count": 258, "lat": 50.06127389496125, "lon": 14.399691503488363}, {"cell_id": 153825636, "tac_lac": 481, "rat": null, "stat": "registered_home", "first_seen": "2026-01-13T10:03:48Z", "last_seen": "2026-01-17T09:42:33Z", "count": 23, "lat": 50.060359278260876, "lon": 14.399313543478259}, {"cell_id": 153825636, "tac_lac": 481, "rat": "LTE", "stat": "registered_home", "first_seen": "2026-01-12T03:58:09Z", "last_seen": "2026-01-17T10:40:51Z", "count": 730, "lat": 50.06045550671221, "lon": 14.39937980082191}, {"cell_id": 153825636, "tac_lac": 65534, "rat": null, "stat": "registered_home", "first_seen": "2026-01-13T07:24:43Z", "last_seen": "2026-01-17T08:41:23Z", "count": 30, "lat": 50.06038466999999, "lon": 14.39930988666666}, {"cell_id": 153825646, "tac_lac": 481, "rat": null, "stat": "registered_home", "first_seen": "2026-01-12T22:04:57Z", "last_seen": "2026-01-16T13:57:35Z", "count": 32, "lat": 50.06034593124999, "lon": 14.399294790624998}, {"cell_id": 153825646, "tac_lac": 481, "rat": "LTE", "stat": "registered_home", "first_seen": "2026-01-11T18:33:35Z", "last_seen": "2026-01-16T16:24:32Z", "count": 2186, "lat": 50.060486796386, "lon": 14.399351787282724}, {"cell_id": 153825646, "tac_lac": 65534, "rat": null, "stat": "registered_home", "first_seen": "2026-01-12T21:05:43Z", "last_seen": "2026-01-16T15:23:10Z", "count": 51, "lat": 50.06033294509804, "lon": 14.399337747058816}, {"cell_id": 153825726, "tac_lac": 481, "rat": "LTE", "stat": "registered_home", "first_seen": "2026-01-11T20:00:26Z", "last_seen": "2026-01-11T23:37:03Z", "count": 80, "lat": 50.06037232125, "lon": 14.39931395875}, {"cell_id": 153945957, "tac_lac": 471, "rat": "LTE", "stat": "registered_home", "first_seen": "2026-01-12T07:35:07Z", "last_seen": "2026-01-12T07:35:07Z", "count": 1, "lat": 50.0629967, "lon": 14.4050333}, {"cell_id": 153956207, "tac_lac": 65534, "rat": null, "stat": "registered_home", "first_seen": "2026-01-12T08:32:06Z", "last_seen": "2026-01-12T08:32:06Z", "count": 1, "lat": 50.0751617, "lon": 14.4091833}, {"cell_id": 153979238, "tac_lac": 471, "rat": "LTE", "stat": "registered_home", "first_seen": "2026-01-12T07:35:21Z", "last_seen": "2026-01-12T07:35:21Z", "count": 1, "lat": 50.062955, "lon": 14.4049933}, {"cell_id": 153981778, "tac_lac": 482, "rat": "LTE", "stat": "registered_home", "first_seen": "2026-01-12T07:30:16Z", "last_seen": "2026-01-12T09:29:51Z", "count": 3, "lat": 50.06301333333334, "lon": 14.404919999999999}, {"cell_id": 153981888, "tac_lac": 482, "rat": "LTE", "stat": "registered_home", "first_seen": "2026-01-12T07:20:42Z", "last_seen": "2026-01-12T09:30:05Z", "count": 3, "lat": 50.061641666666674, "lon": 14.403078333333331}, {"cell_id": 154414418, "tac_lac": 471, "rat": "LTE", "stat": "registered_home", "first_seen": "2026-01-12T08:02:10Z", "last_seen": "2026-01-12T08:02:55Z", "count": 2, "lat": 50.07633250000001, "lon": 14.41772}, {"cell_id": 154762578, "tac_lac": 471, "rat": "LTE", "stat": "registered_home", "first_seen": "2026-01-12T08:12:54Z", "last_seen": "2026-01-12T08:12:54Z", "count": 1, "lat": 50.0768867, "lon": 14.418245}, {"cell_id": 154762598, "tac_lac": 471, "rat": "LTE", "stat": "registered_home", "first_seen": "2026-01-12T08:09:53Z", "last_seen": "2026-01-12T08:09:53Z", "count": 1, "lat": 50.0768867, "lon": 14.418245}, {"cell_id": 154762598, "tac_lac": 65534, "rat": null, "stat": "registered_home", "first_seen": "2026-01-12T08:11:18Z", "last_seen": "2026-01-12T08:11:18Z", "count": 1, "lat": 50.0768867, "lon": 14.418245}, {"cell_id": 155307866, "tac_lac": 471, "rat": "LTE", "stat": "registered_home", "first_seen": "2026-01-12T07:56:25Z", "last_seen": "2026-01-12T07:56:46Z", "count": 3, "lat": 50.07486333333333, "lon": 14.418626666666666}, {"cell_id": 155307876, "tac_lac": 471, "rat": "LTE", "stat": "registered_home", "first_seen": "2026-01-12T07:49:53Z", "last_seen": "2026-01-12T07:50:29Z", "count": 2, "lat": 50.07492, "lon": 14.419125}];
+
+    function escapeHtml(s) {
+      return String(s)
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&#039;');
+    }
+
+    function formatInfo(m) {
+      const title = `Cell ID: ${m.cell_id}`;
+      const rat = m.rat ?? '(unknown)';
+      const tac = (m.tac_lac === null || m.tac_lac === undefined) ? '(unknown)' : m.tac_lac;
+      const stat = m.stat ?? '(unknown)';
+      return `
+        <div class="info">
+          <h3>${escapeHtml(title)}</h3>
+          <div class="kv"><b>RAT</b>: ${escapeHtml(rat)}</div>
+          <div class="kv"><b>TAC/LAC</b>: ${escapeHtml(tac)}</div>
+          <div class="kv"><b>Status</b>: ${escapeHtml(stat)}</div>
+          <div class="kv"><b>First seen</b>: ${escapeHtml(m.first_seen)}</div>
+          <div class="kv"><b>Last seen</b>: ${escapeHtml(m.last_seen)}</div>
+          <div class="kv"><b>Count</b>: ${escapeHtml(m.count)}</div>
+          <div class="muted">Marker location is the average device GPS position when this tower was observed.</div>
+        </div>
+      `;
+    }
+
+    function initMap() {
+      const center = { lat: 50.060583223079014, lng: 14.399448366694333 };
+      const map = new google.maps.Map(document.getElementById("map"), {
+        center,
+        zoom: 14,
+        mapTypeId: "roadmap",
+      });
+
+      const infowindow = new google.maps.InfoWindow();
+
+      for (const m of MARKERS) {
+        const marker = new google.maps.Marker({
+          position: { lat: m.lat, lng: m.lon },
+          map,
+          title: `cell_id=${m.cell_id}`,
+        });
+
+        marker.addListener("click", () => {
+          infowindow.setContent(formatInfo(m));
+          infowindow.open({ anchor: marker, map });
+        });
+      }
+    }
+  </script>
+
+  <script async defer
+    src="https://maps.googleapis.com/maps/api/js?key=***REMOVED***&callback=initMap">
+  </script>
+</body>
+</html>
