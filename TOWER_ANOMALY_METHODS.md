@@ -22,6 +22,52 @@ These support two big families of detection:
 
 ---
 
+## Metric glossary (what the dashboard shows)
+
+Tower identity-ish fields:
+- `operator`: string from `network.cops_current.operator`.
+- `rat`: radio access technology (e.g., `LTE`, `GSM`) from registration / modem.
+- `tac_lac`: LTE TAC or 2G/3G LAC (area code).
+- `cell_id`: serving cell identifier (coarse; can be reused by networks over time).
+- `earfcn`: LTE frequency channel number (when available; helps disambiguate).
+- `pci`: LTE physical cell ID (when available; helps disambiguate sectors).
+
+Counts / time coverage:
+- `count`: how many samples this fingerprint was observed.
+- `days_seen`: number of distinct calendar days with ≥1 observation.
+- `duration_min`: `(last_seen - first_seen)` in minutes (first/last in the dataset window, not continuous uptime).
+- `sessions`: number of “sessions” separated by gaps ≥ 6 hours (crude disappear/reappear metric).
+- `max_gap_days`: largest time gap between consecutive observations (days).
+
+GPS robustness / “unbiasing”:
+- `gps_spread_m`: median distance (meters) from observations to the inferred tower center **after outlier trimming**; higher means less consistent.
+- Inferred tower center is computed via: median lat/lon → MAD trimming → trimmed/weighted mean (see script).
+
+Multi-location / “moving” proxies:
+- `clusters`: number of spatial clusters for this fingerprint using a small greedy clustering radius (default 400m).
+- `cluster_top2_sep_m`: distance (meters) between the two biggest clusters’ centers. Big values suggest the same fingerprint appears in multiple distinct places (often ID reuse or logging bias).
+- `center_drift_m`: maximum distance (meters) between weekly-binned inferred centers (proxy for long-term drift / ID reuse).
+
+Signal & signal-vs-distance:
+- `signal_median`: median of the chosen signal metric for this tower (often `rssi_dbm`; sometimes LTE `rsrp` if present).
+- `signal_robust_z`: robust z-score of `signal_median` vs the global dataset signal distribution, using MAD as scale.
+- `dist_outlier_frac`: fraction of samples that are large residual outliers (≥ 4*MAD) in a per-tower robust model `signal ~ a + b*log10(distance+1)`, where distance is computed from the inferred center (proxy for “signal too strong/weak for where you were”).
+
+Place-bucket baselines (tile buckets):
+- `places_n`: number of place buckets (OSM tiles at `--place-zoom`) where this tower was observed.
+- `place_entropy`: entropy of the tower’s place distribution (higher = more spread out across buckets).
+- `dense_place_novelty`: count of “dense” places (≥500 total samples in that place) where this tower appears only 1–2 times (a novelty-in-dense-areas indicator).
+- `change_places_frac`: fraction of this tower’s samples that occurred in places whose signal distribution appears to have changed sharply (place KS/CUSUM).
+- `place_rat_surprise`: average “RAT transition surprise” in places where this tower appears, computed as average negative log-probability under a smoothed bigram (Markov) model (higher = more chaotic RAT switching in that place).
+
+Pure-Python “ML-ish” outlier rankers (feature-vector novelty):
+- `ml_knn_score`: average distance to k nearest neighbors (k=5) in a scaled tower-feature space (higher = more isolated).
+- `ml_knn_z`: robust z-score of `ml_knn_score` across towers.
+- `ml_lof_score`: LOF-like density ratio (k=10) (higher = locally sparser than neighbors).
+- `ml_lof_z`: robust z-score of `ml_lof_score` across towers.
+
+--- 
+
 ## Statistical tests (practical)
 
 ### A) Univariate outlier tests
