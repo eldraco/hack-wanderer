@@ -1274,9 +1274,19 @@ def build_dashboard(markers: List[Dict[str, Any]], center: Tuple[float, float], 
     html, body {{ height: 100%; margin: 0; }}
     body {{ font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; }}
     #wrap {{ display: flex; flex-direction: column; height: 100%; }}
-    #map {{ flex: 1 1 auto; min-height: 240px; }}
-    /* Bottom panel is resizable; resizing changes table height and map adjusts automatically. */
-    #panel {{ flex: 0 0 auto; height: 40vh; min-height: 220px; max-height: 85vh; padding: 10px; overflow: auto; border-top: 1px solid #ddd; resize: vertical; }}
+    /* Allow the map to shrink all the way down if the user drags the panel up. */
+    #map {{ flex: 1 1 auto; min-height: 0; }}
+    /* Allow the panel to shrink near-zero (but keep a tiny handle area). */
+    #panel {{ flex: 0 0 auto; height: 40vh; padding: 10px; overflow: auto; border-top: 1px solid #ddd; }}
+    /* Resize handle is at the top of the table/panel (drag down/up). */
+    #resize-handle {{
+      height: 10px;
+      margin: -10px -10px 10px -10px;
+      cursor: row-resize;
+      background: linear-gradient(to bottom, #ffffff, #f3f4f6, #ffffff);
+      border-bottom: 1px solid #ddd;
+    }}
+    #resize-handle:hover {{ background: #e5e7eb; }}
     #tabs {{ display:flex; gap:8px; margin: 8px 0 10px 0; }}
     .tabbtn {{ padding: 6px 10px; border: 1px solid #ddd; background: #fff; border-radius: 8px; cursor: pointer; }}
     .tabbtn.active {{ background: #f3f4f6; }}
@@ -1294,12 +1304,38 @@ def build_dashboard(markers: List[Dict[str, Any]], center: Tuple[float, float], 
     tr:hover {{ background: #fafafa; }}
     .mono {{ font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }}
     .muted {{ color: #666; }}
+    .btn {{ padding: 4px 8px; border: 1px solid #ddd; background: #fff; border-radius: 8px; cursor: pointer; }}
+    .btn:hover {{ background: #f3f4f6; }}
+    /* Modal explain panel */
+    #modal {{ position: fixed; inset: 0; background: rgba(0,0,0,0.35); display:none; align-items: center; justify-content: center; z-index: 9999; }}
+    #modal.open {{ display:flex; }}
+    #modal-card {{ width: min(1100px, 96vw); height: min(86vh, 900px); background: #fff; border-radius: 14px; box-shadow: 0 10px 40px rgba(0,0,0,0.2); overflow: hidden; display:flex; flex-direction: column; }}
+    #modal-head {{ padding: 12px 14px; border-bottom: 1px solid #eee; display:flex; gap:10px; align-items:center; justify-content: space-between; }}
+    #modal-body {{ padding: 12px 14px; overflow: auto; }}
+    .grid2 {{ display:grid; grid-template-columns: 1fr 1fr; gap: 10px; }}
+    .card {{ border: 1px solid #eee; border-radius: 12px; padding: 10px; }}
+    .k {{ color:#111827; font-weight:600; }}
+    .v {{ color:#111827; }}
+    .pill {{ display:inline-block; padding: 2px 8px; border-radius: 999px; font-size:12px; border: 1px solid #e5e7eb; background:#f9fafb; }}
+    .pill.on {{ border-color:#bbf7d0; background:#dcfce7; }}
+    .pill.off {{ border-color:#fecaca; background:#fee2e2; }}
+    .rule {{ border-top: 1px solid #f3f4f6; padding: 10px 0; }}
+    .rule:first-child {{ border-top: 0; }}
+    .rule-title {{ display:flex; gap:8px; align-items: baseline; flex-wrap: wrap; }}
+    .rule-title .name {{ font-weight: 700; }}
+    .rule-title .points {{ font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }}
+    .rule-desc {{ margin-top: 4px; color:#374151; }}
+    .rule-why {{ margin-top: 6px; }}
+    .why-row {{ display:flex; gap:10px; flex-wrap: wrap; margin-top: 6px; }}
+    .why-box {{ border:1px solid #f3f4f6; border-radius: 10px; padding: 8px; background:#fff; }}
+    .why-box .mono {{ font-size: 12px; }}
   </style>
 </head>
 <body>
 <div id=\"wrap\">
   <div id=\"map\"></div>
   <div id=\"panel\">
+    <div id=\"resize-handle\" title=\"Drag to resize\"></div>
     <div id=\"tabs\">
       <button class=\"tabbtn active\" data-tab=\"tab-towers\">Towers</button>
       <button class=\"tabbtn\" data-tab=\"tab-methods\">Methods</button>
@@ -1335,7 +1371,8 @@ def build_dashboard(markers: List[Dict[str, Any]], center: Tuple[float, float], 
             <th data-k=\"places_n\">Places</th>
             <th data-k=\"ml_knn_z\">kNN z</th>
             <th data-k=\"ml_lof_z\">LOF z</th>
-            <th>Breakdown</th>
+            <th>Top drivers</th>
+            <th>Explain</th>
             <th>Flags</th>
           </tr>
         </thead>
@@ -1346,6 +1383,19 @@ def build_dashboard(markers: List[Dict[str, Any]], center: Tuple[float, float], 
     <div id=\"tab-methods\" class=\"tab\">
       {methods_html}
     </div>
+  </div>
+</div>
+
+<div id=\"modal\" role=\"dialog\" aria-modal=\"true\" aria-label=\"Explain score\">
+  <div id=\"modal-card\">
+    <div id=\"modal-head\">
+      <div>
+        <div id=\"modal-title\" style=\"font-weight:800;\"></div>
+        <div id=\"modal-sub\" class=\"muted mono\" style=\"margin-top:2px;\"></div>
+      </div>
+      <button id=\"modal-close\" class=\"btn\">Close</button>
+    </div>
+    <div id=\"modal-body\"></div>
   </div>
 </div>
 
@@ -1361,13 +1411,48 @@ def build_dashboard(markers: List[Dict[str, Any]], center: Tuple[float, float], 
     maxNativeZoom: 19,
     attribution: '&copy; OpenStreetMap contributors'
   }}).addTo(map);
-  // Keep Leaflet rendering correct if the bottom panel is resized.
-  if (window.ResizeObserver) {{
-    const ro = new ResizeObserver(() => map.invalidateSize());
-    ro.observe(document.getElementById('map'));
-  }} else {{
-    window.addEventListener('resize', () => map.invalidateSize());
+  // Keep Leaflet rendering correct if layout changes.
+  window.addEventListener('resize', () => map.invalidateSize());
+
+  // Splitter drag-to-resize implementation (more reliable than CSS resize handles).
+  const panel = document.getElementById('panel');
+  const handle = document.getElementById('resize-handle');
+  // Keep at least a sliver so the resize handle remains reachable.
+  const MIN_H = 28;
+  function clamp(v, lo, hi) {{ return Math.max(lo, Math.min(hi, v)); }}
+
+  function setPanelHeight(px) {{
+    // No artificial ceiling: allow the panel to consume almost the whole viewport.
+    const maxH = Math.max(MIN_H, Math.floor(window.innerHeight) - 0);
+    panel.style.height = clamp(px, MIN_H, maxH) + 'px';
+    try {{ localStorage.setItem('panel_h', panel.style.height); }} catch (e) {{}}
+    map.invalidateSize();
   }}
+
+  // Restore last size (if any)
+  try {{
+    const saved = localStorage.getItem('panel_h');
+    if (saved) panel.style.height = saved;
+  }} catch (e) {{}}
+
+  let drag = null;
+  handle.addEventListener('mousedown', (ev) => {{
+    drag = {{ startY: ev.clientY, startH: panel.getBoundingClientRect().height }};
+    document.body.style.userSelect = 'none';
+    document.body.style.cursor = 'row-resize';
+    ev.preventDefault();
+  }});
+  window.addEventListener('mousemove', (ev) => {{
+    if (!drag) return;
+    const dy = drag.startY - ev.clientY; // moving up increases panel height
+    setPanelHeight(drag.startH + dy);
+  }});
+  window.addEventListener('mouseup', () => {{
+    if (!drag) return;
+    drag = null;
+    document.body.style.userSelect = '';
+    document.body.style.cursor = '';
+  }});
 
   function esc(s) {{
     return String(s ?? '')
@@ -1387,6 +1472,285 @@ def build_dashboard(markers: List[Dict[str, Any]], center: Tuple[float, float], 
   const layer = L.layerGroup().addTo(map);
   const byId = new Map();
 
+  // Rule schema for XAI: points, description, thresholds, and feature usage.
+  // The explanation UI will show pass/fail and what values contributed.
+  const RULES = [
+    {{
+      id: 'ephemeral',
+      points: 3.0,
+      title: 'Ephemeral burst',
+      desc: 'Seen many times but only within a short overall time window.',
+      uses: ['count', 'duration_min'],
+      eval: (m) => {{
+        const ok = (m.count ?? 0) >= 5 && (m.duration_min ?? 1e9) <= 20;
+        return {{ ok, because: `count=${{m.count}} and duration_min=${{m.duration_min}} (needs count≥5 and duration≤20min)` }};
+      }}
+    }},
+    {{
+      id: 'strong_signal_global',
+      points: 2.0,
+      title: 'Strong signal vs dataset',
+      desc: 'Median signal is an outlier compared to the dataset-wide distribution (robust z).',
+      uses: ['signal_median', 'signal_robust_z'],
+      eval: (m) => {{
+        const z = m.signal_robust_z;
+        const ok = (typeof z === 'number') && z >= 4.0;
+        return {{ ok, because: `signal_robust_z=${{z}} (needs ≥ 4.0)` }};
+      }}
+    }},
+    {{
+      id: 'signal_distance_mismatch',
+      points: 2.0,
+      title: 'Signal-distance mismatch',
+      desc: 'Many samples are inconsistent with this tower’s own signal-vs-distance trend (proxy distance from inferred center).',
+      uses: ['dist_outlier_frac'],
+      eval: (m) => {{
+        const f = m.dist_outlier_frac;
+        const ok = (typeof f === 'number') && f >= 0.25;
+        return {{ ok, because: `dist_outlier_frac=${{f}} (needs ≥ 0.25)` }};
+      }}
+    }},
+    {{
+      id: 'location_spread',
+      points: 2.0,
+      title: 'High location spread',
+      desc: 'Observations are geographically inconsistent even after robust centering.',
+      uses: ['gps_spread_m','count'],
+      eval: (m) => {{
+        const ok = (typeof m.gps_spread_m === 'number') && m.gps_spread_m >= 250 && (m.count ?? 0) >= 10;
+        return {{ ok, because: `gps_spread_m=${{m.gps_spread_m}} with count=${{m.count}} (needs spread≥250m and count≥10)` }};
+      }}
+    }},
+    {{
+      id: 'multi_location',
+      points: 2.5,
+      title: 'Multi-location clusters',
+      desc: 'Same fingerprint forms multiple spatial clusters far apart.',
+      uses: ['clusters','cluster_top2_sep_m','count'],
+      eval: (m) => {{
+        const ok = (m.clusters ?? 0) >= 2 && (typeof m.cluster_top2_sep_m === 'number') && m.cluster_top2_sep_m >= 1500 && (m.count ?? 0) >= 15;
+        return {{ ok, because: `clusters=${{m.clusters}}, top2_sep_m=${{m.cluster_top2_sep_m}} (needs clusters≥2, sep≥1500m, count≥15)` }};
+      }}
+    }},
+    {{
+      id: 'center_drift',
+      points: 2.0,
+      title: 'Center drift over weeks',
+      desc: 'Inferred center shifts a lot across weekly bins (proxy for ID reuse / changed observation corridors).',
+      uses: ['center_drift_m','count'],
+      eval: (m) => {{
+        const ok = (typeof m.center_drift_m === 'number') && m.center_drift_m >= 1200 && (m.count ?? 0) >= 30;
+        return {{ ok, because: `center_drift_m=${{m.center_drift_m}} (needs ≥1200m, count≥30)` }};
+      }}
+    }},
+    {{
+      id: 'reappears',
+      points: 1.5,
+      title: 'Reappears in sessions',
+      desc: 'Seen in many separated sessions (gap≥6h).',
+      uses: ['sessions','count'],
+      eval: (m) => {{
+        const ok = (m.sessions ?? 0) >= 4 && (m.count ?? 0) >= 20;
+        return {{ ok, because: `sessions=${{m.sessions}} (needs ≥4) with count=${{m.count}} (needs ≥20)` }};
+      }}
+    }},
+    {{
+      id: 'long_absence',
+      points: 1.5,
+      title: 'Long absence',
+      desc: 'Large gaps between sightings (days).',
+      uses: ['max_gap_days','count'],
+      eval: (m) => {{
+        const ok = (typeof m.max_gap_days === 'number') && m.max_gap_days >= 7 && (m.count ?? 0) >= 10;
+        return {{ ok, because: `max_gap_days=${{m.max_gap_days}} (needs ≥7) with count=${{m.count}} (needs ≥10)` }};
+      }}
+    }},
+    {{
+      id: 'non_lte_when_mostly_lte',
+      points: 2.0,
+      title: 'Non-LTE while baseline is LTE',
+      desc: 'RAT is GSM/2G while your dataset is mostly LTE.',
+      uses: ['rat','dataset_mostly_lte'],
+      eval: (m) => {{
+        const rat = String(m.rat ?? '').toUpperCase();
+        const ok = !!m.dataset_mostly_lte && (rat === 'GSM' || rat === '2G');
+        return {{ ok, because: `rat=${{rat}} and dataset_mostly_lte=${{m.dataset_mostly_lte}} (needs GSM/2G + mostly LTE baseline)` }};
+      }}
+    }},
+    {{
+      id: 'novel_in_dense_places',
+      points: 1.5,
+      title: 'Novel in dense places',
+      desc: 'Shows up only 1–2 times in places where you otherwise have lots of samples.',
+      uses: ['dense_place_novelty','count'],
+      eval: (m) => {{
+        const ok = (m.dense_place_novelty ?? 0) >= 2 && (m.count ?? 0) >= 10;
+        return {{ ok, because: `dense_place_novelty=${{m.dense_place_novelty}} (needs ≥2) with count=${{m.count}} (needs ≥10)` }};
+      }}
+    }},
+    {{
+      id: 'place_change_correlation',
+      points: 1.0,
+      title: 'Correlates with place changes',
+      desc: 'Most sightings occur in place buckets whose distributions show change (KS/CUSUM).',
+      uses: ['change_places_frac','count'],
+      eval: (m) => {{
+        const ok = (typeof m.change_places_frac === 'number') && m.change_places_frac >= 0.5 && (m.count ?? 0) >= 20;
+        return {{ ok, because: `change_places_frac=${{m.change_places_frac}} (needs ≥0.5) with count=${{m.count}} (needs ≥20)` }};
+      }}
+    }},
+    {{
+      id: 'rat_transition_surprise',
+      points: 1.0,
+      title: 'RAT transition surprise',
+      desc: 'Places associated with this tower show unusually chaotic RAT switching.',
+      uses: ['place_rat_surprise','count'],
+      eval: (m) => {{
+        const ok = (typeof m.place_rat_surprise === 'number') && m.place_rat_surprise >= 1.2 && (m.count ?? 0) >= 30;
+        return {{ ok, because: `place_rat_surprise=${{m.place_rat_surprise}} (needs ≥1.2) with count=${{m.count}} (needs ≥30)` }};
+      }}
+    }},
+    {{
+      id: 'wide_area',
+      points: 1.0,
+      title: 'Wide area (entropy)',
+      desc: 'Spread across many place buckets; only adds points when already multi-location.',
+      uses: ['place_entropy','places_n','clusters'],
+      eval: (m) => {{
+        const ok = (typeof m.place_entropy === 'number') && m.place_entropy >= 2.5 && (m.count ?? 0) >= 30 && (m.clusters ?? 0) >= 2;
+        return {{ ok, because: `place_entropy=${{m.place_entropy}} (needs ≥2.5) and clusters=${{m.clusters}} (needs ≥2) and count=${{m.count}} (needs ≥30)` }};
+      }}
+    }},
+    {{
+      id: 'ml_knn',
+      points: 1.0,
+      title: 'kNN feature-space outlier',
+      desc: 'Outlier in the multi-feature tower behavior space (kNN distance).',
+      uses: ['ml_knn_z','count'],
+      eval: (m) => {{
+        const ok = (typeof m.ml_knn_z === 'number') && m.ml_knn_z >= 4.0 && (m.count ?? 0) >= 15;
+        return {{ ok, because: `ml_knn_z=${{m.ml_knn_z}} (needs ≥4.0) with count=${{m.count}} (needs ≥15)` }};
+      }}
+    }},
+    {{
+      id: 'ml_lof',
+      points: 1.0,
+      title: 'LOF feature-space outlier',
+      desc: 'Locally sparse vs neighbors in feature space (LOF-like).',
+      uses: ['ml_lof_z','count','ml_mode'],
+      eval: (m) => {{
+        if (m.ml_mode === 'approx') return {{ ok:false, because:'LOF disabled in approx mode (kept neutral).'}};
+        const ok = (typeof m.ml_lof_z === 'number') && m.ml_lof_z >= 4.0 && (m.count ?? 0) >= 15;
+        return {{ ok, because: `ml_lof_z=${{m.ml_lof_z}} (needs ≥4.0) with count=${{m.count}} (needs ≥15)` }};
+      }}
+    }},
+  ];
+
+  function buildXai(m) {{
+    const rows = [];
+    let total = 0;
+    for (const r of RULES) {{
+      const ev = r.eval(m);
+      const pts = ev.ok ? r.points : 0.0;
+      total += pts;
+      rows.push({{ id: r.id, ok: ev.ok, pts, title: r.title, desc: r.desc, uses: r.uses, because: ev.because }});
+    }}
+    // sort by points desc then title
+    rows.sort((a,b) => (b.pts - a.pts) || a.title.localeCompare(b.title));
+    return {{ total, rows }};
+  }}
+
+  function topDrivers(m, n=3) {{
+    const x = buildXai(m);
+    const on = x.rows.filter(r => r.pts > 0).slice(0, n);
+    if (!on.length) return '—';
+    return on.map(r => `${{r.id}} +${{r.pts}}`).join(' | ');
+  }}
+
+  function openExplain(m) {{
+    const modal = document.getElementById('modal');
+    const body = document.getElementById('modal-body');
+
+    document.getElementById('modal-title').textContent = m.label;
+    document.getElementById('modal-sub').textContent =
+      `score=${{m.anomaly_score.toFixed(1)}}  count=${{m.count}}  days=${{m.days_seen}}  first=${{m.first_seen}}  last=${{m.last_seen}}`;
+
+    const metricBox = (k, v) =>
+      `<div class=\"why-box\"><div class=\"muted\">${{esc(k)}}</div><div class=\"mono\">${{esc(v ?? '—')}}</div></div>`;
+
+    const summary = `
+      <div class=\"grid2\">
+        <div class=\"card\">
+          <div class=\"k\">Total score</div>
+          <div class=\"v mono\" style=\"font-size:18px; margin-top:4px;\">${{m.anomaly_score.toFixed(1)}}</div>
+          <div class=\"muted\" style=\"margin-top:6px;\">Sum of rule point contributions below.</div>
+        </div>
+        <div class=\"card\">
+          <div class=\"k\">Top drivers</div>
+          <div class=\"v mono\" style=\"margin-top:4px;\">${{topDrivers(m, 6)}}</div>
+          <div class=\"muted\" style=\"margin-top:6px;\">Rules that triggered and added points.</div>
+        </div>
+      </div>
+    `;
+
+    const metrics = `
+      <div class=\"card\" style=\"margin-top:10px;\">
+        <div class=\"k\">Key metrics (inputs)</div>
+        <div class=\"why-row\">
+          ${{metricBox('duration_min', m.duration_min)}}
+          ${{metricBox('sessions', m.sessions)}}
+          ${{metricBox('max_gap_days', m.max_gap_days)}}
+          ${{metricBox('signal_median', m.signal_median)}}
+          ${{metricBox('signal_robust_z', m.signal_robust_z)}}
+          ${{metricBox('gps_spread_m', m.gps_spread_m)}}
+          ${{metricBox('clusters', m.clusters)}}
+          ${{metricBox('cluster_top2_sep_m', m.cluster_top2_sep_m)}}
+          ${{metricBox('center_drift_m', m.center_drift_m)}}
+          ${{metricBox('dist_outlier_frac', m.dist_outlier_frac)}}
+          ${{metricBox('dense_place_novelty', m.dense_place_novelty)}}
+          ${{metricBox('change_places_frac', m.change_places_frac)}}
+          ${{metricBox('place_rat_surprise', m.place_rat_surprise)}}
+          ${{metricBox('place_entropy', m.place_entropy)}}
+          ${{metricBox('places_n', m.places_n)}}
+          ${{metricBox('ml_knn_z', m.ml_knn_z)}}
+          ${{metricBox('ml_lof_z', m.ml_lof_z)}}
+          ${{metricBox('ml_mode', m.ml_mode)}}
+          ${{metricBox('dataset_mostly_lte', m.dataset_mostly_lte)}}
+        </div>
+      </div>
+    `;
+
+    const x = buildXai(m);
+    const rulesHtml = x.rows.map(r => {{
+      const pill = r.ok ? '<span class=\"pill on\">triggered</span>' : '<span class=\"pill off\">not triggered</span>';
+      const pts = r.ok ? `+${{r.pts.toFixed(1)}}` : '+0.0';
+      const uses = (r.uses||[]).map(u => `<span class=\"pill mono\">${{esc(u)}}</span>`).join(' ');
+      return `
+        <div class=\"rule\">
+          <div class=\"rule-title\">
+            <span class=\"name\">${{esc(r.title)}}</span>
+            ${{pill}}
+            <span class=\"points\">${{pts}}</span>
+          </div>
+          <div class=\"rule-desc\">${{esc(r.desc)}}</div>
+          <div class=\"rule-why\">
+            <div class=\"muted\">Uses:</div>
+            <div class=\"why-row\">${{uses}}</div>
+            <div class=\"muted\" style=\"margin-top:6px;\">Decision:</div>
+            <div class=\"mono\">${{esc(r.because)}}</div>
+          </div>
+        </div>
+      `;
+    }}).join('');
+
+    body.innerHTML = summary + metrics +
+      `<div class=\"card\" style=\"margin-top:10px;\"><div class=\"k\">Rule-by-rule contributions</div>${{rulesHtml}}</div>`;
+    modal.classList.add('open');
+  }}
+
+  document.getElementById('modal-close').addEventListener('click', () => document.getElementById('modal').classList.remove('open'));
+  document.getElementById('modal').addEventListener('click', (ev) => {{ if (ev.target && ev.target.id === 'modal') ev.currentTarget.classList.remove('open'); }});
+
   for (const m of MARKERS) {{
     if (m.lat == null || m.lon == null) continue;
     const cls = scoreClass(m.anomaly_score);
@@ -1403,7 +1767,8 @@ def build_dashboard(markers: List[Dict[str, Any]], center: Tuple[float, float], 
     }}
 
     const flags = (m.flags || []).map(f => `<span class="badge">${{esc(f)}}</span>`).join(' ');
-    const breakdown = (m.score_breakdown || []).map(b => `<div class="mono"><b>${{esc(b.rule)}}</b> +${{b.points}} — ${{esc(b.because)}}</div>`).join('');
+    // Popup: human summary + link to full explain modal
+    const driverText = topDrivers(m, 4);
     const popup = `
       <div style="min-width:280px">
         <div class="badge ${{cls}}"><b>Score</b>: ${{m.anomaly_score.toFixed(1)}}</div>
@@ -1431,14 +1796,21 @@ def build_dashboard(markers: List[Dict[str, Any]], center: Tuple[float, float], 
           <div><b>ML LOF z</b>: ${{m.ml_lof_z ?? ''}} (score=${{m.ml_lof_score ?? ''}})</div>
         </div>
         <div style="margin-top:8px">${{flags}}</div>
-        <div style="margin-top:10px"><b>Score breakdown</b></div>
-        <div style="margin-top:6px">${{breakdown || '<div class=\"muted\">No rules triggered.</div>'}}</div>
+        <div style="margin-top:10px"><b>Top drivers</b></div>
+        <div class="mono" style="margin-top:6px">${{esc(driverText)}}</div>
+        <div style="margin-top:10px"><button class="btn" onclick="window.__OPEN_EXPLAIN(${{m.id}})">Explain score</button></div>
       </div>
     `;
     marker.bindPopup(popup);
 
     byId.set(m.id, {{m, marker}});
   }}
+
+  // Expose openExplain to popup onclick.
+  window.__OPEN_EXPLAIN = (id) => {{
+    const rec = byId.get(id);
+    if (rec) openExplain(rec.m);
+  }};
 
   // Table
   const tbody = document.querySelector('#tbl tbody');
@@ -1465,7 +1837,7 @@ def build_dashboard(markers: List[Dict[str, Any]], center: Tuple[float, float], 
     for (const r of rows) {{
       const cls = scoreClass(r.anomaly_score);
       const tr = document.createElement('tr');
-      const breakdownText = (r.score_breakdown || []).map(b => `${{esc(b.rule)}} +${{b.points}}`).join(' | ');
+      const drivers = topDrivers(r, 4);
       tr.innerHTML = `
         <td><span class="badge ${{cls}} mono">${{r.anomaly_score.toFixed(1)}}</span></td>
         <td>${{esc(r.label)}}</td>
@@ -1488,9 +1860,14 @@ def build_dashboard(markers: List[Dict[str, Any]], center: Tuple[float, float], 
         <td class="mono">${{r.places_n ?? ''}}</td>
         <td class="mono">${{r.ml_knn_z ?? ''}}</td>
         <td class="mono">${{r.ml_lof_z ?? ''}}</td>
-        <td class="mono" title="${{esc(breakdownText)}}">${{esc(breakdownText)}}</td>
+        <td class="mono" title="${{esc(drivers)}}">${{esc(drivers)}}</td>
+        <td><button class="btn" type="button">Explain</button></td>
         <td>${{(r.flags||[]).map(f=>`<span class="badge">${{esc(f)}}</span>`).join(' ')}}</td>
       `;
+      tr.querySelector('button').addEventListener('click', (ev) => {{
+        ev.stopPropagation();
+        openExplain(r);
+      }});
       tr.addEventListener('click', () => {{
         const rec = byId.get(r.id);
         if (rec) {{
@@ -1861,6 +2238,7 @@ def main() -> int:
             "ml_knn_z": round(a.features.get("ml_knn_z"), 2) if isinstance(a.features.get("ml_knn_z"), (int, float)) else None,
             "ml_lof_z": round(a.features.get("ml_lof_z"), 2) if isinstance(a.features.get("ml_lof_z"), (int, float)) else None,
             "ml_mode": ml_mode,
+            "dataset_mostly_lte": bool(global_stats.get("mostly_lte")),
             "n_points": a.center_meta.get("n"),
             "n_used": a.center_meta.get("n_used"),
             "search": search,
