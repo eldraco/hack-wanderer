@@ -27,6 +27,7 @@ import html
 import json
 import math
 import os
+import random
 import statistics
 from collections import Counter, defaultdict
 from dataclasses import dataclass
@@ -81,6 +82,22 @@ def pick_location(obj: Dict[str, Any]) -> Optional[Tuple[float, float]]:
         return float(lat2), float(lon2)
 
     return None
+
+
+def to_epoch_seconds(t: dt.datetime) -> float:
+    if t.tzinfo is None:
+        # assume UTC-ish
+        return t.replace(tzinfo=dt.timezone.utc).timestamp()
+    return t.timestamp()
+
+
+def epoch_to_iso(ts: float) -> str:
+    return dt.datetime.fromtimestamp(ts, tz=dt.timezone.utc).isoformat(timespec="seconds")
+
+
+def day_id_from_epoch(ts: float) -> int:
+    # UTC day number
+    return int(ts // 86400)
 
 
 def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -452,7 +469,7 @@ def cluster_centers_simple(
 
 
 def center_drift_over_time(
-    points: List[Tuple[dt.datetime, float, float, Optional[float]]],
+    points: List[Tuple[float, float, float, Optional[float]]],
     min_points_per_bin: int = 15,
 ) -> Dict[str, Any]:
     """
@@ -466,7 +483,7 @@ def center_drift_over_time(
     start = pts[0][0]
     bins: Dict[int, List[Tuple[float, float, Optional[float]]]] = defaultdict(list)
     for t, lat, lon, sig in pts:
-        week = int((t - start).total_seconds() // (7 * 24 * 3600))
+        week = int((t - start) // (7 * 24 * 3600))
         bins[week].append((lat, lon, sig))
 
     centers: List[Tuple[float, float]] = []
@@ -515,21 +532,27 @@ class TowerKey:
 @dataclass
 class TowerAgg:
     key: TowerKey
-    first_seen: dt.datetime
-    last_seen: dt.datetime
+    first_seen_ts: float
+    last_seen_ts: float
     count: int = 0
 
-    # samples: (lat, lon, signal)
-    points: List[Tuple[float, float, Optional[float]]] = dataclasses.field(default_factory=list)
-    # timestamps for ephemerality / time-of-day
-    times: List[dt.datetime] = dataclasses.field(default_factory=list)
-    # place buckets (tile IDs) where observed
-    places: Counter = dataclasses.field(default_factory=Counter)
-    # per-place signal samples (reservoir-capped)
-    place_signals: Dict[str, List[float]] = dataclasses.field(default_factory=dict)
+    # distinct UTC days (as ints)
+    days: set = dataclasses.field(default_factory=set)
 
-    # signal metrics
-    signal_values: List[float] = dataclasses.field(default_factory=list)
+    # session + gap tracking (streaming)
+    last_observed_ts: Optional[float] = None
+    max_gap_s: float = 0.0
+    sessions: int = 0
+
+    # Memory-bounded reservoir sample: (lat, lon, signal, ts)
+    sample: List[Tuple[float, float, Optional[float], float]] = dataclasses.field(default_factory=list)
+    sample_seen: int = 0
+
+    # place buckets (tile IDs) where observed (counts only)
+    places: Counter = dataclasses.field(default_factory=Counter)
+
+    # online clusters (greedy) for multi-location detection: (lat, lon, n)
+    clusters_online: List[Tuple[float, float, int]] = dataclasses.field(default_factory=list)
 
     # computed
     center_lat: Optional[float] = None
@@ -540,56 +563,147 @@ class TowerAgg:
     features: Dict[str, Any] = dataclasses.field(default_factory=dict)
     anomaly_score: float = 0.0
 
-    def add(self, when: dt.datetime, lat: float, lon: float, signal: Optional[float], place_id: Optional[str]) -> None:
-        if when < self.first_seen:
-            self.first_seen = when
-        if when > self.last_seen:
-            self.last_seen = when
+    def add(
+        self,
+        when_ts: float,
+        lat: float,
+        lon: float,
+        signal: Optional[float],
+        place_id: Optional[str],
+        *,
+        sample_size: int,
+        cluster_radius_m: float,
+        session_gap_s: float,
+        rng: random.Random,
+    ) -> None:
+        if when_ts < self.first_seen_ts:
+            self.first_seen_ts = when_ts
+        if when_ts > self.last_seen_ts:
+            self.last_seen_ts = when_ts
         self.count += 1
-        self.points.append((lat, lon, signal))
-        self.times.append(when)
+
+        self.days.add(day_id_from_epoch(when_ts))
+
+        if self.last_observed_ts is None:
+            self.sessions = 1
+        else:
+            gap = when_ts - self.last_observed_ts
+            if gap > self.max_gap_s:
+                self.max_gap_s = gap
+            if gap >= session_gap_s:
+                self.sessions += 1
+        self.last_observed_ts = when_ts
+
+        # reservoir sampling (bounded memory)
+        self.sample_seen += 1
+        if sample_size > 0:
+            if len(self.sample) < sample_size:
+                self.sample.append((lat, lon, signal, when_ts))
+            else:
+                j = rng.randrange(self.sample_seen)
+                if j < sample_size:
+                    self.sample[j] = (lat, lon, signal, when_ts)
+
         if place_id:
             self.places[place_id] += 1
-            if isinstance(signal, (int, float)):
-                bucket = self.place_signals.get(place_id)
-                if bucket is None:
-                    bucket = []
-                    self.place_signals[place_id] = bucket
-                # cap memory: keep up to 200 samples per place per tower
-                if len(bucket) < 200:
-                    bucket.append(float(signal))
-        if isinstance(signal, (int, float)):
-            self.signal_values.append(float(signal))
+
+        # online clustering
+        if cluster_radius_m > 0:
+            best_idx = None
+            best_d = None
+            for i, (clat, clon, n) in enumerate(self.clusters_online):
+                d = haversine_m(clat, clon, lat, lon)
+                if d <= cluster_radius_m and (best_d is None or d < best_d):
+                    best_idx = i
+                    best_d = d
+            if best_idx is None:
+                self.clusters_online.append((lat, lon, 1))
+            else:
+                clat, clon, n = self.clusters_online[best_idx]
+                n2 = n + 1
+                self.clusters_online[best_idx] = (clat + (lat - clat) / n2, clon + (lon - clon) / n2, n2)
 
 
 @dataclass
 class PlaceAgg:
     place_id: str
     count: int = 0
-    # overall signal series in this place (capped)
-    signals: List[float] = dataclasses.field(default_factory=list)
-    # time-ordered signal series (capped)
-    signals_time: List[Tuple[dt.datetime, float]] = dataclasses.field(default_factory=list)
-    # tower counts in this place
-    towers: Counter = dataclasses.field(default_factory=Counter)
-    # coarse RAT sequence (time ordered, capped)
-    rat_seq: List[str] = dataclasses.field(default_factory=list)
-    rat_seq_time: List[Tuple[dt.datetime, str]] = dataclasses.field(default_factory=list)
+    # Reservoir sample of (ts, signal) for distribution/change estimation (bounded memory)
+    signal_sample: List[Tuple[float, float]] = dataclasses.field(default_factory=list)
+    signal_seen: int = 0
+    signal_sample_size: int = 1000
+    # Approx distinct tower count via bitmap hashing
+    distinct_bitmap_bits: int = 2048
+    distinct_bitmap: int = 0
+    # RAT transition counts (for bigram surprise), streaming
+    rat_states: set = dataclasses.field(default_factory=set)
+    rat_out: Counter = dataclasses.field(default_factory=Counter)
+    rat_trans: Dict[str, Counter] = dataclasses.field(default_factory=dict)
+    last_rat: Optional[str] = None
 
-    def add(self, when: dt.datetime, tower_key: TowerKey, signal: Optional[float]) -> None:
+    def add(self, when_ts: float, tower_key: TowerKey, signal: Optional[float]) -> None:
         self.count += 1
-        self.towers[tower_key] += 1
+        # update approx distinct towers
+        h = hash((tower_key.operator, tower_key.rat, tower_key.tac_lac, tower_key.cell_id, tower_key.earfcn, tower_key.pci))
+        idx = h % self.distinct_bitmap_bits
+        self.distinct_bitmap |= (1 << idx)
+
+        # reservoir sample of signals
         if isinstance(signal, (int, float)):
-            if len(self.signals) < 5000:
-                self.signals.append(float(signal))
-            if len(self.signals_time) < 5000:
-                self.signals_time.append((when, float(signal)))
+            self.signal_seen += 1
+            s = float(signal)
+            if len(self.signal_sample) < self.signal_sample_size:
+                self.signal_sample.append((when_ts, s))
+            else:
+                j = (h ^ int(when_ts)) % self.signal_seen
+                if j < self.signal_sample_size:
+                    self.signal_sample[j] = (when_ts, s)
+
+        # RAT transitions
         rat = (tower_key.rat or "").upper()
         if rat:
-            if len(self.rat_seq) < 5000:
-                self.rat_seq.append(rat)
-            if len(self.rat_seq_time) < 5000:
-                self.rat_seq_time.append((when, rat))
+            self.rat_states.add(rat)
+            if self.last_rat is not None:
+                self.rat_out[self.last_rat] += 1
+                bucket = self.rat_trans.get(self.last_rat)
+                if bucket is None:
+                    bucket = Counter()
+                    self.rat_trans[self.last_rat] = bucket
+                bucket[rat] += 1
+            self.last_rat = rat
+
+    def distinct_towers_est(self) -> int:
+        # Linear counting estimate from bitmap occupancy
+        m = self.distinct_bitmap_bits
+        v = m - self.distinct_bitmap.bit_count()
+        if v <= 0:
+            return m
+        return int(round(-m * math.log(v / m)))
+
+    def rat_surprise(self, alpha: float = 0.5) -> Optional[float]:
+        """
+        Average negative log-probability of observed RAT transitions using add-alpha smoothing.
+        Computed from transition counts (streaming, no full sequence stored).
+        """
+        if not self.rat_trans:
+            return None
+        states = sorted(self.rat_states)
+        n = len(states)
+        if n < 2:
+            return 0.0
+        total = 0
+        s = 0.0
+        for a, out_n in self.rat_out.items():
+            bucket = self.rat_trans.get(a) or Counter()
+            denom = out_n + alpha * n
+            for b, c in bucket.items():
+                numer = c + alpha
+                p = numer / denom
+                s += (-math.log(max(p, 1e-12))) * c
+                total += c
+        if total <= 0:
+            return None
+        return s / total
 
 
 def safe_int(value: Any) -> Optional[int]:
@@ -689,24 +803,14 @@ def compute_features(agg: TowerAgg, global_stats: Dict[str, Any]) -> Tuple[Dict[
     breakdown: List[Dict[str, Any]] = []
 
     # Ephemerality
-    duration_s = (agg.last_seen - agg.first_seen).total_seconds()
+    duration_s = float(agg.last_seen_ts - agg.first_seen_ts)
     feats["duration_s"] = duration_s
-    feats["days_seen"] = len({t.date().isoformat() for t in agg.times})
-    if agg.times:
-        sorted_times = sorted(agg.times)
-        gaps_s = [(b - a).total_seconds() for a, b in zip(sorted_times, sorted_times[1:])]
-        feats["max_gap_s"] = max(gaps_s) if gaps_s else 0.0
-        # A crude \"session\" definition: a new session starts after a long gap.
-        # Use 6 hours to separate day driving vs continuous sampling.
-        session_gap_s = 6 * 3600
-        sessions = 1
-        for g in gaps_s:
-            if g >= session_gap_s:
-                sessions += 1
-        feats["sessions"] = sessions
+    feats["days_seen"] = len(agg.days)
+    feats["max_gap_s"] = agg.max_gap_s
+    feats["sessions"] = agg.sessions
 
     # Signal stats
-    sig = agg.signal_values
+    sig = [float(s) for _lat, _lon, s, _ts in agg.sample if isinstance(s, (int, float))]
     feats["signal_n"] = len(sig)
     feats["signal_median"] = median(sig) if sig else None
     feats["signal_mad"] = mad(sig) if sig else None
@@ -729,23 +833,24 @@ def compute_features(agg: TowerAgg, global_stats: Dict[str, Any]) -> Tuple[Dict[
     else:
         feats["places_n"] = 0
 
-    # Multi-location clustering (same fingerprint seen in distinct places)
-    raw_points = [(lat, lon) for lat, lon, _ in agg.points]
-    clusters = cluster_centers_simple(raw_points, max_cluster_radius_m=400.0) if raw_points else []
+    # Multi-location clustering (streaming, from online clusters)
+    clusters = list(agg.clusters_online)
+    clusters.sort(key=lambda x: -x[2])
     feats["clusters"] = len(clusters)
     if len(clusters) >= 2:
-        # distance between top two clusters
-        c0 = clusters[0]
-        c1 = clusters[1]
-        feats["cluster_top2_sep_m"] = haversine_m(c0[0], c0[1], c1[0], c1[1])
+        feats["cluster_top2_sep_m"] = haversine_m(clusters[0][0], clusters[0][1], clusters[1][0], clusters[1][1])
 
     # Center drift over time (weekly bins)
-    drift = center_drift_over_time([(t, lat, lon, sig) for (t, (lat, lon, sig)) in zip(agg.times, agg.points)])
+    drift = center_drift_over_time([(ts, lat, lon, s) for (lat, lon, s, ts) in agg.sample], min_points_per_bin=15)
     feats["center_drift"] = drift
 
     # Signal vs (proxy) distance consistency
     if agg.center_lat is not None and agg.center_lon is not None:
-        dist_model = robust_residuals_signal_vs_distance(agg.center_lat, agg.center_lon, agg.points)
+        dist_model = robust_residuals_signal_vs_distance(
+            agg.center_lat,
+            agg.center_lon,
+            [(lat, lon, s) for (lat, lon, s, _ts) in agg.sample],
+        )
         feats["signal_dist_model"] = dist_model
 
     # Simple anomaly scoring (0..)
@@ -880,7 +985,9 @@ def compute_global_stats(aggs: List[TowerAgg]) -> Dict[str, Any]:
     rats = Counter()
     for a in aggs:
         rats[(a.key.rat or "").upper()] += a.count
-        all_sig.extend(a.signal_values)
+        for _, _, sig, _ts in a.sample:
+            if isinstance(sig, (int, float)):
+                all_sig.append(float(sig))
     return {
         "signal_median": median(all_sig) if all_sig else None,
         "signal_mad": mad(all_sig) if all_sig else None,
@@ -970,6 +1077,38 @@ def lof_anomaly_scores(vectors: Dict[TowerKey, List[float]], k: int = 10) -> Dic
         ratios = [(lrd[j] / lrd[i]) for j in neighbors[i]] if neighbors[i] else [1.0]
         lof[ki] = sum(ratios) / len(ratios)
     return lof
+
+
+def knn_anomaly_scores_approx(
+    vectors: Dict[TowerKey, List[float]],
+    k: int = 5,
+    reference_size: int = 800,
+    seed: int = 1,
+) -> Dict[TowerKey, float]:
+    """
+    Approximate kNN anomaly score using a fixed reference subset.
+    Complexity: O(n * reference_size), no O(n^2) memory.
+    """
+    import random
+
+    keys = list(vectors.keys())
+    if len(keys) < max(10, k + 1):
+        return {k0: 0.0 for k0 in keys}
+
+    rnd = random.Random(seed)
+    ref = keys[:] if len(keys) <= reference_size else rnd.sample(keys, reference_size)
+    scores: Dict[TowerKey, float] = {}
+    for ki in keys:
+        vi = vectors[ki]
+        dists = []
+        for kj in ref:
+            if kj == ki:
+                continue
+            dists.append(vector_distance(vi, vectors[kj]))
+        dists.sort()
+        nn = dists[:k]
+        scores[ki] = sum(nn) / len(nn) if nn else 0.0
+    return scores
 
 
 def build_dashboard(markers: List[Dict[str, Any]], center: Tuple[float, float], out_path: str) -> None:
@@ -1087,6 +1226,40 @@ def build_dashboard(markers: List[Dict[str, Any]], center: Tuple[float, float], 
 <div class="muted" style="margin-top:10px; max-width: 980px;">
   Note: <span class="mono">rare</span> is tracked but not scored by itself to avoid flagging far-away cells.
 </div>
+
+<h3 style="margin:18px 0 6px 0;">Metric glossary (columns)</h3>
+<div class="muted" style="max-width: 980px; margin-bottom: 10px;">
+  These are the raw values shown in the Towers table and in marker popups.
+</div>
+<table style="width:100%; border-collapse: collapse; font-size: 13px;">
+  <thead>
+    <tr>
+      <th style="text-align:left; border-bottom:1px solid #eee; padding:6px;">Metric</th>
+      <th style="text-align:left; border-bottom:1px solid #eee; padding:6px;">Meaning</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr><td class="mono" style="border-bottom:1px solid #f3f4f6; padding:6px;">count</td><td style="border-bottom:1px solid #f3f4f6; padding:6px;">Samples where this fingerprint was observed.</td></tr>
+    <tr><td class="mono" style="border-bottom:1px solid #f3f4f6; padding:6px;">days_seen</td><td style="border-bottom:1px solid #f3f4f6; padding:6px;">Distinct calendar days with ≥1 sample.</td></tr>
+    <tr><td class="mono" style="border-bottom:1px solid #f3f4f6; padding:6px;">duration_min</td><td style="border-bottom:1px solid #f3f4f6; padding:6px;">(last_seen - first_seen) in minutes within the dataset window.</td></tr>
+    <tr><td class="mono" style="border-bottom:1px solid #f3f4f6; padding:6px;">sessions</td><td style="border-bottom:1px solid #f3f4f6; padding:6px;">Number of segments separated by gaps ≥ 6 hours (disappear/reappear proxy).</td></tr>
+    <tr><td class="mono" style="border-bottom:1px solid #f3f4f6; padding:6px;">max_gap_days</td><td style="border-bottom:1px solid #f3f4f6; padding:6px;">Largest time gap between consecutive observations (days).</td></tr>
+    <tr><td class="mono" style="border-bottom:1px solid #f3f4f6; padding:6px;">signal_median</td><td style="border-bottom:1px solid #f3f4f6; padding:6px;">Median of the chosen signal metric for this tower (often RSSI dBm, sometimes RSRP).</td></tr>
+    <tr><td class="mono" style="border-bottom:1px solid #f3f4f6; padding:6px;">signal_robust_z</td><td style="border-bottom:1px solid #f3f4f6; padding:6px;">Robust z-score of signal_median vs global distribution (MAD scale).</td></tr>
+    <tr><td class="mono" style="border-bottom:1px solid #f3f4f6; padding:6px;">gps_spread_m</td><td style="border-bottom:1px solid #f3f4f6; padding:6px;">Median distance from samples to inferred center after robust trimming (uncertainty).</td></tr>
+    <tr><td class="mono" style="border-bottom:1px solid #f3f4f6; padding:6px;">clusters</td><td style="border-bottom:1px solid #f3f4f6; padding:6px;">Number of spatial clusters (greedy, radius 400m) for this fingerprint.</td></tr>
+    <tr><td class="mono" style="border-bottom:1px solid #f3f4f6; padding:6px;">cluster_top2_sep_m</td><td style="border-bottom:1px solid #f3f4f6; padding:6px;">Distance between the two biggest clusters’ centers (multi-location indicator).</td></tr>
+    <tr><td class="mono" style="border-bottom:1px solid #f3f4f6; padding:6px;">center_drift_m</td><td style="border-bottom:1px solid #f3f4f6; padding:6px;">Max distance between weekly-binned inferred centers (drift / ID reuse proxy).</td></tr>
+    <tr><td class="mono" style="border-bottom:1px solid #f3f4f6; padding:6px;">dist_outlier_frac</td><td style="border-bottom:1px solid #f3f4f6; padding:6px;">Fraction of big residual outliers in robust signal-vs-(proxy)distance model.</td></tr>
+    <tr><td class="mono" style="border-bottom:1px solid #f3f4f6; padding:6px;">dense_place_novelty</td><td style="border-bottom:1px solid #f3f4f6; padding:6px;"># of dense places (≥500 samples) where this tower appears only 1–2 times.</td></tr>
+    <tr><td class="mono" style="border-bottom:1px solid #f3f4f6; padding:6px;">change_places_frac</td><td style="border-bottom:1px solid #f3f4f6; padding:6px;">Fraction of this tower’s samples in places with strong distribution change (KS/CUSUM).</td></tr>
+    <tr><td class="mono" style="border-bottom:1px solid #f3f4f6; padding:6px;">place_rat_surprise</td><td style="border-bottom:1px solid #f3f4f6; padding:6px;">Average negative log-probability of RAT transitions in its places (higher = more chaotic).</td></tr>
+    <tr><td class="mono" style="border-bottom:1px solid #f3f4f6; padding:6px;">places_n</td><td style="border-bottom:1px solid #f3f4f6; padding:6px;">Number of place buckets (OSM tile at --place-zoom) where seen.</td></tr>
+    <tr><td class="mono" style="border-bottom:1px solid #f3f4f6; padding:6px;">place_entropy</td><td style="border-bottom:1px solid #f3f4f6; padding:6px;">Entropy of place distribution (higher = more spread out).</td></tr>
+    <tr><td class="mono" style="border-bottom:1px solid #f3f4f6; padding:6px;">ml_knn_z</td><td style="border-bottom:1px solid #f3f4f6; padding:6px;">Robust z-score of kNN distance outlier score in tower-feature space.</td></tr>
+    <tr><td class="mono" style="border-bottom:1px solid #f3f4f6; padding:6px;">ml_lof_z</td><td style="border-bottom:1px solid #f3f4f6; padding:6px;">Robust z-score of LOF-like density outlier score in tower-feature space.</td></tr>
+  </tbody>
+</table>
 """
 
     # Leaflet via CDN. Local HTML file loads tiles from OpenStreetMap.
@@ -1100,9 +1273,10 @@ def build_dashboard(markers: List[Dict[str, Any]], center: Tuple[float, float], 
   <style>
     html, body {{ height: 100%; margin: 0; }}
     body {{ font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; }}
-    #wrap {{ display: grid; grid-template-rows: 60vh 40vh; height: 100%; }}
-    #map {{ height: 100%; }}
-    #panel {{ padding: 10px; overflow: auto; border-top: 1px solid #ddd; }}
+    #wrap {{ display: flex; flex-direction: column; height: 100%; }}
+    #map {{ flex: 1 1 auto; min-height: 240px; }}
+    /* Bottom panel is resizable; resizing changes table height and map adjusts automatically. */
+    #panel {{ flex: 0 0 auto; height: 40vh; min-height: 220px; max-height: 85vh; padding: 10px; overflow: auto; border-top: 1px solid #ddd; resize: vertical; }}
     #tabs {{ display:flex; gap:8px; margin: 8px 0 10px 0; }}
     .tabbtn {{ padding: 6px 10px; border: 1px solid #ddd; background: #fff; border-radius: 8px; cursor: pointer; }}
     .tabbtn.active {{ background: #f3f4f6; }}
@@ -1187,6 +1361,13 @@ def build_dashboard(markers: List[Dict[str, Any]], center: Tuple[float, float], 
     maxNativeZoom: 19,
     attribution: '&copy; OpenStreetMap contributors'
   }}).addTo(map);
+  // Keep Leaflet rendering correct if the bottom panel is resized.
+  if (window.ResizeObserver) {{
+    const ro = new ResizeObserver(() => map.invalidateSize());
+    ro.observe(document.getElementById('map'));
+  }} else {{
+    window.addEventListener('resize', () => map.invalidateSize());
+  }}
 
   function esc(s) {{
     return String(s ?? '')
@@ -1360,6 +1541,13 @@ def main() -> int:
     ap.add_argument("--min-count", type=int, default=3, help="Hide towers seen fewer than N times")
     ap.add_argument("--place-zoom", type=int, default=17, help="OSM tile zoom for place bucketing (higher => smaller buckets)")
     ap.add_argument("--max-lines", type=int, default=0, help="Read at most N lines from the JSONL (0 = no limit)")
+    ap.add_argument("--ml-mode", choices=["auto", "off", "approx", "full"], default="auto", help="ML-style rankers mode (kNN/LOF). 'auto' disables heavy modes for large tower counts.")
+    ap.add_argument("--ml-ref-size", type=int, default=800, help="Reference subset size for --ml-mode approx (kNN)")
+    ap.add_argument("--sample-size", type=int, default=2000, help="Max per-tower reservoir samples kept for robust stats (memory bound).")
+    ap.add_argument("--place-sample-size", type=int, default=800, help="Max per-place reservoir samples kept for distribution/change estimation (memory bound).")
+    ap.add_argument("--place-bitmap-bits", type=int, default=2048, help="Bitmap size for approximate distinct-tower counts per place (memory bound).")
+    ap.add_argument("--cluster-radius-m", type=float, default=400.0, help="Radius (m) for online multi-location clustering.")
+    ap.add_argument("--session-gap-s", type=float, default=6*3600.0, help="Gap (seconds) that starts a new session.")
     args = ap.parse_args()
 
     if not os.path.exists(args.jsonl):
@@ -1370,11 +1558,13 @@ def main() -> int:
     all_lats: List[float] = []
     all_lons: List[float] = []
 
+    rng = random.Random(1)
     max_lines = args.max_lines if args.max_lines and args.max_lines > 0 else None
     for obj in iter_jsonl(args.jsonl, max_lines=max_lines):
         when = parse_time(obj.get("timestamp_utc") or obj.get("timestamp_local") or "")
         if when is None:
             continue
+        when_ts = to_epoch_seconds(when)
         loc = pick_location(obj)
         if loc is None:
             continue
@@ -1391,14 +1581,28 @@ def main() -> int:
                 continue
             sig = observation_signal(obj, cell)
             if key not in aggs:
-                aggs[key] = TowerAgg(key=key, first_seen=when, last_seen=when)
-            aggs[key].add(when, lat, lon, sig, place_id)
+                aggs[key] = TowerAgg(key=key, first_seen_ts=when_ts, last_seen_ts=when_ts)
+            aggs[key].add(
+                when_ts,
+                lat,
+                lon,
+                sig,
+                place_id,
+                sample_size=max(0, int(args.sample_size)),
+                cluster_radius_m=float(args.cluster_radius_m),
+                session_gap_s=float(args.session_gap_s),
+                rng=rng,
+            )
 
             p = places.get(place_id)
             if p is None:
-                p = PlaceAgg(place_id=place_id)
+                p = PlaceAgg(
+                    place_id=place_id,
+                    signal_sample_size=max(0, int(args.place_sample_size)),
+                    distinct_bitmap_bits=max(256, int(args.place_bitmap_bits)),
+                )
                 places[place_id] = p
-            p.add(when, key, sig)
+            p.add(when_ts, key, sig)
 
     if not aggs:
         raise SystemExit("No tower observations found (need location + towers/registration in JSONL).")
@@ -1406,7 +1610,7 @@ def main() -> int:
     # Compute robust centers
     agg_list = list(aggs.values())
     for a in agg_list:
-        lat, lon, meta = robust_center(a.points)
+        lat, lon, meta = robust_center([(lat, lon, sig) for (lat, lon, sig, _ts) in a.sample])
         a.center_lat = lat
         a.center_lon = lon
         a.center_meta = meta
@@ -1420,8 +1624,7 @@ def main() -> int:
     # Place-level distribution & change metrics
     place_metrics: Dict[str, Dict[str, Any]] = {}
     for pid, p in places.items():
-        sigs = p.signals
-        st = sorted(p.signals_time, key=lambda x: x[0])
+        st = sorted(p.signal_sample, key=lambda x: x[0])
         series = [v for _, v in st]
         km = {}
         if len(series) >= 60:
@@ -1432,10 +1635,8 @@ def main() -> int:
             km["mw_u_norm"] = mann_whitney_u(early, late)
             km["cusum"] = cusum_change_score(series, drift=0.05)
         km["count"] = p.count
-        km["distinct_towers"] = len(p.towers)
-        # RAT transition surprise
-        rat_series = [r for _, r in sorted(p.rat_seq_time, key=lambda x: x[0])]
-        km["rat_surprise"] = markov_bigram_surprise(rat_series)
+        km["distinct_towers"] = p.distinct_towers_est()
+        km["rat_surprise"] = p.rat_surprise()
         place_metrics[pid] = km
 
     # Add place-aware features to each tower
@@ -1492,7 +1693,8 @@ def main() -> int:
             })
         a.features["score_breakdown"] = breakdown
 
-    # Pure-Python ML-ish rankers over tower feature vectors (kNN + LOF)
+    # Pure-Python ML-ish rankers over tower feature vectors (kNN + LOF).
+    # WARNING: full LOF is O(n^2) memory/time and can be killed by the OS for large n.
     feature_names = [
         "count",
         "days_seen",
@@ -1534,8 +1736,22 @@ def main() -> int:
         scaled = [((v - m) / (s if s > 1e-9 else 1.0)) for v, m, s in zip(vec, med, scale)]
         scaled_vectors[k0] = scaled
 
-    knn_scores = knn_anomaly_scores(scaled_vectors, k=5)
-    lof_scores = lof_anomaly_scores(scaled_vectors, k=10)
+    n_towers = len(scaled_vectors)
+    ml_mode = args.ml_mode
+    if ml_mode == "auto":
+        # Safe defaults: for large N, avoid O(n^2) LOF and compute only approximate kNN.
+        ml_mode = "full" if n_towers <= 1200 else "approx"
+
+    if ml_mode == "off":
+        knn_scores = {k0: 0.0 for k0 in scaled_vectors.keys()}
+        lof_scores = {k0: 1.0 for k0 in scaled_vectors.keys()}
+    elif ml_mode == "approx":
+        knn_scores = knn_anomaly_scores_approx(scaled_vectors, k=5, reference_size=args.ml_ref_size, seed=1)
+        # LOF disabled in approx mode (too costly dependency-free); keep neutral values.
+        lof_scores = {k0: 1.0 for k0 in scaled_vectors.keys()}
+    else:
+        knn_scores = knn_anomaly_scores(scaled_vectors, k=5)
+        lof_scores = lof_anomaly_scores(scaled_vectors, k=10)
 
     # Add ML-ish scores and conservative scoring bumps
     knn_vals = list(knn_scores.values())
@@ -1561,7 +1777,7 @@ def main() -> int:
             a.anomaly_score += 1.0
             a.features["anomaly_ml_knn"] = True
             breakdown.append({"rule": "ml_knn", "points": 1.0, "because": f"knn_z={round(kz,2)}"})
-        if lz >= 4.0 and a.count >= 15:
+        if ml_mode != "approx" and lz >= 4.0 and a.count >= 15:
             a.anomaly_score += 1.0
             a.features["anomaly_ml_lof"] = True
             breakdown.append({"rule": "ml_lof", "points": 1.0, "because": f"lof_z={round(lz,2)}"})
@@ -1619,8 +1835,8 @@ def main() -> int:
             "lat": a.center_lat,
             "lon": a.center_lon,
             "count": a.count,
-            "first_seen": a.first_seen.isoformat(timespec="seconds"),
-            "last_seen": a.last_seen.isoformat(timespec="seconds"),
+            "first_seen": epoch_to_iso(a.first_seen_ts),
+            "last_seen": epoch_to_iso(a.last_seen_ts),
             "days_seen": a.features.get("days_seen"),
             "duration_min": round((a.features.get("duration_s") or 0.0) / 60.0, 1) if a.features.get("duration_s") is not None else None,
             "sessions": a.features.get("sessions"),
@@ -1644,6 +1860,7 @@ def main() -> int:
             "ml_lof_score": round(a.features.get("ml_lof_score"), 4) if isinstance(a.features.get("ml_lof_score"), (int, float)) else None,
             "ml_knn_z": round(a.features.get("ml_knn_z"), 2) if isinstance(a.features.get("ml_knn_z"), (int, float)) else None,
             "ml_lof_z": round(a.features.get("ml_lof_z"), 2) if isinstance(a.features.get("ml_lof_z"), (int, float)) else None,
+            "ml_mode": ml_mode,
             "n_points": a.center_meta.get("n"),
             "n_used": a.center_meta.get("n_used"),
             "search": search,
