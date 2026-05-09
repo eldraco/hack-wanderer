@@ -44,9 +44,17 @@ def parse_time(ts: str) -> Optional[dt.datetime]:
         return None
 
 
-def iter_jsonl(path: str) -> Iterable[Dict[str, Any]]:
+def iter_jsonl(path: str, max_lines: Optional[int] = None) -> Iterable[Dict[str, Any]]:
+    """
+    Stream JSON objects from a JSONL file.
+
+    `max_lines` limits how many *lines* are read from disk (including malformed lines).
+    This prevents accidentally scanning multi-GB logs.
+    """
     with open(path, "rb") as f:
-        for raw in f:
+        for i, raw in enumerate(f, 1):
+            if max_lines and i > max_lines:
+                break
             line = raw.decode("utf-8", "replace").strip()
             if not line or line.startswith("\x00"):
                 continue
@@ -1351,6 +1359,7 @@ def main() -> int:
     ap.add_argument("--out", default="towers-dashboard.html", help="Output HTML path")
     ap.add_argument("--min-count", type=int, default=3, help="Hide towers seen fewer than N times")
     ap.add_argument("--place-zoom", type=int, default=17, help="OSM tile zoom for place bucketing (higher => smaller buckets)")
+    ap.add_argument("--max-lines", type=int, default=0, help="Read at most N lines from the JSONL (0 = no limit)")
     args = ap.parse_args()
 
     if not os.path.exists(args.jsonl):
@@ -1361,7 +1370,8 @@ def main() -> int:
     all_lats: List[float] = []
     all_lons: List[float] = []
 
-    for obj in iter_jsonl(args.jsonl):
+    max_lines = args.max_lines if args.max_lines and args.max_lines > 0 else None
+    for obj in iter_jsonl(args.jsonl, max_lines=max_lines):
         when = parse_time(obj.get("timestamp_utc") or obj.get("timestamp_local") or "")
         if when is None:
             continue
