@@ -477,6 +477,43 @@ def iso_timestamp():
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
+def run_timestamp_slug():
+    """
+    Timestamp suitable for filenames. Uses UTC time with millisecond precision.
+    Example: 20260512_201530_123Z
+    """
+    now = datetime.datetime.now(datetime.timezone.utc)
+    ms = int(now.microsecond / 1000)
+    return now.strftime("%Y%m%d_%H%M%S") + "_{:03d}Z".format(ms)
+
+
+def rotated_output_path(base_path, stamp, pid=None):
+    """
+    Build a per-start unique output path from a configured base path.
+
+    Rules:
+    - If `base_path` contains '{run_ts}', replace it with `stamp`.
+    - If `base_path` is a directory (or endswith '/'), create '<basename>_<stamp>_<pid>.jsonl' inside.
+    - Otherwise, insert '_<stamp>_<pid>' before the file extension.
+    """
+    pid = pid or os.getpid()
+    text = base_path or ""
+    if "{run_ts}" in text:
+        return text.format(run_ts=stamp, pid=pid)
+
+    if text.endswith(os.sep) or (text and os.path.isdir(text)):
+        directory = text.rstrip(os.sep) if text else "."
+        name = "hack-wanderer_{}_{}.jsonl".format(stamp, pid)
+        return os.path.join(directory, name)
+
+    directory = os.path.dirname(text) or "."
+    filename = os.path.basename(text) or "hack-wanderer.jsonl"
+    root, ext = os.path.splitext(filename)
+    if not ext:
+        ext = ".jsonl"
+    out_name = "{}_{}_{}{}".format(root, stamp, pid, ext)
+    return os.path.join(directory, out_name)
+
 def get_timezone(config):
     cfg = config or {}
     name = cfg.get("timezone")
@@ -1067,7 +1104,8 @@ def build_towers_snapshot(network, vendor):
             "cell_id": reg.get("cell_id"),
             "tac_lac": reg.get("lac_tac"),
             "stat": reg.get("stat_text"),
-        })
+        }
+        towers.append(reg_entry)
     cpsi = vendor.get("cpsi") or {}
     if isinstance(cpsi, dict) and cpsi.get("system_mode") == "LTE" and cpsi.get("scell_id") is not None:
         towers.append({
@@ -2497,11 +2535,33 @@ def main(argv):
                     duration_s = 0
                 end_time = time.monotonic() + duration_s if duration_s else None
                 logger.step("Start wardriving loop")
-                logger.info("Wardrive JSONL: {}".format(jsonl_path))
+                run_ts = run_timestamp_slug()
+                jsonl_run_path = rotated_output_path(jsonl_path, run_ts, pid=os.getpid())
+                logger.info("Wardrive JSONL (base): {}".format(jsonl_path))
+                logger.info("Wardrive JSONL (run): {}".format(jsonl_run_path))
                 wigle_handle = None
                 if wigle_path:
                     logger.info("Wigle CSV (draft): {}".format(wigle_path))
-                with open(jsonl_path, "a", encoding="utf-8") as jsonl_handle:
+                # Ensure per-start file is new. If it somehow exists (rapid restarts),
+                # fall back to append with an extra numeric suffix.
+                try:
+                    jsonl_handle = open(jsonl_run_path, "x", encoding="utf-8")
+                except FileExistsError:
+                    alt = jsonl_run_path
+                    for idx in range(1, 1000):
+                        alt = "{}.{}".format(jsonl_run_path, idx)
+                        try:
+                            jsonl_handle = open(alt, "x", encoding="utf-8")
+                            jsonl_run_path = alt
+                            logger.warning("Wardrive JSONL collision; using {}".format(jsonl_run_path))
+                            break
+                        except FileExistsError:
+                            continue
+                    else:
+                        logger.warning("Wardrive JSONL collisions; falling back to append at {}".format(jsonl_run_path))
+                        jsonl_handle = open(jsonl_run_path, "a", encoding="utf-8")
+
+                with jsonl_handle:
                     if wigle_path:
                         wigle_handle = open(wigle_path, "a", encoding="utf-8")
                         if wigle_handle.tell() == 0:
