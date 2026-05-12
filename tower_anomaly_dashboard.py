@@ -45,6 +45,23 @@ def parse_time(ts: str) -> Optional[dt.datetime]:
         return None
 
 
+def parse_time_arg(value: str) -> Optional[dt.datetime]:
+    """
+    Parse CLI time values.
+    Accepts:
+      - ISO8601 with Z (UTC) or offset, e.g. 2026-05-01T12:00:00Z
+      - ISO date, e.g. 2026-05-01 (interpreted as 00:00:00 UTC)
+    """
+    if not value:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if "T" not in text and len(text) == 10:
+        text = text + "T00:00:00Z"
+    return parse_time(text)
+
+
 def iter_jsonl(path: str, max_lines: Optional[int] = None) -> Iterable[Dict[str, Any]]:
     """
     Stream JSON objects from a JSONL file.
@@ -1918,6 +1935,8 @@ def main() -> int:
     ap.add_argument("--min-count", type=int, default=3, help="Hide towers seen fewer than N times")
     ap.add_argument("--place-zoom", type=int, default=17, help="OSM tile zoom for place bucketing (higher => smaller buckets)")
     ap.add_argument("--max-lines", type=int, default=0, help="Read at most N lines from the JSONL (0 = no limit)")
+    ap.add_argument("--after", default="", help="Only include samples at/after this datetime (ISO8601, e.g. 2026-05-01T00:00:00Z or 2026-05-01)")
+    ap.add_argument("--before", default="", help="Only include samples before this datetime (ISO8601, e.g. 2026-05-10T00:00:00Z or 2026-05-10)")
     ap.add_argument("--ml-mode", choices=["auto", "off", "approx", "full"], default="auto", help="ML-style rankers mode (kNN/LOF). 'auto' disables heavy modes for large tower counts.")
     ap.add_argument("--ml-ref-size", type=int, default=800, help="Reference subset size for --ml-mode approx (kNN)")
     ap.add_argument("--sample-size", type=int, default=2000, help="Max per-tower reservoir samples kept for robust stats (memory bound).")
@@ -1937,11 +1956,19 @@ def main() -> int:
 
     rng = random.Random(1)
     max_lines = args.max_lines if args.max_lines and args.max_lines > 0 else None
+    after_dt = parse_time_arg(args.after)
+    before_dt = parse_time_arg(args.before)
+    after_ts = to_epoch_seconds(after_dt) if after_dt else None
+    before_ts = to_epoch_seconds(before_dt) if before_dt else None
     for obj in iter_jsonl(args.jsonl, max_lines=max_lines):
         when = parse_time(obj.get("timestamp_utc") or obj.get("timestamp_local") or "")
         if when is None:
             continue
         when_ts = to_epoch_seconds(when)
+        if after_ts is not None and when_ts < after_ts:
+            continue
+        if before_ts is not None and when_ts >= before_ts:
+            continue
         loc = pick_location(obj)
         if loc is None:
             continue
