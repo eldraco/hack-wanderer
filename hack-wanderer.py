@@ -6,6 +6,10 @@ import json
 import os
 import sys
 import time
+try:
+    from zoneinfo import ZoneInfo
+except Exception:
+    ZoneInfo = None
 
 try:
     import serial
@@ -20,6 +24,8 @@ except ImportError:
 
 DEFAULT_CONFIG = {
     "mode": "test",
+    "timezone": "Europe/Prague",
+    "timezone_offset_minutes": 0,
     "serial": {
         "port": "/dev/cu.SLAB_USBtoUART",
         "baudrate": 115200,
@@ -471,6 +477,28 @@ def iso_timestamp():
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
+def get_timezone(config):
+    cfg = config or {}
+    name = cfg.get("timezone")
+    offset_min = safe_int(cfg.get("timezone_offset_minutes"))
+    if name and ZoneInfo is not None:
+        try:
+            return ZoneInfo(name)
+        except Exception:
+            pass
+    if offset_min is not None:
+        try:
+            return datetime.timezone(datetime.timedelta(minutes=offset_min))
+        except Exception:
+            pass
+    return datetime.timezone.utc
+
+
+def local_timestamp(config):
+    tz = get_timezone(config)
+    return datetime.datetime.now(tz).isoformat()
+
+
 def parse_sim_read_file(value):
     if not value:
         raise ValueError("SIM file definition is empty.")
@@ -786,13 +814,23 @@ def parse_cops_current(lines):
             payload = line.split(":", 1)[1].strip()
             parts = split_fields(payload)
             if len(parts) >= 4:
+                operator = strip_quotes(parts[2])
                 return {
                     "mode": safe_int(parts[0]),
                     "format": safe_int(parts[1]),
-                    "operator": strip_quotes(parts[2]),
+                    "operator": operator,
                     "act": safe_int(parts[3]),
                 }
     return {}
+
+
+def split_mcc_mnc(numeric):
+    if not numeric:
+        return None, None
+    digits = "".join(ch for ch in str(numeric) if ch.isdigit())
+    if len(digits) < 5:
+        return None, None
+    return safe_int(digits[:3]), safe_int(digits[3:])
 
 
 def parse_cops_scan(lines):
@@ -1020,10 +1058,12 @@ def parse_qeng_neighborcell(lines):
 def build_towers_snapshot(network, vendor):
     towers = []
     reg = best_registration(network)
+    mcc, mnc = split_mcc_mnc((network.get("cops_current") or {}).get("operator"))
     if reg:
-        towers.append({
+        reg_entry = {
             "source": "registration",
             "rat": reg.get("rat"),
+            "rat_code": reg.get("act"),
             "cell_id": reg.get("cell_id"),
             "tac_lac": reg.get("lac_tac"),
             "stat": reg.get("stat_text"),
@@ -1045,6 +1085,17 @@ def build_towers_snapshot(network, vendor):
         })
     qeng_serving = parse_qeng_servingcell(vendor.get("qeng_servingcell", []))
     qeng_neighbor = parse_qeng_neighborcell(vendor.get("qeng_neighborcell", []))
+    # Enrich QENG entries with fallback MCC/MNC from operator if missing.
+    for entry in qeng_serving + qeng_neighbor:
+        if entry.get("mcc") is None and mcc is not None:
+            entry["mcc"] = mcc
+        if entry.get("mnc") is None and mnc is not None:
+            entry["mnc"] = mnc
+        if entry.get("rat") in ("LTE", "CAT-M1", "CAT-NB1", "NB-IOT") and entry.get("cell_id") is not None:
+            eci = entry["cell_id"]
+            entry["eci"] = eci
+            entry["enodeb_id"] = eci >> 8
+            entry["sector_id"] = eci & 0xFF
     towers.extend(qeng_serving)
     towers.extend(qeng_neighbor)
     return towers
@@ -1917,13 +1968,35 @@ def build_snapshot(at, config, logger):
     gps_modem = collect_gps(at, config)
     gps_device = collect_external_gps(config, logger)
     log_modem_gps(logger, gps_modem)
+    tz = get_timezone(config)
+
+    gps_time_utc = None
+    gps_time_local = None
+    # Prefer device GPS timestamp if available
+    gps_dev_ts = (gps_device.get("location") or {}).get("timestamp_utc") or gps_device.get("timestamp_utc")
+    gps_mod_ts = (gps_modem.get("cgnsinf") or {}).get("utc") if gps_modem else None
+    if gps_dev_ts:
+        gps_time_utc = gps_dev_ts
+    elif gps_mod_ts:
+        gps_time_utc = gps_mod_ts
+    if gps_time_utc:
+        try:
+            dt = datetime.datetime.fromisoformat(gps_time_utc.replace("Z", "+00:00"))
+            gps_time_local = dt.astimezone(tz).isoformat()
+        except Exception:
+            gps_time_local = None
+
     snapshot = {
         "timestamp_utc": iso_timestamp(),
+        "timestamp_local": local_timestamp(config),
+        "timezone": config.get("timezone") or "UTC",
         "network": network,
         "vendor": vendor,
         "gps": gps_modem,
         "gps_device": gps_device,
         "scan_activity": vendor.get("scan_activity"),
+        "gps_time_utc": gps_time_utc,
+        "gps_time_local": gps_time_local,
         "location": best_location_from_sources(gps_modem, gps_device),
         "towers": build_towers_snapshot(network, vendor),
     }
@@ -1942,15 +2015,59 @@ def write_status_snapshot(path, snapshot, logger):
         directory = os.path.dirname(path)
         if directory:
             os.makedirs(directory, exist_ok=True)
+        cache_path = os.path.join(directory, "towers_cache.json") if directory else "towers_cache.json"
+        existing = []
+        cache_map = {}
+        if os.path.exists(cache_path):
+            try:
+                with open(cache_path, "r", encoding="utf-8") as ch:
+                    existing = json.load(ch) or []
+                    for item in existing:
+                        key = item.get("key")
+                        if key:
+                            cache_map[key] = item
+            except Exception:
+                existing = []
+                cache_map = {}
+        towers = snapshot.get("towers") or []
+        tz_time = snapshot.get("timestamp_local") or snapshot.get("timestamp_utc")
+        location = snapshot.get("location") or {}
+        for t in towers:
+            key = "{}|{}|{}|{}|{}".format(
+                t.get("rat"),
+                t.get("cell_id"),
+                t.get("tac_lac"),
+                t.get("mcc"),
+                t.get("mnc"),
+            )
+            if key in cache_map:
+                continue
+            entry = dict(t)
+            entry["seen_time_local"] = tz_time
+            entry["seen_time_utc"] = snapshot.get("timestamp_utc")
+            entry["seen_location"] = location
+            entry["key"] = key
+            cache_map[key] = entry
+            existing.append(entry)
+        try:
+            with open(cache_path, "w", encoding="utf-8") as ch:
+                json.dump(existing, ch, ensure_ascii=True, indent=2)
+        except Exception as exc:
+            logger.warning("Failed to write tower cache {}: {}".format(cache_path, exc))
         payload = {
             "timestamp_utc": snapshot.get("timestamp_utc"),
             "location": snapshot.get("location"),
             "network": snapshot.get("network"),
             "towers": snapshot.get("towers"),
+            "towers_all": existing,
             "gps_lte_modem": snapshot.get("gps"),
             "gps_device": snapshot.get("gps_device"),
             "sim_status": snapshot.get("sim_status"),
             "scan_status": snapshot.get("scan_activity"),
+            "timezone": snapshot.get("timezone"),
+            "local_time": snapshot.get("timestamp_local"),
+            "gps_time_utc": snapshot.get("gps_time_utc"),
+            "gps_time_local": snapshot.get("gps_time_local"),
         }
         with open(path, "w", encoding="utf-8") as handle:
             json.dump(payload, handle, ensure_ascii=True, indent=2)

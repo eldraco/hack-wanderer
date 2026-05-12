@@ -1,4 +1,6 @@
 mode: test
+timezone: Europe/Prague
+timezone_offset_minutes: 60
 serial:
   port: /dev/ttyUSB2
   baudrate: 115200
