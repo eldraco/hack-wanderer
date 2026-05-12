@@ -50,8 +50,10 @@ sim:
 wardrive:
   interval_s: 5.0
   duration_s: 60.0
-  jsonl_path: hack-wanderer.jsonl
+  #jsonl_path: hack-wanderer.jsonl
   wigle_csv_path: ""
+  # Tip: to force a per-start file name pattern, you can use:
+  jsonl_path: logs/hack-wanderer_{run_ts}_{pid}.jsonl
 
 sim_read:
   files:
