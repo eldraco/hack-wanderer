@@ -128,6 +128,21 @@ def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     return 2 * r * math.asin(math.sqrt(a))
 
 
+def implied_speed_mps(
+    lat1: float,
+    lon1: float,
+    t1: float,
+    lat2: float,
+    lon2: float,
+    t2: float,
+) -> Optional[float]:
+    dt_s = float(t2 - t1)
+    if dt_s <= 0:
+        return None
+    d = haversine_m(lat1, lon1, lat2, lon2)
+    return d / dt_s
+
+
 def latlon_to_tile(lat: float, lon: float, zoom: int) -> Tuple[int, int]:
     """
     Web Mercator tile coordinates (like OSM).
@@ -142,6 +157,27 @@ def latlon_to_tile(lat: float, lon: float, zoom: int) -> Tuple[int, int]:
     x = max(0, min(int(n) - 1, x))
     y = max(0, min(int(n) - 1, y))
     return x, y
+
+
+def tile_bounds_latlon(zoom: int, x: int, y: int) -> Tuple[float, float, float, float]:
+    """
+    Web Mercator tile bounds as (south_lat, west_lon, north_lat, east_lon).
+    Useful for visualizing the "place bucket" rectangles in the HTML.
+    """
+    n = 2.0 ** zoom
+
+    def lon_deg(tx: int) -> float:
+        return tx / n * 360.0 - 180.0
+
+    def lat_deg(ty: int) -> float:
+        lat_rad = math.atan(math.sinh(math.pi * (1.0 - 2.0 * ty / n)))
+        return math.degrees(lat_rad)
+
+    west = lon_deg(x)
+    east = lon_deg(x + 1)
+    north = lat_deg(y)
+    south = lat_deg(y + 1)
+    return south, west, north, east
 
 
 def ks_2samp(data1: List[float], data2: List[float]) -> Optional[float]:
@@ -570,6 +606,8 @@ class TowerAgg:
 
     # online clusters (greedy) for multi-location detection: (lat, lon, n)
     clusters_online: List[Tuple[float, float, int]] = dataclasses.field(default_factory=list)
+    # number of observations excluded due to bad GPS fixes (global jump filter)
+    bad_gps_skipped: int = 0
 
     # computed
     center_lat: Optional[float] = None
@@ -645,6 +683,8 @@ class TowerAgg:
 class PlaceAgg:
     place_id: str
     count: int = 0
+    first_seen_ts: Optional[float] = None
+    last_seen_ts: Optional[float] = None
     # Reservoir sample of (ts, signal) for distribution/change estimation (bounded memory)
     signal_sample: List[Tuple[float, float]] = dataclasses.field(default_factory=list)
     signal_seen: int = 0
@@ -659,6 +699,10 @@ class PlaceAgg:
     last_rat: Optional[str] = None
 
     def add(self, when_ts: float, tower_key: TowerKey, signal: Optional[float]) -> None:
+        if self.first_seen_ts is None or when_ts < self.first_seen_ts:
+            self.first_seen_ts = when_ts
+        if self.last_seen_ts is None or when_ts > self.last_seen_ts:
+            self.last_seen_ts = when_ts
         self.count += 1
         # update approx distinct towers
         h = hash((tower_key.operator, tower_key.rat, tower_key.tac_lac, tower_key.cell_id, tower_key.earfcn, tower_key.pci))
@@ -854,6 +898,7 @@ def compute_features(agg: TowerAgg, global_stats: Dict[str, Any]) -> Tuple[Dict[
     clusters = list(agg.clusters_online)
     clusters.sort(key=lambda x: -x[2])
     feats["clusters"] = len(clusters)
+    feats["clusters_detail"] = [{"lat": clat, "lon": clon, "n": n} for (clat, clon, n) in clusters[:8]]
     if len(clusters) >= 2:
         feats["cluster_top2_sep_m"] = haversine_m(clusters[0][0], clusters[0][1], clusters[1][0], clusters[1][1])
 
@@ -873,15 +918,7 @@ def compute_features(agg: TowerAgg, global_stats: Dict[str, Any]) -> Tuple[Dict[
     # Simple anomaly scoring (0..)
     score = 0.0
 
-    # 1) Very short-lived cells
-    if agg.count >= 5 and duration_s <= 20 * 60:
-        score += 3.0
-        feats["anomaly_ephemeral"] = True
-        breakdown.append({
-            "rule": "ephemeral",
-            "points": 3.0,
-            "because": f"count={agg.count} duration_min={round(duration_s/60,1)}",
-        })
+    # 1) Ephemeral burst is scored later using a *local opportunity window* (place-aware).
 
     # 2) Rare overall: do not score rarity alone (far-away cells are naturally rare).
     # We keep it as a label/feature that only becomes important when combined with other anomalies.
@@ -1128,15 +1165,28 @@ def knn_anomaly_scores_approx(
     return scores
 
 
-def build_dashboard(markers: List[Dict[str, Any]], center: Tuple[float, float], out_path: str) -> None:
+def build_dashboard(
+    markers: List[Dict[str, Any]],
+    center: Tuple[float, float],
+    out_path: str,
+    *,
+    bad_gps_points: Optional[List[Dict[str, Any]]] = None,
+    bad_gps_stats: Optional[Dict[str, Any]] = None,
+) -> None:
     marker_json = json.dumps(markers, ensure_ascii=False)
     center_lat, center_lon = center
+    bad_gps_json = json.dumps(bad_gps_points or [], ensure_ascii=False)
+    bad_gps_stats_json = json.dumps(bad_gps_stats or {}, ensure_ascii=False)
 
     methods_html = """
 <h2 style="margin:10px 0 6px 0;">Methods & scoring</h2>
 <div class="muted" style="margin-bottom:10px; max-width: 980px;">
   This dashboard ranks <b>anomalous / inconsistent</b> cells for manual review. It is not attribution.
   Each tower row has a <b>score</b> that is the sum of triggered rules below.
+</div>
+<div class="muted" style="margin-bottom:10px; max-width: 980px;">
+  <b>Bad GPS fixes</b>: device locations that imply impossible speed jumps are <b>excluded</b> from all tower stats to avoid false anomalies.
+  They are still shown on the map as an overlay: enable <span class="mono">Bad GPS fixes (excluded)</span> in the layer control.
 </div>
 <table style="width:100%; border-collapse: collapse; font-size: 13px;">
   <thead>
@@ -1150,9 +1200,9 @@ def build_dashboard(markers: List[Dict[str, Any]], center: Tuple[float, float], 
   <tbody>
     <tr>
       <td style="border-bottom:1px solid #f3f4f6; padding:6px;"><b>ephemeral</b></td>
-      <td style="border-bottom:1px solid #f3f4f6; padding:6px;" class="mono">count, duration_s</td>
+      <td style="border-bottom:1px solid #f3f4f6; padding:6px;" class="mono">count, duration_s, local_window_s</td>
       <td style="border-bottom:1px solid #f3f4f6; padding:6px;" class="mono">+3.0</td>
-      <td style="border-bottom:1px solid #f3f4f6; padding:6px;">Seen ≥ 5 times but only within ≤ 20 minutes.</td>
+      <td style="border-bottom:1px solid #f3f4f6; padding:6px;">Seen ≥ 5 times, but only for a small fraction of the local time window you were active in the same place buckets (duration/local_window ≤ 0.25).</td>
     </tr>
     <tr>
       <td style="border-bottom:1px solid #f3f4f6; padding:6px;"><b>strong_signal_global</b></td>
@@ -1259,6 +1309,8 @@ def build_dashboard(markers: List[Dict[str, Any]], center: Tuple[float, float], 
     <tr><td class="mono" style="border-bottom:1px solid #f3f4f6; padding:6px;">count</td><td style="border-bottom:1px solid #f3f4f6; padding:6px;">Samples where this fingerprint was observed.</td></tr>
     <tr><td class="mono" style="border-bottom:1px solid #f3f4f6; padding:6px;">days_seen</td><td style="border-bottom:1px solid #f3f4f6; padding:6px;">Distinct calendar days with ≥1 sample.</td></tr>
     <tr><td class="mono" style="border-bottom:1px solid #f3f4f6; padding:6px;">duration_min</td><td style="border-bottom:1px solid #f3f4f6; padding:6px;">(last_seen - first_seen) in minutes within the dataset window.</td></tr>
+    <tr><td class="mono" style="border-bottom:1px solid #f3f4f6; padding:6px;">local_window_min</td><td style="border-bottom:1px solid #f3f4f6; padding:6px;">Time span between first/last logging activity in the same place buckets where this tower was seen (proxy for “you were around and active”).</td></tr>
+    <tr><td class="mono" style="border-bottom:1px solid #f3f4f6; padding:6px;">local_window_frac</td><td style="border-bottom:1px solid #f3f4f6; padding:6px;">duration / local_window (smaller = more “bursty” relative to opportunity).</td></tr>
     <tr><td class="mono" style="border-bottom:1px solid #f3f4f6; padding:6px;">sessions</td><td style="border-bottom:1px solid #f3f4f6; padding:6px;">Number of segments separated by gaps ≥ 6 hours (disappear/reappear proxy).</td></tr>
     <tr><td class="mono" style="border-bottom:1px solid #f3f4f6; padding:6px;">max_gap_days</td><td style="border-bottom:1px solid #f3f4f6; padding:6px;">Largest time gap between consecutive observations (days).</td></tr>
     <tr><td class="mono" style="border-bottom:1px solid #f3f4f6; padding:6px;">signal_median</td><td style="border-bottom:1px solid #f3f4f6; padding:6px;">Median of the chosen signal metric for this tower (often RSSI dBm, sometimes RSRP).</td></tr>
@@ -1273,6 +1325,12 @@ def build_dashboard(markers: List[Dict[str, Any]], center: Tuple[float, float], 
     <tr><td class="mono" style="border-bottom:1px solid #f3f4f6; padding:6px;">place_rat_surprise</td><td style="border-bottom:1px solid #f3f4f6; padding:6px;">Average negative log-probability of RAT transitions in its places (higher = more chaotic).</td></tr>
     <tr><td class="mono" style="border-bottom:1px solid #f3f4f6; padding:6px;">places_n</td><td style="border-bottom:1px solid #f3f4f6; padding:6px;">Number of place buckets (OSM tile at --place-zoom) where seen.</td></tr>
     <tr><td class="mono" style="border-bottom:1px solid #f3f4f6; padding:6px;">place_entropy</td><td style="border-bottom:1px solid #f3f4f6; padding:6px;">Entropy of place distribution (higher = more spread out).</td></tr>
+    <tr><td class="mono" style="border-bottom:1px solid #f3f4f6; padding:6px;">place_id</td><td style="border-bottom:1px solid #f3f4f6; padding:6px;">A place bucket ID in <span class="mono">z/x/y</span> format (Web Mercator tile coordinates at zoom=--place-zoom). Used to group samples by location.</td></tr>
+    <tr><td class="mono" style="border-bottom:1px solid #f3f4f6; padding:6px;">place_total</td><td style="border-bottom:1px solid #f3f4f6; padding:6px;">Total number of log samples inside that place bucket (all towers, all time).</td></tr>
+    <tr><td class="mono" style="border-bottom:1px solid #f3f4f6; padding:6px;">place_dur_min</td><td style="border-bottom:1px solid #f3f4f6; padding:6px;">Duration (minutes) between first and last logging activity recorded in that place bucket.</td></tr>
+    <tr><td class="mono" style="border-bottom:1px solid #f3f4f6; padding:6px;">ks_d</td><td style="border-bottom:1px solid #f3f4f6; padding:6px;">Kolmogorov–Smirnov D statistic comparing <b>early</b> vs <b>late</b> signal samples within a place bucket (higher = distributions differ more). No p-value is computed.</td></tr>
+    <tr><td class="mono" style="border-bottom:1px solid #f3f4f6; padding:6px;">cusum</td><td style="border-bottom:1px solid #f3f4f6; padding:6px;">CUSUM-like change score over the bucket’s sampled signal time series (higher = stronger evidence of a shift).</td></tr>
+    <tr><td class="mono" style="border-bottom:1px solid #f3f4f6; padding:6px;">changed</td><td style="border-bottom:1px solid #f3f4f6; padding:6px;">Whether the bucket is classified as “changed” (true if ks_d≥0.25 or cusum≥8.0).</td></tr>
     <tr><td class="mono" style="border-bottom:1px solid #f3f4f6; padding:6px;">ml_knn_z</td><td style="border-bottom:1px solid #f3f4f6; padding:6px;">Robust z-score of kNN distance outlier score in tower-feature space.</td></tr>
     <tr><td class="mono" style="border-bottom:1px solid #f3f4f6; padding:6px;">ml_lof_z</td><td style="border-bottom:1px solid #f3f4f6; padding:6px;">Robust z-score of LOF-like density outlier score in tower-feature space.</td></tr>
   </tbody>
@@ -1363,6 +1421,7 @@ def build_dashboard(markers: List[Dict[str, Any]], center: Tuple[float, float], 
         <div class=\"badge\">Ranking only (not attribution)</div>
         <input id=\"q\" type=\"search\" placeholder=\"Filter (operator / rat / cell / tac / earfcn / pci)\" />
         <span class=\"muted\">Click a row to zoom; open popup for full breakdown.</span>
+        <span id=\"badgps-summary\" class=\"muted mono\"></span>
       </div>
       <table id=\"tbl\">
         <thead>
@@ -1372,6 +1431,8 @@ def build_dashboard(markers: List[Dict[str, Any]], center: Tuple[float, float], 
             <th data-k=\"count\">Seen</th>
             <th data-k=\"days_seen\">Days</th>
             <th data-k=\"duration_min\">Dur (min)</th>
+            <th data-k=\"local_window_min\">Local win (min)</th>
+            <th data-k=\"local_window_frac\">Local frac</th>
             <th data-k=\"sessions\">Sessions</th>
             <th data-k=\"max_gap_days\">Max gap (d)</th>
             <th data-k=\"signal_median\">Sig med</th>
@@ -1419,6 +1480,8 @@ def build_dashboard(markers: List[Dict[str, Any]], center: Tuple[float, float], 
 <script src=\"https://unpkg.com/leaflet@1.9.4/dist/leaflet.js\" integrity=\"sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=\" crossorigin=\"\"></script>
 <script>
   const MARKERS = {marker_json};
+  const BAD_GPS = {bad_gps_json};
+  const BAD_GPS_STATS = {bad_gps_stats_json};
 
   const map = L.map('map').setView([{center_lat}, {center_lon}], 14);
   L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
@@ -1487,6 +1550,145 @@ def build_dashboard(markers: List[Dict[str, Any]], center: Tuple[float, float], 
   }}
 
   const layer = L.layerGroup().addTo(map);
+  const focusLayer = L.layerGroup().addTo(map);
+  const badGpsLayer = L.layerGroup();
+  if (Array.isArray(BAD_GPS) && BAD_GPS.length) {{
+    for (const p of BAD_GPS) {{
+      if (p.lat==null || p.lon==null) continue;
+      const m = L.circleMarker([p.lat, p.lon], {{
+        radius: 5,
+        color: '#ef4444',
+        weight: 2,
+        fillColor: '#ef4444',
+        fillOpacity: 0.25,
+      }});
+      const sp = (p.speed_mps!=null) ? `speed=${{p.speed_mps}} m/s` : '';
+      m.bindPopup(`<div class=\"mono\">BAD GPS<br/>${{esc(p.ts ?? '')}}<br/>${{esc(sp)}}<br/>lat=${{esc(p.lat)}} lon=${{esc(p.lon)}}</div>`);
+      m.addTo(badGpsLayer);
+    }}
+  }}
+
+  // Layer control (lets you toggle bad GPS points on/off)
+  L.control.layers({{}}, {{'Bad GPS fixes (excluded)': badGpsLayer, 'Focus (clusters/buckets)': focusLayer}}).addTo(map);
+
+  // Show bad-GPS summary (excluded points)
+  try {{
+    const s = document.getElementById('badgps-summary');
+    if (s && BAD_GPS_STATS && (BAD_GPS_STATS.excluded_total || BAD_GPS.length)) {{
+      const excl = BAD_GPS_STATS.excluded_total ?? 0;
+      const shown = BAD_GPS.length ?? 0;
+      const thr = BAD_GPS_STATS.gps_max_speed_mps ?? '';
+      s.textContent = 'bad_gps_excluded=' + excl + ' shown=' + shown + ' speed_thr_mps=' + thr;
+    }}
+  }} catch (e) {{}}
+
+  function setFocus(m) {{
+    focusLayer.clearLayers();
+    // Clusters: centers from greedy online clustering (radius defined in CLI).
+    const clusters = Array.isArray(m.clusters_detail) ? m.clusters_detail : [];
+    for (let i=0;i<clusters.length;i++) {{
+      const c = clusters[i];
+      if (c.lat==null || c.lon==null) continue;
+      const n = c.n ?? 0;
+      const r = Math.max(4, Math.min(16, 3 + Math.sqrt(Math.max(1,n))));
+      const cm = L.circleMarker([c.lat, c.lon], {{
+        radius: r,
+        color: '#7c3aed',
+        weight: 2,
+        fillColor: '#a78bfa',
+        fillOpacity: 0.35,
+      }});
+      const chtml = '<div class=\"mono\">cluster #' + (i+1) +
+        '<br/>n=' + esc(n) +
+        '<br/>lat=' + esc(c.lat) + ' lon=' + esc(c.lon) +
+        '</div>';
+      cm.bindPopup(chtml);
+      cm.addTo(focusLayer);
+    }}
+
+    // Place buckets: OSM tiles at --place-zoom; show top buckets for this tower.
+    const places = Array.isArray(m.place_details) ? m.place_details : [];
+    for (const p of places) {{
+      const bb = p.bbox;
+      if (!bb) continue;
+      const col = p.changed ? '#ef4444' : '#94a3b8';
+      const rect = L.rectangle([[bb.south, bb.west],[bb.north, bb.east]], {{
+        color: col,
+        weight: p.changed ? 3 : 1,
+        fillOpacity: p.changed ? 0.08 : 0.04,
+      }});
+      const why = 'place=' + (p.place_id ?? '') +
+        ' tower_count=' + (p.tower_count ?? '') + '/' + (p.place_total ?? '') +
+        ' ks_d=' + (p.ks_d ?? '—') +
+        ' cusum=' + (p.cusum ?? '—') +
+        ' changed=' + (p.changed ? 'true' : 'false');
+      rect.bindPopup(`<div class=\"mono\">${{esc(why)}}</div>`);
+      rect.addTo(focusLayer);
+    }}
+  }}
+
+  function clustersTable(m) {{
+    const clusters = Array.isArray(m.clusters_detail) ? m.clusters_detail : [];
+    if (!clusters.length) return '<div class=\"muted\">No clusters recorded for this tower.</div>';
+    const rows = [];
+    rows.push('<table style=\"width:100%; border-collapse:collapse; font-size:12px;\">');
+    rows.push('<thead><tr>' +
+      '<th style=\"text-align:left; border-bottom:1px solid #eee; padding:6px;\">#</th>' +
+      '<th style=\"text-align:left; border-bottom:1px solid #eee; padding:6px;\">n</th>' +
+      '<th style=\"text-align:left; border-bottom:1px solid #eee; padding:6px;\">lat</th>' +
+      '<th style=\"text-align:left; border-bottom:1px solid #eee; padding:6px;\">lon</th>' +
+      '</tr></thead><tbody>');
+    for (let i=0;i<clusters.length;i++) {{
+      const c = clusters[i];
+      rows.push('<tr>' +
+        `<td class=\"mono\" style=\"border-bottom:1px solid #f3f4f6; padding:6px;\">${{esc(i+1)}}</td>` +
+        `<td class=\"mono\" style=\"border-bottom:1px solid #f3f4f6; padding:6px;\">${{esc(c.n ?? '')}}</td>` +
+        `<td class=\"mono\" style=\"border-bottom:1px solid #f3f4f6; padding:6px;\">${{esc((c.lat==null?'':Number(c.lat).toFixed(6)))}}</td>` +
+        `<td class=\"mono\" style=\"border-bottom:1px solid #f3f4f6; padding:6px;\">${{esc((c.lon==null?'':Number(c.lon).toFixed(6)))}}</td>` +
+      '</tr>');
+    }}
+    rows.push('</tbody></table>');
+    rows.push('<div class=\"muted\" style=\"margin-top:8px;\">Clusters are formed by greedy online assignment: each GPS sample goes to the nearest existing cluster within the configured radius, else starts a new cluster.</div>');
+    return rows.join('');
+  }}
+
+  function placesTable(m) {{
+    const places = Array.isArray(m.place_details) ? m.place_details : [];
+    if (!places.length) return '<div class=\"muted\">No place buckets recorded for this tower (place tracking disabled or capped).</div>';
+    const rows = [];
+    rows.push('<table style=\"width:100%; border-collapse:collapse; font-size:12px;\">');
+    rows.push('<thead><tr>' +
+      '<th style=\"text-align:left; border-bottom:1px solid #eee; padding:6px;\">place_id (z/x/y)</th>' +
+      '<th style=\"text-align:left; border-bottom:1px solid #eee; padding:6px;\">tower_count</th>' +
+      '<th style=\"text-align:left; border-bottom:1px solid #eee; padding:6px;\">place_total</th>' +
+      '<th style=\"text-align:left; border-bottom:1px solid #eee; padding:6px;\">place_dur_min</th>' +
+      '<th style=\"text-align:left; border-bottom:1px solid #eee; padding:6px;\">ks_d</th>' +
+      '<th style=\"text-align:left; border-bottom:1px solid #eee; padding:6px;\">cusum</th>' +
+      '<th style=\"text-align:left; border-bottom:1px solid #eee; padding:6px;\">changed</th>' +
+      '</tr></thead><tbody>');
+    for (const p of places) {{
+      const changed = !!p.changed;
+      const bg = changed ? ' style=\"background:#fee2e2;\"' : '';
+      rows.push(`<tr${{bg}}>` +
+        `<td class=\"mono\" style=\"border-bottom:1px solid #f3f4f6; padding:6px;\">${{esc(p.place_id)}}</td>` +
+        `<td class=\"mono\" style=\"border-bottom:1px solid #f3f4f6; padding:6px;\">${{esc(p.tower_count ?? '')}}</td>` +
+        `<td class=\"mono\" style=\"border-bottom:1px solid #f3f4f6; padding:6px;\">${{esc(p.place_total ?? '')}}</td>` +
+        `<td class=\"mono\" style=\"border-bottom:1px solid #f3f4f6; padding:6px;\">${{esc(p.place_duration_min ?? '')}}</td>` +
+        `<td class=\"mono\" style=\"border-bottom:1px solid #f3f4f6; padding:6px;\">${{esc(p.ks_d ?? '')}}</td>` +
+        `<td class=\"mono\" style=\"border-bottom:1px solid #f3f4f6; padding:6px;\">${{esc(p.cusum ?? '')}}</td>` +
+        `<td class=\"mono\" style=\"border-bottom:1px solid #f3f4f6; padding:6px;\">${{changed ? 'yes' : 'no'}}</td>` +
+      `</tr>`);
+    }}
+    rows.push('</tbody></table>');
+    rows.push('<div class=\"muted\" style=\"margin-top:8px;\">' +
+      'A “place bucket” is an OpenStreetMap Web Mercator tile at <span class=\"mono\">--place-zoom</span>. ' +
+      '<span class=\"mono\">place_total</span>=all log samples in that tile; <span class=\"mono\">place_dur_min</span>=first→last activity span in that tile. ' +
+      '<span class=\"mono\">ks_d</span>=KS D statistic (early vs late bucket signal samples); <span class=\"mono\">cusum</span>=CUSUM-like change score. ' +
+      'Red rows indicate <span class=\"mono\">changed</span>=true (ks_d≥0.25 or cusum≥8.0). ' +
+      'These buckets are drawn on the map in the Focus overlay.' +
+    '</div>');
+    return rows.join('');
+  }}
   const byId = new Map();
 
   // Rule schema for XAI: points, description, thresholds, and feature usage.
@@ -1496,11 +1698,14 @@ def build_dashboard(markers: List[Dict[str, Any]], center: Tuple[float, float], 
       id: 'ephemeral',
       points: 3.0,
       title: 'Ephemeral burst',
-      desc: 'Seen many times but only within a short overall time window.',
-      uses: ['count', 'duration_min'],
+      desc: 'Seen ≥5 times, but only for a small fraction of the local time window you were active in the same place buckets.',
+      uses: ['count', 'duration_min', 'local_window_min', 'local_window_frac'],
       eval: (m) => {{
-        const ok = (m.count ?? 0) >= 5 && (m.duration_min ?? 1e9) <= 20;
-        return {{ ok, because: `count=${{m.count}} and duration_min=${{m.duration_min}} (needs count≥5 and duration≤20min)` }};
+        const dur = (typeof m.duration_min === 'number') ? m.duration_min : null;
+        const lw = (typeof m.local_window_min === 'number') ? m.local_window_min : null;
+        const frac = (typeof m.local_window_frac === 'number') ? m.local_window_frac : null;
+        const ok = (m.count ?? 0) >= 5 && (lw == null ? false : lw >= Math.max(30, 3*(dur ?? 0))) && (frac == null ? false : frac <= 0.25);
+        return {{ ok, because: `count=${{m.count}} (needs ≥5), duration_min=${{m.duration_min}}, local_window_min=${{m.local_window_min}} (needs ≥max(30,3×duration)), local_window_frac=${{m.local_window_frac}} (needs ≤0.25)` }};
       }}
     }},
     {{
@@ -1542,8 +1747,8 @@ def build_dashboard(markers: List[Dict[str, Any]], center: Tuple[float, float], 
       id: 'multi_location',
       points: 2.5,
       title: 'Multi-location clusters',
-      desc: 'Same fingerprint forms multiple spatial clusters far apart.',
-      uses: ['clusters','cluster_top2_sep_m','count'],
+      desc: 'GPS samples for this fingerprint group into ≥2 spatial clusters far apart (clusters built by greedy radius assignment).',
+      uses: ['clusters','cluster_top2_sep_m','count','clusters_detail'],
       eval: (m) => {{
         const ok = (m.clusters ?? 0) >= 2 && (typeof m.cluster_top2_sep_m === 'number') && m.cluster_top2_sep_m >= 1500 && (m.count ?? 0) >= 15;
         return {{ ok, because: `clusters=${{m.clusters}}, top2_sep_m=${{m.cluster_top2_sep_m}} (needs clusters≥2, sep≥1500m, count≥15)` }};
@@ -1610,10 +1815,12 @@ def build_dashboard(markers: List[Dict[str, Any]], center: Tuple[float, float], 
       points: 1.0,
       title: 'Correlates with place changes',
       desc: 'Most sightings occur in place buckets whose distributions show change (KS/CUSUM).',
-      uses: ['change_places_frac','count'],
+      uses: ['change_places_frac','count','place_details'],
       eval: (m) => {{
         const ok = (typeof m.change_places_frac === 'number') && m.change_places_frac >= 0.5 && (m.count ?? 0) >= 20;
-        return {{ ok, because: `change_places_frac=${{m.change_places_frac}} (needs ≥0.5) with count=${{m.count}} (needs ≥20)` }};
+        const places = Array.isArray(m.place_details) ? m.place_details : [];
+        const changed = places.filter(p => p && p.changed).slice(0,3).map(p => p.place_id).join(', ');
+        return {{ ok, because: `change_places_frac=${{m.change_places_frac}} (needs ≥0.5) with count=${{m.count}} (needs ≥20). changed_buckets_top=${{changed || '—'}}` }};
       }}
     }},
     {{
@@ -1714,10 +1921,12 @@ def build_dashboard(markers: List[Dict[str, Any]], center: Tuple[float, float], 
       <div class=\"card\" style=\"margin-top:10px;\">
         <div class=\"k\">Key metrics (inputs)</div>
         <div class=\"why-row\">
-          ${{metricBox('duration_min', m.duration_min)}}
-          ${{metricBox('sessions', m.sessions)}}
-          ${{metricBox('max_gap_days', m.max_gap_days)}}
-          ${{metricBox('signal_median', m.signal_median)}}
+            ${{metricBox('duration_min', m.duration_min)}}
+            ${{metricBox('local_window_min', m.local_window_min)}}
+            ${{metricBox('local_window_frac', m.local_window_frac)}}
+            ${{metricBox('sessions', m.sessions)}}
+            ${{metricBox('max_gap_days', m.max_gap_days)}}
+            ${{metricBox('signal_median', m.signal_median)}}
           ${{metricBox('signal_robust_z', m.signal_robust_z)}}
           ${{metricBox('gps_spread_m', m.gps_spread_m)}}
           ${{metricBox('clusters', m.clusters)}}
@@ -1734,6 +1943,17 @@ def build_dashboard(markers: List[Dict[str, Any]], center: Tuple[float, float], 
           ${{metricBox('ml_mode', m.ml_mode)}}
           ${{metricBox('dataset_mostly_lte', m.dataset_mostly_lte)}}
         </div>
+      </div>
+    `;
+
+    const explainMore = `
+      <div class=\"card\" style=\"margin-top:10px;\">
+        <div class=\"k\">Clusters (where + how)</div>
+        <div style=\"margin-top:8px;\">${{clustersTable(m)}}</div>
+      </div>
+      <div class=\"card\" style=\"margin-top:10px;\">
+        <div class=\"k\">Place buckets (which ones)</div>
+        <div style=\"margin-top:8px;\">${{placesTable(m)}}</div>
       </div>
     `;
 
@@ -1760,7 +1980,10 @@ def build_dashboard(markers: List[Dict[str, Any]], center: Tuple[float, float], 
       `;
     }}).join('');
 
-    body.innerHTML = summary + metrics +
+    // Draw clusters/place-buckets overlay for this tower.
+    try {{ setFocus(m); }} catch (e) {{}}
+
+    body.innerHTML = summary + metrics + explainMore +
       `<div class=\"card\" style=\"margin-top:10px;\"><div class=\"k\">Rule-by-rule contributions</div>${{rulesHtml}}</div>`;
     modal.classList.add('open');
   }}
@@ -1797,6 +2020,7 @@ def build_dashboard(markers: List[Dict[str, Any]], center: Tuple[float, float], 
           <div><b>First</b>: ${{esc(m.first_seen)}}</div>
           <div><b>Last</b>: ${{esc(m.last_seen)}}</div>
           <div><b>Duration</b>: ${{m.duration_min ?? ''}} min</div>
+          <div><b>Local window</b>: ${{m.local_window_min ?? ''}} min (frac=${{m.local_window_frac ?? ''}})</div>
           <div><b>Sessions</b>: ${{m.sessions ?? ''}} (gap≥6h)</div>
           <div><b>Max gap</b>: ${{m.max_gap_days ?? ''}} days</div>
           <div><b>Signal median</b>: ${{m.signal_median ?? ''}}</div>
@@ -1861,6 +2085,8 @@ def build_dashboard(markers: List[Dict[str, Any]], center: Tuple[float, float], 
         <td class="mono">${{r.count}}</td>
         <td class="mono">${{r.days_seen}}</td>
         <td class="mono">${{r.duration_min ?? ''}}</td>
+        <td class="mono">${{r.local_window_min ?? ''}}</td>
+        <td class="mono">${{r.local_window_frac ?? ''}}</td>
         <td class="mono">${{r.sessions ?? ''}}</td>
         <td class="mono">${{r.max_gap_days ?? ''}}</td>
         <td class="mono">${{r.signal_median ?? ''}}</td>
@@ -1929,10 +2155,10 @@ def build_dashboard(markers: List[Dict[str, Any]], center: Tuple[float, float], 
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     ap.add_argument("jsonl", help="Path to hack-wanderer JSONL")
     ap.add_argument("--out", default="towers-dashboard.html", help="Output HTML path")
-    ap.add_argument("--min-count", type=int, default=3, help="Hide towers seen fewer than N times")
+    ap.add_argument("--min-count", type=int, default=1, help="Hide towers seen fewer than N times")
     ap.add_argument("--place-zoom", type=int, default=17, help="OSM tile zoom for place bucketing (higher => smaller buckets)")
     ap.add_argument("--max-lines", type=int, default=0, help="Read at most N lines from the JSONL (0 = no limit)")
     ap.add_argument("--after", default="", help="Only include samples at/after this datetime (ISO8601, e.g. 2026-05-01T00:00:00Z or 2026-05-01)")
@@ -1942,6 +2168,10 @@ def main() -> int:
     ap.add_argument("--sample-size", type=int, default=2000, help="Max per-tower reservoir samples kept for robust stats (memory bound).")
     ap.add_argument("--place-sample-size", type=int, default=800, help="Max per-place reservoir samples kept for distribution/change estimation (memory bound).")
     ap.add_argument("--place-bitmap-bits", type=int, default=2048, help="Bitmap size for approximate distinct-tower counts per place (memory bound).")
+    ap.add_argument("--max-places", type=int, default=8000, help="Max number of distinct place buckets to track (0 = unlimited). Limits memory for very long logs.")
+    ap.add_argument("--device-sample-size", type=int, default=5000, help="Reservoir size for device GPS points used only to center the map (0 = center on first tower marker).")
+    ap.add_argument("--gps-max-speed-mps", type=float, default=60.0, help="Device GPS jump filter: if implied speed exceeds this, treat the fix as bad and exclude it from tower stats (still shown on map).")
+    ap.add_argument("--bad-gps-sample-size", type=int, default=2000, help="Max number of bad GPS fixes to keep for display (memory bound).")
     ap.add_argument("--cluster-radius-m", type=float, default=400.0, help="Radius (m) for online multi-location clustering.")
     ap.add_argument("--session-gap-s", type=float, default=6*3600.0, help="Gap (seconds) that starts a new session.")
     args = ap.parse_args()
@@ -1951,8 +2181,15 @@ def main() -> int:
 
     aggs: Dict[TowerKey, TowerAgg] = {}
     places: Dict[str, PlaceAgg] = {}
-    all_lats: List[float] = []
-    all_lons: List[float] = []
+    # Memory-bounded reservoir of device locations to center the map.
+    device_pts: List[Tuple[float, float]] = []
+    device_pts_seen = 0
+    device_pts_cap = max(0, int(args.device_sample_size))
+    # Memory-bounded reservoir of bad GPS fixes (jump filter) to visualize but exclude.
+    bad_gps: List[Dict[str, Any]] = []
+    bad_gps_seen = 0
+    bad_gps_cap = max(0, int(args.bad_gps_sample_size))
+    last_fix: Optional[Tuple[float, float, float]] = None  # lat, lon, ts
 
     rng = random.Random(1)
     max_lines = args.max_lines if args.max_lines and args.max_lines > 0 else None
@@ -1973,10 +2210,46 @@ def main() -> int:
         if loc is None:
             continue
         lat, lon = loc
-        all_lats.append(lat)
-        all_lons.append(lon)
+        # GPS jump filter: exclude fixes that imply impossible speeds (common when GPS has poor lock).
+        bad_fix = False
+        speed_mps = None
+        if last_fix is not None:
+            speed_mps = implied_speed_mps(last_fix[0], last_fix[1], last_fix[2], lat, lon, when_ts)
+            if isinstance(speed_mps, (int, float)) and speed_mps > float(args.gps_max_speed_mps):
+                bad_fix = True
+
+        if bad_fix:
+            bad_gps_seen += 1
+            if bad_gps_cap > 0:
+                rec = {
+                    "ts": epoch_to_iso(when_ts),
+                    "lat": lat,
+                    "lon": lon,
+                    "speed_mps": round(float(speed_mps or 0.0), 2) if speed_mps is not None else None,
+                }
+                if len(bad_gps) < bad_gps_cap:
+                    bad_gps.append(rec)
+                else:
+                    j = rng.randrange(bad_gps_seen)
+                    if j < bad_gps_cap:
+                        bad_gps[j] = rec
+            continue
+
+        last_fix = (lat, lon, when_ts)
+
+        if device_pts_cap > 0:
+            device_pts_seen += 1
+            if len(device_pts) < device_pts_cap:
+                device_pts.append((lat, lon))
+            else:
+                j = rng.randrange(device_pts_seen)
+                if j < device_pts_cap:
+                    device_pts[j] = (lat, lon)
+
         x, y = latlon_to_tile(lat, lon, args.place_zoom)
         place_id = f"{args.place_zoom}/{x}/{y}"
+        if args.max_places and args.max_places > 0 and place_id not in places and len(places) >= int(args.max_places):
+            place_id = None
 
         operator = extract_operator(obj)
         for cell in iter_observed_cells(obj):
@@ -1998,15 +2271,16 @@ def main() -> int:
                 rng=rng,
             )
 
-            p = places.get(place_id)
-            if p is None:
-                p = PlaceAgg(
-                    place_id=place_id,
-                    signal_sample_size=max(0, int(args.place_sample_size)),
-                    distinct_bitmap_bits=max(256, int(args.place_bitmap_bits)),
-                )
-                places[place_id] = p
-            p.add(when_ts, key, sig)
+            if place_id is not None:
+                p = places.get(place_id)
+                if p is None:
+                    p = PlaceAgg(
+                        place_id=place_id,
+                        signal_sample_size=max(0, int(args.place_sample_size)),
+                        distinct_bitmap_bits=max(256, int(args.place_bitmap_bits)),
+                    )
+                    places[place_id] = p
+                p.add(when_ts, key, sig)
 
     if not aggs:
         raise SystemExit("No tower observations found (need location + towers/registration in JSONL).")
@@ -2039,6 +2313,12 @@ def main() -> int:
             km["mw_u_norm"] = mann_whitney_u(early, late)
             km["cusum"] = cusum_change_score(series, drift=0.05)
         km["count"] = p.count
+        km["first_ts"] = p.first_seen_ts
+        km["last_ts"] = p.last_seen_ts
+        if isinstance(p.first_seen_ts, (int, float)) and isinstance(p.last_seen_ts, (int, float)) and p.last_seen_ts >= p.first_seen_ts:
+            km["duration_s"] = float(p.last_seen_ts - p.first_seen_ts)
+        else:
+            km["duration_s"] = None
         km["distinct_towers"] = p.distinct_towers_est()
         km["rat_surprise"] = p.rat_surprise()
         place_metrics[pid] = km
@@ -2050,8 +2330,19 @@ def main() -> int:
         surprise_weighted = 0.0
         surprise_w = 0
         total = a.count or 1
+        local_first: Optional[float] = None
+        local_last: Optional[float] = None
+        place_details: List[Dict[str, Any]] = []
         for pid, c in a.places.items():
             pm = place_metrics.get(pid) or {}
+            ft = pm.get("first_ts")
+            lt = pm.get("last_ts")
+            if isinstance(ft, (int, float)):
+                if local_first is None or float(ft) < local_first:
+                    local_first = float(ft)
+            if isinstance(lt, (int, float)):
+                if local_last is None or float(lt) > local_last:
+                    local_last = float(lt)
             if pm.get("count", 0) >= 500 and c <= 2:
                 dense_novel += 1
             ks = pm.get("ks_d")
@@ -2063,12 +2354,70 @@ def main() -> int:
             if isinstance(rs, (int, float)):
                 surprise_weighted += rs * c
                 surprise_w += c
+            # store for per-tower XAI (which buckets, what changed)
+            place_details.append({
+                "place_id": pid,
+                "tower_count": int(c),
+                "place_total": int(pm.get("count") or 0),
+                "place_duration_min": round(float(pm.get("duration_s") or 0.0) / 60.0, 1) if isinstance(pm.get("duration_s"), (int, float)) else None,
+                "ks_d": round(float(ks), 3) if isinstance(ks, (int, float)) else None,
+                "cusum": round(float(cus), 3) if isinstance(cus, (int, float)) else None,
+                "rat_surprise": round(float(pm.get("rat_surprise")), 3) if isinstance(pm.get("rat_surprise"), (int, float)) else None,
+                "changed": bool(changed),
+            })
         a.features["dense_place_novelty"] = dense_novel
         a.features["change_places_frac"] = change_weight / max(1, total)
         a.features["place_rat_surprise"] = (surprise_weighted / surprise_w) if surprise_w else None
+        if local_first is not None and local_last is not None and local_last >= local_first:
+            local_window_s = float(local_last - local_first)
+            a.features["local_window_s"] = local_window_s
+            a.features["local_window_min"] = round(local_window_s / 60.0, 1)
+            dur_s = a.features.get("duration_s")
+            a.features["local_window_frac"] = (float(dur_s) / local_window_s) if isinstance(dur_s, (int, float)) and local_window_s > 0 else None
+        else:
+            a.features["local_window_s"] = None
+            a.features["local_window_min"] = None
+            a.features["local_window_frac"] = None
+
+        # keep only top place buckets by this tower's count, for HTML size control
+        place_details.sort(key=lambda d: (-int(d.get("tower_count") or 0), -int(d.get("place_total") or 0), str(d.get("place_id") or "")))
+        top_places = place_details[:12]
+        for d in top_places:
+            pid = str(d.get("place_id") or "")
+            try:
+                z_str, x_str, y_str = pid.split("/", 2)
+                z = int(z_str)
+                x = int(x_str)
+                y = int(y_str)
+                s, w, n, e = tile_bounds_latlon(z, x, y)
+                d["bbox"] = {"south": s, "west": w, "north": n, "east": e}
+                d["tile"] = {"z": z, "x": x, "y": y}
+            except Exception:
+                d["bbox"] = None
+                d["tile"] = None
+        a.features["place_details"] = top_places
 
         # scoring additions (explainable)
         breakdown = a.features.get("score_breakdown") or []
+        # Ephemeral burst (place-aware, ratio-based): short presence relative to the time you were active in the same place buckets.
+        dur_s = a.features.get("duration_s")
+        lw_s = a.features.get("local_window_s")
+        lw_frac = a.features.get("local_window_frac")
+        if (
+            a.count >= 5
+            and isinstance(dur_s, (int, float))
+            and isinstance(lw_s, (int, float))
+            and lw_s >= max(30 * 60, 3.0 * float(dur_s))
+            and isinstance(lw_frac, (int, float))
+            and lw_frac <= 0.25
+        ):
+            a.anomaly_score += 3.0
+            a.features["anomaly_ephemeral"] = True
+            breakdown.append({
+                "rule": "ephemeral",
+                "points": 3.0,
+                "because": f"count={a.count} duration_min={round(float(dur_s)/60.0,1)} local_window_min={a.features.get('local_window_min')} frac={round(float(lw_frac),4)}",
+            })
         if isinstance(dense_novel, int) and dense_novel >= 2 and a.count >= 10:
             a.anomaly_score += 1.5
             a.features["anomaly_novel_in_dense_places"] = True
@@ -2250,11 +2599,15 @@ def main() -> int:
             "gps_spread_m": a.features.get("gps_spread_m"),
             "clusters": a.features.get("clusters"),
             "cluster_top2_sep_m": round(a.features.get("cluster_top2_sep_m"), 1) if isinstance(a.features.get("cluster_top2_sep_m"), (int, float)) else None,
+            "clusters_detail": a.features.get("clusters_detail") or [],
             "center_drift_m": round(((a.features.get("center_drift") or {}).get("max_drift_m") or 0.0), 1) if isinstance(((a.features.get("center_drift") or {}).get("max_drift_m")), (int, float)) else None,
             "dist_outlier_frac": round((((a.features.get("signal_dist_model") or {}).get("outlier_frac")) or 0.0), 3) if isinstance(((a.features.get("signal_dist_model") or {}).get("outlier_frac")), (int, float)) else None,
             "anomaly_score": a.anomaly_score,
             "score_breakdown": a.features.get("score_breakdown") or [],
             "flags": flags,
+            "local_window_min": a.features.get("local_window_min"),
+            "local_window_frac": round(a.features.get("local_window_frac"), 4) if isinstance(a.features.get("local_window_frac"), (int, float)) else None,
+            "place_details": a.features.get("place_details") or [],
             "dense_place_novelty": a.features.get("dense_place_novelty"),
             "change_places_frac": round(a.features.get("change_places_frac"), 3) if isinstance(a.features.get("change_places_frac"), (int, float)) else None,
             "place_rat_surprise": round(a.features.get("place_rat_surprise"), 3) if isinstance(a.features.get("place_rat_surprise"), (int, float)) else None,
@@ -2271,11 +2624,21 @@ def main() -> int:
             "search": search,
         })
 
-    # Center map on global median of device points
-    c_lat = median(all_lats) or markers[0]["lat"]
-    c_lon = median(all_lons) or markers[0]["lon"]
+    # Center map
+    if device_pts:
+        c_lat = median([p[0] for p in device_pts]) or markers[0]["lat"]
+        c_lon = median([p[1] for p in device_pts]) or markers[0]["lon"]
+    else:
+        c_lat = markers[0]["lat"]
+        c_lon = markers[0]["lon"]
 
-    build_dashboard(markers, (c_lat, c_lon), args.out)
+    bad_stats = {
+        "excluded_total": int(bad_gps_seen),
+        "shown": int(len(bad_gps)),
+        "gps_max_speed_mps": float(args.gps_max_speed_mps),
+    }
+
+    build_dashboard(markers, (c_lat, c_lon), args.out, bad_gps_points=bad_gps, bad_gps_stats=bad_stats)
     print(f"Wrote {args.out} (towers: {len(markers)})")
     return 0
 
