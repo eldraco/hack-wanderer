@@ -1,4 +1,7 @@
 __pycache__/
+*.pyc
+.env
+towers.with-key.html
 .env
 logs/
 venv
