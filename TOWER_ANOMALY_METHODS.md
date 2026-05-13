@@ -164,6 +164,56 @@ The script `tower_anomaly_dashboard.py` implements this robust approach and visu
 
 ---
 
+## Ephemeral burst (what it really means here)
+
+The dashboard’s “ephemeral” rule is **ratio-based** (place-aware), not “you only logged for 10 minutes”.
+
+It compares:
+
+- `duration_min`: how long the tower fingerprint spans in your dataset (first→last time you saw it)
+- `local_window_min`: how long you were logging in the *same place buckets* where that tower appears
+- `local_window_frac = duration / local_window`
+
+It triggers when the tower is seen many times but occupies a small fraction of the local opportunity window (details are shown per tower in the HTML).
+
+## “Clusters” (multi-location) — what they are
+
+In the dashboard, “clusters” are computed from the GPS samples associated with a tower fingerprint using a streaming greedy method:
+
+- Maintain cluster centers.
+- Each new sample is assigned to the nearest existing cluster within `--cluster-radius-m` meters.
+- Otherwise, a new cluster is created.
+
+The HTML “Explain” view lists cluster centers and draws them on the map via the “Focus (clusters/buckets)” overlay.
+
+## “Place buckets” (KS/CUSUM) — what is a bucket?
+
+A “place bucket” is an OpenStreetMap Web Mercator **tile** at zoom `--place-zoom` (default 17). We group samples by tile to create a stable “where you were” context.
+
+For each bucket, the dashboard keeps a bounded reservoir of signal samples and computes:
+
+- KS two-sample D statistic (early vs late samples)
+- a CUSUM-style change score
+
+The HTML “Explain” view shows *which buckets* were involved for a given tower (with KS/CUSUM), and draws bucket rectangles on the map (Focus overlay).
+
+### Place-bucket column glossary (what you see in the HTML)
+
+- `place_id`: tile ID in `z/x/y` format (Web Mercator at zoom `--place-zoom`).
+- `tower_count`: number of times this tower fingerprint was observed in that bucket.
+- `place_total`: total number of log samples in that bucket (all towers).
+- `place_dur_min`: minutes between the first and last logging activity timestamps seen in that bucket.
+- `ks_d`: Kolmogorov–Smirnov D statistic comparing early vs late signal samples within the bucket (higher = distributions differ more). (No p-value.)
+- `cusum`: CUSUM-like change score over the bucket’s signal time series (higher = stronger shift evidence).
+- `changed`: boolean; true if `ks_d ≥ 0.25` or `cusum ≥ 8.0`.
+
+## Bad GPS jump filter (excluded but shown)
+
+If the device GPS jumps unrealistically far in a short time (poor lock), those fixes can create fake “moving towers”.
+The dashboard excludes such device fixes using `--gps-max-speed-mps` (default 60 m/s) but keeps a sample to display on the map in the “Bad GPS fixes (excluded)” overlay.
+
+---
+
 ## Best overall approach (recommended)
 
 1) **Start with explainable heuristics**:
