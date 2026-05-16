@@ -84,6 +84,8 @@
     </table>
   </div>
   <script>
+    const SESSION_VIEW_PARAM = new URLSearchParams(window.location.search).get('session');
+
     async function loadStatus() {
       try {
         const res = await fetch('./status.json', {cache: 'no-store'});
@@ -91,14 +93,33 @@
         const data = await res.json();
         render(data);
       } catch (err) {
-        document.getElementById('updated').textContent = 'Error loading status';
+        document.getElementById('l1').textContent = 'Error loading status';
       }
     }
 
+    function formatDateTime(value) {
+      if (!value) return '--';
+      const text = String(value).trim();
+      if (!text) return '--';
+      const match = text.match(/^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2}:\d{2})/);
+      if (match) return `${match[1]} ${match[2]}`;
+      return text.replace('T', ' ');
+    }
+
+    function shouldShowCurrentSessionOnly(data) {
+      if (SESSION_VIEW_PARAM === 'all') return false;
+      if (SESSION_VIEW_PARAM === 'current') return true;
+      const cfg = data.status_page || {};
+      return cfg.show_current_session_only !== false;
+    }
+
     function render(data) {
-      const updated = data.timestamp_utc || '--';
+      const updated = data.timestamp_local || data.timestamp_utc || '--';
       const timeShort = updated && updated.indexOf('T') >= 0 ? updated.split('T')[1].replace('Z','') : (updated || '--');
-      const towers = data.towers || [];
+      const allTowers = data.towers_all || data.towers_current_session || data.towers || [];
+      const currentSessionTowers = data.towers_current_session || data.towers || [];
+      const showCurrentSessionOnly = shouldShowCurrentSessionOnly(data);
+      const towers = showCurrentSessionOnly ? currentSessionTowers : allTowers;
       const loc = data.location || {};
       const locText = (loc.lat != null && loc.lon != null) ?
         `${loc.lat.toFixed(5)},${loc.lon.toFixed(5)}${loc.alt_m != null ? ' ' + loc.alt_m + 'm' : ''}` : 'No fix';
@@ -122,8 +143,8 @@
       const l1 = `T:${timeShort} Loc:${locText}`;
       const l2 = `GPSd:${gpsDeviceText} | GPSm:${gpsModemText}`;
       const l3 = `Net:${cops.operator||'unk'} act:${cops.act!=null?cops.act:'?'} reg:${reg.stat_text||'?'} | Sig:${signal.rssi_dbm!=null?signal.rssi_dbm+'dBm':'?' } r:${signal.rssi??'?' } SIM:${data.sim_status||'?'}`;
-      const l4 = '';
-      const l5 = `Tw:${towers.length||0}`;
+      const l4 = `View:${showCurrentSessionOnly ? 'current-session' : 'all-cached'} started:${formatDateTime(data.session_started_local || data.session_started_utc)}`;
+      const l5 = `Tw:${towers.length||0} shown | session:${currentSessionTowers.length||0} | all:${allTowers.length||0}`;
 
       const reversed = towers.slice().reverse(); // latest first if appended
       const tbody = document.getElementById('towers-body');
@@ -137,7 +158,13 @@
           const tr = document.createElement('tr');
           const rat = t.rat || t.mode || '?';
           const id = t.cell_id != null ? t.cell_id : 'unk';
-          tr.innerHTML = `<td>${rat}</td><td>${id}</td><td>${locShort}</td><td>${timeShort}</td>`;
+          const seenLoc = (t.seen_location && t.seen_location.lat != null && t.seen_location.lon != null)
+            ? `${Number(t.seen_location.lat).toFixed(4)},${Number(t.seen_location.lon).toFixed(4)}`
+            : locShort;
+          const seenTime = formatDateTime(
+            t.seen_time_local || t.last_seen_time_local || t.seen_time_utc || t.last_seen_time_utc || updated
+          );
+          tr.innerHTML = `<td>${rat}</td><td>${id}</td><td>${seenLoc}</td><td>${seenTime}</td>`;
           tbody.appendChild(tr);
         });
       }
