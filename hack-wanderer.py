@@ -92,6 +92,7 @@ DEFAULT_CONFIG = {
     },
     "status_page": {
         "json_path": "status/status.json",
+        "show_current_session_only": True,
     },
     "logging": {
         "enabled": True,
@@ -106,6 +107,10 @@ DEFAULT_CONFIG = {
         "interactive": False,
     },
 }
+
+
+_STATUS_SESSION_STARTED_UTC = None
+_STATUS_SESSION_STARTED_LOCAL = None
 
 
 ACT_RAT = {
@@ -989,6 +994,7 @@ def parse_cgnsinf(lines):
         return {}
     parts = split_fields(value)
     if len(parts) >= 6:
+        speed_kph = safe_float(parts[6]) if len(parts) > 6 else None
         return {
             "run_status": safe_int(parts[0]),
             "fix_status": safe_int(parts[1]),
@@ -996,6 +1002,9 @@ def parse_cgnsinf(lines):
             "lat": safe_float(parts[3]),
             "lon": safe_float(parts[4]),
             "alt_m": safe_float(parts[5]),
+            "speed_kph": speed_kph,
+            "speed_mps": (speed_kph / 3.6) if isinstance(speed_kph, (int, float)) else None,
+            "course_deg": safe_float(parts[7]) if len(parts) > 7 else None,
             "raw": value,
         }
     return {"raw": value}
@@ -1517,11 +1526,16 @@ def aggregate_nmea(parsed, raw_lines):
     location_source = None
     for key, data in (("rmc", rmc), ("gga", gga), ("gll", gll)):
         if data and data.get("lat") is not None and data.get("lon") is not None:
+            speed_knots = data.get("speed_knots")
+            alt_m = data.get("alt_m")
+            if alt_m is None:
+                alt_m = gga.get("alt_m")
             location = {
                 "lat": data.get("lat"),
                 "lon": data.get("lon"),
-                "alt_m": data.get("alt_m"),
-                "speed_knots": data.get("speed_knots"),
+                "alt_m": alt_m,
+                "speed_knots": speed_knots,
+                "speed_mps": (float(speed_knots) * 0.514444) if isinstance(speed_knots, (int, float)) else None,
                 "course_deg": data.get("course_deg"),
             }
             if data.get("timestamp_utc"):
@@ -1911,6 +1925,9 @@ def best_location_from_sources(gps_modem, gps_device):
             "lat": cgns.get("lat"),
             "lon": cgns.get("lon"),
             "alt_m": cgns.get("alt_m"),
+            "speed_kph": cgns.get("speed_kph"),
+            "speed_mps": cgns.get("speed_mps"),
+            "course_deg": cgns.get("course_deg"),
             "timestamp_utc": cgns.get("utc"),
             "source": "lte_modem",
         }
@@ -2046,7 +2063,16 @@ def write_jsonl(handle, obj):
     handle.flush()
 
 
-def write_status_snapshot(path, snapshot, logger):
+def status_session_started(snapshot):
+    global _STATUS_SESSION_STARTED_UTC, _STATUS_SESSION_STARTED_LOCAL
+    if _STATUS_SESSION_STARTED_UTC is None:
+        _STATUS_SESSION_STARTED_UTC = snapshot.get("timestamp_utc") or iso_timestamp()
+    if _STATUS_SESSION_STARTED_LOCAL is None:
+        _STATUS_SESSION_STARTED_LOCAL = snapshot.get("timestamp_local") or _STATUS_SESSION_STARTED_UTC
+    return _STATUS_SESSION_STARTED_UTC, _STATUS_SESSION_STARTED_LOCAL
+
+
+def write_status_snapshot(path, snapshot, logger, config=None):
     if not path:
         return
     try:
@@ -2054,6 +2080,11 @@ def write_status_snapshot(path, snapshot, logger):
         if directory:
             os.makedirs(directory, exist_ok=True)
         cache_path = os.path.join(directory, "towers_cache.json") if directory else "towers_cache.json"
+        status_page_cfg = (config or {}).get("status_page") or {}
+        show_current_session_only = status_page_cfg.get("show_current_session_only")
+        if show_current_session_only is None:
+            show_current_session_only = True
+        session_started_utc, session_started_local = status_session_started(snapshot)
         existing = []
         cache_map = {}
         if os.path.exists(cache_path):
@@ -2078,15 +2109,33 @@ def write_status_snapshot(path, snapshot, logger):
                 t.get("mcc"),
                 t.get("mnc"),
             )
-            if key in cache_map:
-                continue
-            entry = dict(t)
+            entry = cache_map.get(key)
+            if entry is None:
+                entry = dict(t)
+                entry["key"] = key
+                entry["first_seen_time_local"] = tz_time
+                entry["first_seen_time_utc"] = snapshot.get("timestamp_utc")
+                entry["first_seen_location"] = location
+                entry["first_seen_session_utc"] = session_started_utc
+                entry["first_seen_session_local"] = session_started_local
+                entry["seen_count"] = 0
+                cache_map[key] = entry
+                existing.append(entry)
+            else:
+                entry.update(t)
             entry["seen_time_local"] = tz_time
             entry["seen_time_utc"] = snapshot.get("timestamp_utc")
             entry["seen_location"] = location
-            entry["key"] = key
-            cache_map[key] = entry
-            existing.append(entry)
+            entry["seen_count"] = int(entry.get("seen_count") or 0) + 1
+        towers_all = []
+        towers_current_session = []
+        for item in existing:
+            item_payload = dict(item)
+            in_current_session = item.get("first_seen_session_utc") == session_started_utc
+            item_payload["in_current_session"] = in_current_session
+            towers_all.append(item_payload)
+            if in_current_session:
+                towers_current_session.append(item_payload)
         try:
             with open(cache_path, "w", encoding="utf-8") as ch:
                 json.dump(existing, ch, ensure_ascii=True, indent=2)
@@ -2094,10 +2143,12 @@ def write_status_snapshot(path, snapshot, logger):
             logger.warning("Failed to write tower cache {}: {}".format(cache_path, exc))
         payload = {
             "timestamp_utc": snapshot.get("timestamp_utc"),
+            "timestamp_local": snapshot.get("timestamp_local"),
             "location": snapshot.get("location"),
             "network": snapshot.get("network"),
             "towers": snapshot.get("towers"),
-            "towers_all": existing,
+            "towers_all": towers_all,
+            "towers_current_session": towers_current_session,
             "gps_lte_modem": snapshot.get("gps"),
             "gps_device": snapshot.get("gps_device"),
             "sim_status": snapshot.get("sim_status"),
@@ -2106,6 +2157,11 @@ def write_status_snapshot(path, snapshot, logger):
             "local_time": snapshot.get("timestamp_local"),
             "gps_time_utc": snapshot.get("gps_time_utc"),
             "gps_time_local": snapshot.get("gps_time_local"),
+            "session_started_utc": session_started_utc,
+            "session_started_local": session_started_local,
+            "status_page": {
+                "show_current_session_only": bool(show_current_session_only),
+            },
         }
         with open(path, "w", encoding="utf-8") as handle:
             json.dump(payload, handle, ensure_ascii=True, indent=2)
@@ -2592,7 +2648,7 @@ def main(argv):
                             snapshot["sim_status"] = pin_info.get("status_after")
                             write_jsonl(jsonl_handle, snapshot)
                             status_path = (config.get("status_page") or {}).get("json_path") or ""
-                            write_status_snapshot(status_path, snapshot, logger)
+                            write_status_snapshot(status_path, snapshot, logger, config)
                             if wigle_handle:
                                 for row in snapshot_to_wigle_rows(snapshot):
                                     wigle_handle.write(",".join([
