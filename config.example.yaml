@@ -74,6 +74,7 @@ output:
 
 status_page:
   json_path: status/status.json
+  show_current_session_only: true
 
 logging:
   enabled: true
