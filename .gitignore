@@ -7,3 +7,5 @@ logs/
 venv
 *.jsonl
 status/status.json
+tower_intel.sqlite*
+imports_uploaded/
