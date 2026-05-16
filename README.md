@@ -40,6 +40,21 @@ Wardriving mode (JSONL):
 python hack-wanderer.py --config config.example.yaml --mode wardrive
 ```
 
+## Persistent local dashboard
+
+For multi-day tower analysis, use the SQLite-backed local dashboard:
+
+```bash
+pip install -r requirements-tower-intel.txt
+python3 tower_intel_server.py ingest logs/14-5-2026.jsonl
+python3 tower_intel_server.py recompute
+python3 tower_intel_server.py serve
+```
+
+Then open `http://127.0.0.1:8890`.
+
+The dashboard stores raw samples and tower observations in `tower_intel.sqlite`, including valid GPS altitude, lets you tune anomaly thresholds, softens geo-heavy anomaly methods when observations came from elevated positions, shows per-tower XAI explanations, and exports tower reports as Markdown or DOCX. See `TOWER_INTEL_APP.md`.
+
 ## Configuration
 
 All settings can be provided via CLI flags or a YAML file. CLI flags override the YAML values.
@@ -111,6 +126,7 @@ output:
 
 status_page:
   json_path: status/status.json
+  show_current_session_only: true
 
 logging:
   enabled: true
@@ -202,6 +218,7 @@ Run `python hack-wanderer.py --help` for the full list. Key flags:
 ## Local status page (small display)
 
 - The wardrive loop writes a live snapshot to `status/status.json` and a matching display at `status/index.html` (auto-refresh every 3s).
+- `status_page.show_current_session_only` defaults to `true`, so the tower table shows only towers first seen in the current run session. Use `?session=all` in the browser URL to temporarily show the full cached tower history.
 - Serve it locally or open directly with a browser: `chromium-browser file:///home/pi/code/hack-wanderer/status/index.html`.
 - To auto-open on boot (kiosk on :0, adjust if your user/desktop differ):
   ```bash
