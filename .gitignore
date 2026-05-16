@@ -9,3 +9,5 @@ venv
 status/status.json
 tower_intel.sqlite*
 imports_uploaded/
+pages/
+papers/
