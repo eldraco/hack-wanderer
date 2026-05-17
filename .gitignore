@@ -11,3 +11,5 @@ tower_intel.sqlite*
 imports_uploaded/
 pages/
 papers/
+Towers/
+.DS_Store
