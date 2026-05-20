@@ -206,7 +206,12 @@ Examples of negative evidence:
 
 Raw GPS is stored exactly as observed. Derived calculations exclude bad GPS fixes by default.
 
-Bad GPS means consecutive valid fixes imply an impossible speed jump. These points remain visible in the UI, but they do not create false anomaly evidence.
+Bad GPS means either:
+
+- the GPS source reports an invalid/no-fix state (for example external GPS `gps_device.fix_quality == 0` / `status != A`, or modem GPS fix_status == 0), or
+- consecutive valid fixes imply an impossible speed jump.
+
+These points remain visible in the UI, but they do not create false anomaly evidence.
 
 Altitude is also stored when the fix looks valid:
 
