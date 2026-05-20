@@ -10,6 +10,7 @@ Leaflet dashboard for exploration.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import datetime as dt
 import hashlib
 import html
@@ -3404,7 +3405,8 @@ def create_app(db_path: str):
                 paths.extend(parse_multipart_paths(ctype, body, upload_dir))
         if not paths:
             return {"error": "No paths or files provided"}
-        return ingest_files(db_path, paths)
+        # Run ingest off the event loop so the UI stays responsive while importing.
+        return await asyncio.to_thread(ingest_files, db_path, paths)
 
     @app.post("/api/recompute")
     def api_recompute() -> Dict[str, Any]:
