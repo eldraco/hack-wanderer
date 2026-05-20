@@ -210,6 +210,8 @@ def connect_db(db_path: str) -> sqlite3.Connection:
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA journal_mode=WAL")
     con.execute("PRAGMA synchronous=NORMAL")
+    # Avoid immediate failures when the UI/server has the DB open briefly.
+    con.execute("PRAGMA busy_timeout=5000")
     con.execute("PRAGMA foreign_keys=ON")
     return con
 
@@ -392,6 +394,12 @@ VARIABLE_GLOSSARY: Dict[str, str] = {
     "change_places_frac_stationary": "Same as change_places_frac, but preferring place buckets whose stationary-only distributions changed when that evidence exists.",
     "changed_bucket_fraction": "Fraction of this tower's observations that fall in place buckets marked as changed. Uses stationary-only change fraction when available, otherwise overall change fraction.",
     "place_details": "List of local place buckets used by the place-change method. Each item summarizes one bucket with fields such as count, place_total, ks_d, cusum, changed, and changed_stationary.",
+    "new_place_id": "The place bucket (tile at zoom 17) where this tower fingerprint was most often observed.",
+    "new_place_count": "How many observations of this tower were in new_place_id (the tower's main place bucket).",
+    "new_place_prior_count": "How many total (good-GPS) tower observations existed in new_place_id before this tower was first seen there. Higher implies better coverage and higher confidence the tower is genuinely new.",
+    "new_place_prior_days": "How many distinct UTC days had any (good-GPS) observations in new_place_id before this tower was first seen there.",
+    "new_place_prior_stationary_count": "How many stationary (good-GPS) observations existed in new_place_id before this tower was first seen there.",
+    "new_place_prior_stationary_days": "How many distinct UTC days had any stationary observations in new_place_id before this tower was first seen there.",
     "place_total": "Total number of log samples in that place bucket, across all towers.",
     "place_dur_min": "Total duration in minutes covered by samples inside that place bucket.",
     "ks_d": "Kolmogorov-Smirnov distance between earlier and later signal distributions in that place bucket. Bigger means stronger distribution change.",
@@ -462,6 +470,28 @@ VARIABLE_GLOSSARY: Dict[str, str] = {
 
 
 METHOD_REGISTRY: List[Dict[str, Any]] = [
+    {
+        "id": "new_in_well_covered_place",
+        "label": "New tower in a well-covered place",
+        "direction": "up",
+        "weight": 1.6,
+        "thresholds": {
+            "prior_count_start": 120,
+            "prior_count_full": 1200,
+            "min_tower_count_in_place": 6,
+            "min_prior_days": 2,
+        },
+        "variables": [
+            "new_place_prior_count",
+            "new_place_prior_days",
+            "new_place_prior_stationary_count",
+            "new_place_prior_stationary_days",
+            "new_place_count",
+        ],
+        "equation": "norm01 = clamp((new_place_prior_count - prior_count_start) / (prior_count_full - prior_count_start), 0, 1) if new_place_prior_days >= min_prior_days",
+        "help": "If a tower first appears inside a place bucket that previously had lots of good observations, we have higher confidence it was not simply missed earlier. This flags new deployments in well-covered areas (still probabilistic).",
+        "map_layers": ["place_buckets", "points"],
+    },
     {
         "id": "multi_location_stationary",
         "label": "Multi-location even while stationary",
@@ -630,6 +660,21 @@ METHOD_REGISTRY: List[Dict[str, Any]] = [
 ]
 
 METHOD_XAI_SPECS: Dict[str, Dict[str, Any]] = {
+    "new_in_well_covered_place": {
+        "trigger_summary": "Requires enough tower observations in its main place bucket and substantial prior coverage (count and days) in that place before the tower first appeared there.",
+        "rows": [
+            ("Gate", "new_place_count"),
+            ("Gate", "min_tower_count_in_place"),
+            ("Gate", "new_place_prior_days"),
+            ("Gate", "min_prior_days"),
+            ("Equation", "new_place_prior_count"),
+            ("Equation", "prior_count_start"),
+            ("Equation", "prior_count_full"),
+            ("Context", "new_place_id"),
+            ("Context", "new_place_prior_stationary_count"),
+            ("Context", "new_place_prior_stationary_days"),
+        ],
+    },
     "multi_location_stationary": {
         "trigger_summary": "Requires at least 2 stationary clusters, enough stationary observations, and separation above the start threshold.",
         "rows": [
@@ -1234,6 +1279,28 @@ def evaluate_methods(
     if isinstance(frac, (int, float)) and full_frac != max_frac:
         n = clamp01((max_frac - float(frac)) / (max_frac - full_frac))
     total_delta += add_method_result(results, m(mid), context, n, bool(stat_count >= th(mid, "min_stationary_count", 5) and isinstance(window, (int, float)) and window >= th(mid, "min_window_min", 8) and n > 0), "Tower appeared briefly despite stationary nearby opportunity.", altitude_factor=stationary_altitude_factor(), altitude_factor_name="stationary_geo_altitude_confidence")
+
+    mid = "new_in_well_covered_place"
+    prior_count = features.get("new_place_prior_count")
+    prior_days = features.get("new_place_prior_days")
+    tower_place_n = features.get("new_place_count") or 0
+    n = norm_range(prior_count, th(mid, "prior_count_start", 120), th(mid, "prior_count_full", 1200))
+    triggered = bool(
+        isinstance(prior_days, (int, float))
+        and prior_days >= th(mid, "min_prior_days", 2)
+        and (tower_place_n >= th(mid, "min_tower_count_in_place", 6))
+        and n > 0
+    )
+    total_delta += add_method_result(
+        results,
+        m(mid),
+        context,
+        n,
+        triggered,
+        "Tower first appears in a place bucket that had substantial prior coverage.",
+        altitude_factor=geo_altitude_factor(),
+        altitude_factor_name="geo_altitude_confidence",
+    )
 
     mid = "place_change_correlation"
     frac2 = features.get("change_places_frac_stationary")
@@ -1983,6 +2050,24 @@ def recompute(db_path: str, *, sample_size: int = 2500) -> Dict[str, Any]:
         aggs: Dict[int, TowerAgg] = {}
         base_aggs: Dict[str, BaseAgg] = {}
         place_aggs: Dict[str, PlaceAgg] = {}
+
+        # For "new tower in well-covered place" we need to know how much a place
+        # was observed before a given tower first appeared there. Because rows
+        # are ordered by timestamp, we can compute these as running counters.
+        place_seen_total: Dict[str, int] = defaultdict(int)
+        place_seen_stationary: Dict[str, int] = defaultdict(int)
+        place_day_count: Dict[str, int] = defaultdict(int)
+        place_last_day: Dict[str, int] = {}
+        place_stationary_day_count: Dict[str, int] = defaultdict(int)
+        place_stationary_last_day: Dict[str, int] = {}
+
+        first_seen_in_place: set[Tuple[int, str]] = set()
+        tower_place_prior: Dict[Tuple[int, str], Dict[str, Any]] = {}
+
+        def day_id_utc(ts: float) -> int:
+            d = dt.datetime.fromtimestamp(float(ts), dt.timezone.utc)
+            return d.year * 10000 + d.month * 100 + d.day
+
         place_altitude_floor = compute_place_altitude_floors(con, app_config)
         altitude_aggs: Dict[int, Dict[str, Any]] = defaultdict(make_altitude_acc)
         rows = con.execute(
@@ -2005,6 +2090,20 @@ def recompute(db_path: str, *, sample_size: int = 2500) -> Dict[str, Any]:
                 agg.bad_gps_skipped += 1
                 continue
             place_id = row["place_id"]
+            ts = float(row["ts"])
+            if place_id:
+                pid = str(place_id)
+                # Record prior place coverage the first time we ever see this tower in this place.
+                tp = (tid, pid)
+                if tp not in first_seen_in_place:
+                    tower_place_prior[tp] = {
+                        "prior_count": int(place_seen_total.get(pid, 0)),
+                        "prior_stationary_count": int(place_seen_stationary.get(pid, 0)),
+                        "prior_days": int(place_day_count.get(pid, 0)),
+                        "prior_stationary_days": int(place_stationary_day_count.get(pid, 0)),
+                        "first_seen_ts": ts,
+                    }
+                    first_seen_in_place.add(tp)
             alt_m = float(row["alt_m"]) if isinstance(row["alt_m"], (int, float)) else None
             place_floor = place_altitude_floor.get(str(place_id)) if place_id else None
             relative_alt_m = max(0.0, alt_m - place_floor) if isinstance(alt_m, (int, float)) and isinstance(place_floor, (int, float)) else None
@@ -2012,7 +2111,7 @@ def recompute(db_path: str, *, sample_size: int = 2500) -> Dict[str, Any]:
                 add_altitude_obs(altitude_aggs[tid], float(relative_alt_m), stationary=bool(row["stationary"]), rng=rng, config=app_config)
             signal = row["signal"]
             agg.add(
-                float(row["ts"]),
+                ts,
                 float(row["lat"]),
                 float(row["lon"]),
                 float(signal) if isinstance(signal, (int, float)) else None,
@@ -2026,7 +2125,7 @@ def recompute(db_path: str, *, sample_size: int = 2500) -> Dict[str, Any]:
             if row["stationary"]:
                 seg = int(row["stationary_segment"] or 0)
                 agg.add_stationary(
-                    float(row["ts"]),
+                    ts,
                     float(row["lat"]),
                     float(row["lon"]),
                     float(signal) if isinstance(signal, (int, float)) else None,
@@ -2039,7 +2138,19 @@ def recompute(db_path: str, *, sample_size: int = 2500) -> Dict[str, Any]:
                 bidentity = base_identity_key(bkey)
                 base_aggs.setdefault(bidentity, BaseAgg(bkey)).add_stationary(key.pci, key.earfcn, segment_id=seg)
             if place_id:
-                place_aggs.setdefault(place_id, PlaceAgg(place_id)).add(float(row["ts"]), key, signal, stationary=bool(row["stationary"]))
+                # Update per-place running coverage counters AFTER processing the row.
+                pid = str(place_id)
+                day = day_id_utc(ts)
+                if place_last_day.get(pid) != day:
+                    place_last_day[pid] = day
+                    place_day_count[pid] += 1
+                place_seen_total[pid] += 1
+                if row["stationary"]:
+                    if place_stationary_last_day.get(pid) != day:
+                        place_stationary_last_day[pid] = day
+                        place_stationary_day_count[pid] += 1
+                    place_seen_stationary[pid] += 1
+                place_aggs.setdefault(place_id, PlaceAgg(place_id)).add(ts, key, signal, stationary=bool(row["stationary"]))
 
         agg_list = list(aggs.values())
         for a in agg_list:
@@ -2097,7 +2208,7 @@ def recompute(db_path: str, *, sample_size: int = 2500) -> Dict[str, Any]:
         churn_baselines = apply_stationary_param_churn(agg_list)
         place_metrics = compute_place_metrics(place_aggs)
 
-        for a in agg_list:
+        for tid, a in aggs.items():
             pdetails = []
             changed_count = 0
             changed_count_stationary = 0
@@ -2117,6 +2228,17 @@ def recompute(db_path: str, *, sample_size: int = 2500) -> Dict[str, Any]:
                     stationary_firsts.append(pa.first_stationary_ts)
                     stationary_lasts.append(pa.last_stationary_ts)
                 pdetails.append({"place_id": pid, "count": count, **pm})
+            # New tower in well-covered place: attach prior coverage features for the tower's
+            # most common place bucket.
+            if a.places:
+                top_pid, top_cnt = max(a.places.items(), key=lambda kv: (kv[1], str(kv[0])))
+                a.features["new_place_id"] = str(top_pid)
+                a.features["new_place_count"] = int(top_cnt)
+                prior = tower_place_prior.get((tid, str(top_pid))) or {}
+                a.features["new_place_prior_count"] = prior.get("prior_count")
+                a.features["new_place_prior_days"] = prior.get("prior_days")
+                a.features["new_place_prior_stationary_count"] = prior.get("prior_stationary_count")
+                a.features["new_place_prior_stationary_days"] = prior.get("prior_stationary_days")
             a.features["place_details"] = pdetails[:30]
             if a.count:
                 a.features["change_places_frac"] = changed_count / max(1, a.count)
@@ -2980,7 +3102,7 @@ async function openTower(id){
   const t=await api('/api/towers/'+id); currentTowerData=t; drawerShowAllMethods=false; renderDrawer(t);
   if(t.center_lat!=null) map.setView([t.center_lat,t.center_lon], Math.max(map.getZoom(),17));
 }
-function pickFeatures(f){const keys=['count','days_seen','stationary_count','gps_spread_m','clusters','cluster_top2_sep_m','stationary_clusters','stationary_cluster_top2_sep_m','signal_dist_model','stationary_signal_mad','stationary_signal_mad_z','stationary_jump_rate_8db','stationary_jump_rate_z','stationary_param_obs','stationary_pci_change_rate_z','stationary_earfcn_change_rate_z','local_stationary_window_min','local_stationary_window_frac','change_places_frac_stationary','place_rat_surprise','stability_bonus','bad_gps_skipped','altitude_samples','altitude_rel_median_m','altitude_rel_p90_m','high_altitude_obs_frac','geo_altitude_confidence','stationary_altitude_samples','stationary_altitude_rel_median_m','stationary_altitude_rel_p90_m','stationary_high_altitude_obs_frac','stationary_geo_altitude_confidence']; let o={}; keys.forEach(k=>{if(f&&f[k]!==undefined)o[k]=f[k]}); return o}
+function pickFeatures(f){const keys=['count','days_seen','stationary_count','gps_spread_m','clusters','cluster_top2_sep_m','stationary_clusters','stationary_cluster_top2_sep_m','signal_dist_model','stationary_signal_mad','stationary_signal_mad_z','stationary_jump_rate_8db','stationary_jump_rate_z','stationary_param_obs','stationary_pci_change_rate_z','stationary_earfcn_change_rate_z','local_stationary_window_min','local_stationary_window_frac','change_places_frac_stationary','place_rat_surprise','new_place_id','new_place_count','new_place_prior_count','new_place_prior_days','new_place_prior_stationary_count','new_place_prior_stationary_days','stability_bonus','bad_gps_skipped','altitude_samples','altitude_rel_median_m','altitude_rel_p90_m','high_altitude_obs_frac','geo_altitude_confidence','stationary_altitude_samples','stationary_altitude_rel_median_m','stationary_altitude_rel_p90_m','stationary_high_altitude_obs_frac','stationary_geo_altitude_confidence']; let o={}; keys.forEach(k=>{if(f&&f[k]!==undefined)o[k]=f[k]}); return o}
 function renderDrawer(t){
   document.getElementById('drawer').classList.add('open');
   document.getElementById('drawerTitle').textContent=t.label;
