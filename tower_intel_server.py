@@ -211,8 +211,8 @@ def connect_db(db_path: str) -> sqlite3.Connection:
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA journal_mode=WAL")
     con.execute("PRAGMA synchronous=NORMAL")
-    # Avoid immediate failures when the UI/server has the DB open briefly.
-    con.execute("PRAGMA busy_timeout=5000")
+    # Avoid immediate failures when imports/recompute are writing.
+    con.execute("PRAGMA busy_timeout=30000")
     con.execute("PRAGMA foreign_keys=ON")
     return con
 
@@ -289,6 +289,7 @@ CREATE TABLE IF NOT EXISTS tower_observations (
   signal REAL,
   raw_cell_json TEXT NOT NULL,
   bad_gps INTEGER NOT NULL DEFAULT 0,
+  ignored INTEGER NOT NULL DEFAULT 0,
   stationary INTEGER NOT NULL DEFAULT 0,
   stationary_segment INTEGER,
   FOREIGN KEY(sample_uid) REFERENCES raw_samples(sample_uid) ON DELETE CASCADE,
@@ -361,7 +362,7 @@ VARIABLE_GLOSSARY: Dict[str, str] = {
     "pci": "Physical Cell ID. It identifies radio-layer identity within a local LTE area and helps distinguish sectors.",
     "earfcn": "LTE frequency channel number. It helps distinguish frequency layers/sectors.",
     "signal": "Best available signal proxy from the log: per-cell RSRP/RSSI/RSRQ/RSSNR when present, otherwise CSQ RSSI dBm.",
-    "bad_gps": "A GPS fix excluded from anomaly calculations because consecutive fixes imply an impossible speed jump.",
+    "bad_gps": "A GPS fix excluded from anomaly calculations because the source reports an invalid/no-fix state (e.g. gps_device fix_quality==0/status!=A, or modem fix_status==0) or because consecutive fixes imply an impossible speed jump.",
     "stationary": "A sample marked stationary because the device stayed within a small radius long enough, with low implied speed between fixes and low GPS-reported speed when that direct speed was available from the log.",
     "alt_m": "Altitude in meters attached to the sample when available from GPS. For external NMEA GPS this often comes from the GGA sentence.",
     "place_id": "A Web-Mercator map-tile bucket at zoom 17. It groups nearby samples into a local place without needing external geocoding.",
@@ -985,6 +986,7 @@ def ensure_column(con: sqlite3.Connection, table: str, column: str, spec: str) -
 
 def migrate_db(con: sqlite3.Connection) -> None:
     ensure_column(con, "raw_samples", "alt_m", "REAL")
+    ensure_column(con, "tower_observations", "ignored", "INTEGER NOT NULL DEFAULT 0")
     ensure_column(con, "import_files", "new_samples", "INTEGER NOT NULL DEFAULT 0")
     ensure_column(con, "import_files", "tower_fingerprints", "INTEGER NOT NULL DEFAULT 0")
     ensure_column(con, "import_files", "new_towers", "INTEGER NOT NULL DEFAULT 0")
@@ -1468,6 +1470,28 @@ def sample_alt_m(obj: Dict[str, Any]) -> Optional[float]:
     return None
 
 
+def sample_has_valid_location_fix(obj: Dict[str, Any]) -> bool:
+    """
+    Best-effort validity check for the location fix used by hack-wanderer.
+
+    We intentionally keep this conservative: if the location source is explicit
+    (gps_device / lte_modem), require that source to report a valid fix.
+    Otherwise, assume "valid enough" and let the speed-jump heuristic catch
+    implausible points.
+    """
+    if not isinstance(obj, dict):
+        return True
+    loc = obj.get("location") or {}
+    source = str(loc.get("source") or "").lower() if isinstance(loc, dict) else ""
+    if source == "gps_device":
+        gpsd = obj.get("gps_device") or {}
+        return _gps_device_has_valid_fix(gpsd) if isinstance(gpsd, dict) else False
+    if source == "lte_modem":
+        gps = obj.get("gps") or obj.get("gps_lte_modem") or {}
+        return _modem_has_valid_fix(gps) if isinstance(gps, dict) else False
+    return True
+
+
 def quantile(values: Sequence[float], q: float) -> Optional[float]:
     if not values:
         return None
@@ -1760,6 +1784,8 @@ def ingest_files(db_path: str, paths: Sequence[str], *, max_lines: Optional[int]
                     bad_gps = 0
                     if loc is not None:
                         lat, lon = loc
+                        if not sample_has_valid_location_fix(obj):
+                            bad_gps = 1
                         if ts is not None and prev_fix is not None:
                             speed = implied_speed_mps(prev_fix[0], prev_fix[1], prev_fix[2], lat, lon, ts)
                             if speed is not None and speed > BAD_GPS_SPEED_MPS:
@@ -1804,7 +1830,9 @@ def ingest_files(db_path: str, paths: Sequence[str], *, max_lines: Optional[int]
                             (obs_uid, sample_uid, tower_id, base_identity_key(BaseKey(key.operator, key.rat, key.tac_lac, key.cell_id)), ts, lat, lon, place_id, signal, json_dumps(cell), bad_gps),
                         )
                     imported_rows += 1
-                    if imported_rows % 1000 == 0:
+                    # Commit in smaller batches to reduce long-held write locks,
+                    # so the UI can still perform small updates (e.g. ignore a point).
+                    if imported_rows % 200 == 0:
                         con.commit()
             counts_after_file = _count_db_entities(con)
             file_summary = {
@@ -2077,7 +2105,7 @@ def recompute(db_path: str, *, sample_size: int = 2500) -> Dict[str, Any]:
             FROM tower_observations o
             JOIN towers t ON t.id=o.tower_id
             LEFT JOIN raw_samples r ON r.sample_uid=o.sample_uid
-            WHERE o.ts IS NOT NULL AND o.lat IS NOT NULL AND o.lon IS NOT NULL
+            WHERE o.ts IS NOT NULL AND o.lat IS NOT NULL AND o.lon IS NOT NULL AND COALESCE(o.ignored,0)=0
             ORDER BY o.ts, o.id
             """
         )
@@ -2767,7 +2795,7 @@ def index_html() -> str:
     .config-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px}.config-field label{display:block;font-weight:700;margin-bottom:6px}.config-field input{width:100%}
     .table-wrap.compact{height:auto;max-height:360px}.table-wrap.compact table{min-width:100%}.path-cell code{display:block;white-space:normal;overflow-wrap:anywhere}.status-tag{display:inline-flex;align-items:center;border-radius:999px;padding:3px 9px;font-size:12px;font-weight:800;text-transform:capitalize}.status-tag.imported{background:#dcfce7;color:#166534}.status-tag.skipped{background:#e2e8f0;color:#334155}.status-tag.error{background:#fee2e2;color:#991b1b}
     .toolbar-note{margin-left:auto}
-    .meta-editor{border:1px solid var(--line);border-radius:14px;padding:14px;background:#f8fafc}.meta-editor textarea{width:100%;min-height:120px;resize:vertical}.meta-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px}.meta-grid label{display:flex;gap:8px;align-items:center}.note-indicator{font-weight:700}.note-indicator.yes{color:#1d4ed8}.note-indicator.no{color:#64748b}.tag-badge{display:inline-flex;align-items:center;border:1px solid #cbd5e1;border-radius:999px;padding:3px 8px;background:#f8fafc;font-size:12px;font-weight:700}.leaflet-tooltip.point-raw-tooltip{max-width:460px;white-space:normal}.point-tooltip{max-width:440px}.point-tooltip pre{margin:6px 0 0;max-height:180px;overflow:auto;white-space:pre-wrap;word-break:break-word;background:#f8fafc;border:1px solid #e5e7eb;border-radius:8px;padding:8px;font-size:11px}
+    .meta-editor{border:1px solid var(--line);border-radius:14px;padding:14px;background:#f8fafc}.meta-editor textarea{width:100%;min-height:120px;resize:vertical}.meta-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px}.meta-grid label{display:flex;gap:8px;align-items:center}.note-indicator{font-weight:700}.note-indicator.yes{color:#1d4ed8}.note-indicator.no{color:#64748b}.tag-badge{display:inline-flex;align-items:center;border:1px solid #cbd5e1;border-radius:999px;padding:3px 8px;background:#f8fafc;font-size:12px;font-weight:700}.leaflet-tooltip.point-raw-tooltip,.leaflet-popup.point-raw-tooltip{max-width:min(720px,92vw);min-width:min(320px,92vw);white-space:normal}.point-tooltip{max-width:min(700px,92vw)}.point-tooltip pre{margin:6px 0 0;max-height:180px;overflow:auto;white-space:pre-wrap;word-break:break-word;background:#f8fafc;border:1px solid #e5e7eb;border-radius:8px;padding:8px;font-size:11px}
     @media (max-width: 1180px){.imports-grid{grid-template-columns:1fr 1fr}.imports-grid .stats-card-col,.imports-grid .span-all{grid-column:1/-1}}
     @media (max-width: 860px){.imports-grid{grid-template-columns:1fr}.imports-grid > *{grid-column:1/-1}.toolbar-note{margin-left:0}}
   </style>
@@ -2811,6 +2839,8 @@ let towerTableItems=[], adminTableItems=[];
 let tableSort={towerTable:{key:'bayes_post_p',dir:-1},adminTable:{key:'bayes_post_p',dir:-1}};
 let appConfig={}, appConfigHelp={};
 let currentTowerData=null, drawerShowAllMethods=false;
+let obsMarkers=new Map(); // obs_uid -> {layer, point}
+let currentPointsMode='';
 const ANOMALY_CATEGORY_CUTOFF=0.001;
 const ANALYSIS_STATUS_VALUES=['','under analysis','analyzed','benign','suspicious','CSS'];
 function initMap(){
@@ -2831,6 +2861,7 @@ function analysisTagHtml(value){
   return text?`<span class="tag-badge">${esc(text)}</span>`:'—';
 }
 function pointTooltipHtml(point, mode){
+  const canToggle = Boolean(point && point.obs_uid);
   const bits=[
     `<div><b>Mode</b>: ${esc(mode)}</div>`,
     `<div><b>Time</b>: ${esc(point.ts_iso||point.ts||'')}</div>`,
@@ -2840,15 +2871,30 @@ function pointTooltipHtml(point, mode){
     `<div><b>Place</b>: ${esc(point.place_id||'')}</div>`,
     `<div><b>Stationary</b>: ${esc(Boolean(point.stationary))}</div>`,
     `<div><b>Bad GPS</b>: ${esc(Boolean(point.bad_gps))}</div>`,
+    `<div><b>Ignored</b>: ${esc(Boolean(point.ignored))}</div>`,
     point.sample_uid?`<div><b>Sample UID</b>: <code>${esc(point.sample_uid)}</code></div>`:'',
     point.obs_uid?`<div><b>Obs UID</b>: <code>${esc(point.obs_uid)}</code></div>`:'',
     `<div><b>Raw cell</b></div><pre>${prettyJson(point.raw_cell||{})}</pre>`,
     `<div><b>Raw sample</b></div><pre>${prettyJson(point.raw_sample||{})}</pre>`
   ].filter(Boolean);
-  return `<div class="point-tooltip">${bits.join('')}</div>`;
+  const action = canToggle ? `
+    <div style="margin-top:10px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+      <button class="ghost" onclick="toggleObsIgnored('${esc(String(point.obs_uid))}', ${point.ignored?0:1})">${point.ignored?'Mark used':'Ignore this observation'}</button>
+      <span class="small">${point.ignored?'Ignored: excluded from recompute.':'Used: included in recompute.'}</span>
+    </div>` : '';
+  return `<div class="point-tooltip">${bits.join('')}${action}</div>`;
 }
 function bindPointTooltip(layer, point, mode){
-  layer.bindTooltip(pointTooltipHtml(point, mode), {sticky:true, direction:'top', opacity:0.98, className:'point-raw-tooltip'});
+  // Use a click-open popup (not a hover tooltip) so you can move the mouse into
+  // it (e.g. to scroll) without it disappearing.
+  layer.bindPopup(pointTooltipHtml(point, mode), {
+    maxWidth: 720,
+    autoClose: true,
+    closeOnClick: true,
+    autoPan: true,
+    className: 'point-raw-tooltip',
+  });
+  layer.on('click', () => layer.openPopup());
 }
 function analysisStatusOptionsHtml(selected){
   return ANALYSIS_STATUS_VALUES.map(v=>`<option value="${esc(v)}" ${String(selected||'')===String(v)?'selected':''}>${esc(v||'unassigned')}</option>`).join('');
@@ -3113,7 +3159,7 @@ function renderDrawer(t){
   const hiddenCount=Math.max(0, allMethods.length - shownMethods.length);
   const toggleLabel=drawerShowAllMethods ? 'Hide inactive methods' : `Show all methods${hiddenCount?` (${hiddenCount} hidden)`:''}`;
   document.getElementById('drawerBody').innerHTML=`
-    <div class="pillbar"><button class="ghost" onclick="showPoints(${t.id},'all')">Show all points</button><button class="ghost" onclick="showPoints(${t.id},'stationary')">Stationary</button><button class="ghost" onclick="showPoints(${t.id},'bad')">Bad GPS</button><button class="ghost" onclick="showPoints(${t.id},'clusters')">Clusters</button><button class="ghost" onclick="showPoints(${t.id},'places')">Place buckets</button><button class="ghost" onclick="clearOverlays()">Clear overlays</button></div>
+    <div class="pillbar"><button class="ghost" onclick="showPoints(${t.id},'all')" title="Overlay all good-GPS observation points for this tower (blue).">Obs points</button><button class="ghost" onclick="showPoints(${t.id},'raw')" title="Overlay all good-GPS observation points for this tower as small green dots.">Raw obs</button><button class="ghost" onclick="showPoints(${t.id},'stationary')" title="Overlay only stationary observations for this tower (green).">Stationary</button><button class="ghost" onclick="showPoints(${t.id},'bad')" title="Overlay excluded bad-GPS observations (orange).">Bad GPS</button><button class="ghost" onclick="showPoints(${t.id},'clusters')" title="Show cluster centers/radii used by multi-location methods.">Clusters</button><button class="ghost" onclick="showPoints(${t.id},'places')" title="Show place buckets where this tower was seen.">Place buckets</button><button class="ghost" onclick="clearOverlays()" title="Clear overlay layers.">Clear overlays</button></div>
     <div class="pillbar"><a class="badge" href="/api/towers/${t.id}/export.md">Export MD</a><a class="badge" href="/api/towers/${t.id}/export.docx">Export DOCX</a></div>
     <div class="meta-editor">
       <h3 style="margin-top:0">Tower review metadata</h3>
@@ -3144,13 +3190,57 @@ function renderMethod(m){
 }
 function currentTowerId(){return currentTowerData ? Number(currentTowerData.id||0) : 0}
 function closeDrawer(){document.getElementById('drawer').classList.remove('open'); currentTowerData=null;}
-function clearOverlays(){pointLayer.clearLayers();clusterLayer.clearLayers();badLayer.clearLayers();placeLayer.clearLayers();centerLayer.clearLayers()}
-async function showPoints(id,mode){clearOverlays(); const p=await api(`/api/towers/${id}/points?kind=${mode}`);
-  if(mode==='bad'){(p.bad_gps||[]).forEach(x=>{const layer=L.circleMarker([x.lat,x.lon],{radius:5,color:'#111827',fillColor:'#f59e0b',fillOpacity:.8}).addTo(badLayer); bindPointTooltip(layer,x,'bad GPS')})}
+function clearOverlays(){pointLayer.clearLayers();clusterLayer.clearLayers();badLayer.clearLayers();placeLayer.clearLayers();centerLayer.clearLayers(); resetObsMarkers(); currentPointsMode='';}
+function resetObsMarkers(){obsMarkers=new Map();}
+function pointStyleFor(mode, x){
+  const ignored = Boolean(x && x.ignored);
+  if(ignored){
+    return {radius:(mode==='raw'?3:4),color:'#111827',fillColor:'#94a3b8',fillOpacity:.35,weight:1,dashArray:'3 3'};
+  }
+  if(mode==='raw') return {radius:3,color:'#16a34a',fillColor:'#16a34a',fillOpacity:.55,weight:1};
+  if(mode==='stationary') return {radius:4,color:'#16a34a',fillColor:'#16a34a',fillOpacity:.70,weight:1};
+  if(mode==='bad') return {radius:5,color:'#111827',fillColor:'#f59e0b',fillOpacity:.80,weight:1};
+  return {radius:4,color:'#2563eb',fillColor:'#2563eb',fillOpacity:.65,weight:1};
+}
+async function showPoints(id,mode){clearOverlays(); resetObsMarkers(); currentPointsMode=String(mode||''); const p=await api(`/api/towers/${id}/points?kind=${mode}`);
+  if(mode==='bad'){(p.bad_gps||[]).forEach(x=>{const layer=L.circleMarker([x.lat,x.lon], pointStyleFor('bad',x)).addTo(badLayer); if(x&&x.obs_uid) obsMarkers.set(String(x.obs_uid), {layer, point:x}); bindPointTooltip(layer,x,'bad');})}
   else if(mode==='clusters'){(p.clusters||[]).forEach(c=>L.circle([c.lat,c.lon],{radius:Math.max(25,Math.sqrt(c.n)*18),color:'#7c3aed',fillOpacity:.08}).addTo(clusterLayer).bindTooltip(`cluster n=${c.n}`));(p.stationary_clusters||[]).forEach(c=>L.circle([c.lat,c.lon],{radius:Math.max(25,Math.sqrt(c.n)*18),color:'#16a34a',fillOpacity:.12}).addTo(clusterLayer).bindTooltip(`stationary cluster n=${c.n}`))}
   else if(mode==='places'){(p.place_buckets||[]).forEach(b=>{if(!b.bounds)return; L.rectangle([[b.bounds.south,b.bounds.west],[b.bounds.north,b.bounds.east]],{color:'#2563eb',weight:1,fillOpacity:.05}).addTo(placeLayer).bindTooltip(`${b.place_id} n=${b.count}`)})}
-  else {const arr=mode==='stationary'?p.stationary:p.points; arr.forEach(x=>{const layer=L.circleMarker([x.lat,x.lon],{radius:4,color:mode==='stationary'?'#16a34a':'#2563eb',fillOpacity:.65}).addTo(pointLayer); bindPointTooltip(layer,x,mode);});}
+  else {
+    const arr = (mode==='stationary') ? (p.stationary||[]) : (p.points||[]);
+    arr.forEach(x=>{
+      const layer=L.circleMarker([x.lat,x.lon], pointStyleFor(mode,x)).addTo(pointLayer);
+      if(x && x.obs_uid) obsMarkers.set(String(x.obs_uid), {layer, point:x});
+      bindPointTooltip(layer,x,mode);
+    });
+  }
   if(p.center&&p.center.lat!=null)L.marker([p.center.lat,p.center.lon]).addTo(centerLayer).bindTooltip('robust center');
+}
+
+async function toggleObsIgnored(obs_uid, ignored){
+  try{
+    const r = await api('/api/admin/observations/'+encodeURIComponent(String(obs_uid)), {
+      method:'PUT',
+      headers:{'content-type':'application/json'},
+      body: JSON.stringify({ignored: Boolean(ignored)}),
+    });
+    const id = String(r.obs_uid||obs_uid);
+    const rec = obsMarkers.get(id);
+    if(rec && rec.layer){
+      const isIgnored = Boolean(r.ignored);
+      // Preserve the current overlay's styling while applying ignored marker style.
+      rec.point = {...(rec.point||{}), ignored:isIgnored};
+      rec.layer.setStyle(pointStyleFor(currentPointsMode||'all', rec.point));
+      try{ rec.layer.setPopupContent(pointTooltipHtml(rec.point, currentPointsMode||'')); }catch(_e){}
+    }
+  }catch(e){
+    const msg = (e && e.message) ? String(e.message) : String(e);
+    if(msg.includes('db_busy') || msg.toLowerCase().includes('busy') || msg.toLowerCase().includes('locked')){
+      alert('DB is busy importing/recomputing. Try again in a moment.');
+    } else {
+      alert('Failed to update observation: '+msg);
+    }
+  }
 }
 async function loadTowerTable(){const q=document.getElementById('towerSearch').value.trim(); const data=await api('/api/towers?limit=5000&q='+encodeURIComponent(q)+'&include_ignored=1'); towerTableItems=data.items; renderTowerTable('towerTable',towerTableItems,false)}
 async function loadAdmin(){const q=document.getElementById('adminSearch').value.trim(); const data=await api('/api/towers?limit=5000&q='+encodeURIComponent(q)+'&include_ignored=1'); adminTableItems=data.items; renderTowerTable('adminTable',adminTableItems,true)}
@@ -3488,6 +3578,7 @@ def create_app(db_path: str):
                 "signal": r["signal"],
                 "stationary": bool(r["stationary"]),
                 "bad_gps": bool(r["bad_gps"]),
+                "ignored": bool(r["ignored"]) if "ignored" in r.keys() else False,
                 "place_id": r["place_id"],
                 "gps_source": r["gps_source"],
                 "gps_status": r["gps_status"],
@@ -3508,6 +3599,28 @@ def create_app(db_path: str):
             "place_buckets": places,
             "center": {"lat": frow["center_lat"] if frow else None, "lon": frow["center_lon"] if frow else None},
         }
+
+    @app.put("/api/admin/observations/{obs_uid}")
+    async def api_update_observation(obs_uid: str, request: StarletteRequest) -> Dict[str, Any]:
+        payload = await request.json()
+        ignored = payload.get("ignored")
+        if not isinstance(ignored, (bool, int, float)):
+            return JSONResponse({"error": "ignored must be boolean"}, status_code=400)
+        ignored_i = 1 if bool(ignored) else 0
+        try:
+            with connect_db(db_path) as con:
+                migrate_db(con)
+                cur = con.execute("UPDATE tower_observations SET ignored=? WHERE obs_uid=?", (ignored_i, str(obs_uid)))
+                con.commit()
+                if cur.rowcount < 1:
+                    return JSONResponse({"error": "not found"}, status_code=404)
+                row = con.execute("SELECT obs_uid, ignored FROM tower_observations WHERE obs_uid=?", (str(obs_uid),)).fetchone()
+                return {"obs_uid": row["obs_uid"], "ignored": bool(row["ignored"])}
+        except sqlite3.OperationalError as exc:
+            # SQLite allows only one writer; imports/recompute may hold a write lock.
+            if "locked" in str(exc).lower():
+                return JSONResponse({"error": "db_busy", "detail": "Database is busy (import/recompute in progress). Try again in a moment."}, status_code=409)
+            raise
 
     @app.get("/api/towers/{tower_id}/export.md")
     def api_export_md(tower_id: int) -> PlainTextResponse:
