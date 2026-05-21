@@ -22,6 +22,7 @@ import random
 import re
 import sqlite3
 import statistics
+import threading
 import textwrap
 import zipfile
 from collections import Counter, defaultdict
@@ -100,6 +101,10 @@ GLOBAL_CONFIG_HELP: Dict[str, str] = {
 }
 
 ANALYSIS_STATUS_VALUES = ("", "under analysis", "analyzed", "benign", "suspicious", "CSS")
+
+# SQLite allows only one writer. Imports and recompute are write-heavy, so we
+# serialize them at the app layer to avoid "database is locked" crashes.
+WRITE_TASK_LOCK = threading.Lock()
 
 
 def utc_now() -> str:
@@ -3365,7 +3370,10 @@ async function recompute(origin='general'){
     if(origin==='imports') setStatusLine('importsStatus','success',msg);
     else setMethodsStatus('success',msg);
   }catch(e){
-    const msg=`Recompute failed: ${e&&e.message?e.message:String(e)}`;
+    const raw = (e&&e.message)?String(e.message):String(e);
+    const msg = raw.includes('db_busy')
+      ? 'Recompute blocked: DB is busy importing/recomputing. Try again in a moment.'
+      : `Recompute failed: ${raw}`;
     if(origin==='imports') setStatusLine('importsStatus','error',msg);
     else setMethodsStatus('error',msg);
   }
@@ -3495,12 +3503,33 @@ def create_app(db_path: str):
                 paths.extend(parse_multipart_paths(ctype, body, upload_dir))
         if not paths:
             return {"error": "No paths or files provided"}
-        # Run ingest off the event loop so the UI stays responsive while importing.
-        return await asyncio.to_thread(ingest_files, db_path, paths)
+        # Run ingest off the event loop so the UI stays responsive while importing,
+        # and serialize write-heavy tasks to avoid SQLite writer lock errors.
+        def _run() -> Dict[str, Any]:
+            with WRITE_TASK_LOCK:
+                return ingest_files(db_path, paths)
+        try:
+            return await asyncio.to_thread(_run)
+        except sqlite3.OperationalError as exc:
+            if "locked" in str(exc).lower():
+                return JSONResponse({"error": "db_busy", "detail": "Database is busy (import/recompute in progress). Try again in a moment."}, status_code=409)
+            raise
 
     @app.post("/api/recompute")
     def api_recompute() -> Dict[str, Any]:
-        return recompute(db_path)
+        if not WRITE_TASK_LOCK.acquire(blocking=False):
+            return JSONResponse({"error": "db_busy", "detail": "Database is busy (import/recompute in progress). Try again in a moment."}, status_code=409)
+        try:
+            return recompute(db_path)
+        except sqlite3.OperationalError as exc:
+            if "locked" in str(exc).lower():
+                return JSONResponse({"error": "db_busy", "detail": "Database is busy (import/recompute in progress). Try again in a moment."}, status_code=409)
+            raise
+        finally:
+            try:
+                WRITE_TASK_LOCK.release()
+            except RuntimeError:
+                pass
 
     @app.get("/api/towers")
     def api_towers(
