@@ -116,7 +116,12 @@ Click a tower to open the side drawer. The drawer shows:
 - Bayes and rule scores,
 - per-method XAI breakdown,
 - variables, values, equations, thresholds, and effect on score,
-- buttons for all points, stationary points, bad GPS, clusters, place buckets, and center.
+- buttons for observation overlays (raw obs dots, stationary, bad GPS), clusters, place buckets, and center,
+- an **Observations table** (loaded on demand) where you can click **Show** to open a specific point (useful when a tower has 1 point that overlaps the tower marker),
+- per-observation **Ignore/Use** toggles. Ignored points stay visible but are excluded from recompute,
+- a **Recompute this tower** button to update scores/features for just the selected tower (faster than full recompute when you are iterating on one case).
+
+Terminology note: a **place bucket** is a small local area bucketed from GPS using a Web‑Mercator map tile at zoom 17 (shown like `z17/x/y`). It’s only used to group nearby points for local comparisons without addresses/geocoding.
 
 ### Towers
 
@@ -152,6 +157,8 @@ Search towers and edit:
 - `known`: verified/expected tower; adds negative evidence to reduce false positives.
 - `ignored`: hidden from default anomaly views, but still kept in the DB.
 - delete: removes a tower and its observations.
+
+You can also ignore individual observation points from the tower drawer (map popup or observation table). This is intended for “I know this fix is garbage” cases. It does not delete data; it only flips an `ignored` flag so recompute can skip those points.
 
 ### Help
 
