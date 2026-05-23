@@ -128,6 +128,7 @@ Not a single “test”, but strong evidence when combined.
 - **Ephemeral cell score (stationary-opportunity based)**: towers that appear only for a short *stationary* span relative to the stationary opportunity window in the same place buckets (so “I walked past quickly” does not automatically trigger).
 - **Novelty in place**: first-ever appearance of a cell in a place bucket.
 - **New tower in a well-covered place**: if a tower first appears in a place bucket where you already have lots of prior good GPS observations, you can be more confident it is genuinely new (not just previously unobserved due to sparse sampling). In the persistent Tower Intel app this is implemented as method id `new_in_well_covered_place` using `new_place_prior_count`/`new_place_prior_days` (and stationary-only variants).
+- **Disappears despite later coverage**: if a tower was seen in a place bucket, but on *subsequent days* you have lots of good GPS observations in that same bucket (you were there again and saw other towers), and the tower never appears again, that raises suspicion of a short-lived deployment or inconsistent reporting. In the persistent Tower Intel app this is implemented as method id `disappears_despite_coverage` using `new_place_post_count`/`new_place_post_days` (and stationary-only variants). This is not proof: phones do not observe every cell on every pass.
 
 ### E) Consistency / plausibility tests
 These are often the most useful because they’re explainable.
