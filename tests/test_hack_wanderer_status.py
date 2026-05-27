@@ -2,6 +2,7 @@ import importlib.util
 import json
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 
@@ -17,6 +18,26 @@ class FakeLogger:
         pass
 
 
+class FakeAT:
+    def __init__(self, responses):
+        self.responses = {key: [dict(item) for item in value] for key, value in responses.items()}
+        self.commands = []
+
+    def send(self, cmd, **_kwargs):
+        self.commands.append(cmd)
+        queue = self.responses.get(cmd)
+        if queue:
+            item = queue.pop(0)
+            return {
+                "command": cmd,
+                "lines": item.get("lines", []),
+                "ok": item.get("ok", True),
+                "error": item.get("error"),
+                "elapsed_s": item.get("elapsed_s", 0.0),
+            }
+        return {"command": cmd, "lines": ["OK"], "ok": True, "error": None, "elapsed_s": 0.0}
+
+
 class HackWandererStatusTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -24,6 +45,7 @@ class HackWandererStatusTests(unittest.TestCase):
         self.status_path = self.status_dir / "status.json"
         hack_wanderer._STATUS_SESSION_STARTED_UTC = None
         hack_wanderer._STATUS_SESSION_STARTED_LOCAL = None
+        hack_wanderer._LAST_AUTO_REGISTER_ATTEMPT_MONO = None
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -81,6 +103,67 @@ class HackWandererStatusTests(unittest.TestCase):
         new_entry = next(item for item in payload["towers_all"] if item["cell_id"] == 222)
         self.assertEqual(new_entry["first_seen_session_utc"], "2026-05-16T08:00:00Z")
         self.assertEqual(new_entry["seen_count"], 1)
+
+    def test_collect_network_skips_auto_register_when_already_registered(self):
+        at = FakeAT({
+            "AT+CSQ": [{"lines": ["+CSQ: 31,0", "OK"]}],
+            "AT+CREG?": [{"lines": ["+CREG: 2,5,FFFE,17F900", "OK"]}],
+            "AT+CGREG?": [{"lines": ["+CGREG: 2,5,DA4,17F900", "OK"]}],
+            "AT+CEREG?": [{"lines": ["+CEREG: 2,5,DA4,17F900,7", "OK"]}],
+            "AT+COPS?": [{"lines": ["+COPS: 0,2,\"21670\",7", "OK"]}],
+        })
+        config = json.loads(json.dumps(hack_wanderer.DEFAULT_CONFIG))
+
+        network = hack_wanderer.collect_network(at, config)
+
+        self.assertTrue(hack_wanderer.network_is_registered(network))
+        self.assertNotIn("AT+COPS=0", at.commands)
+
+    def test_collect_network_throttles_auto_register_retries_while_searching(self):
+        at = FakeAT({
+            "AT+CSQ": [{"lines": ["+CSQ: 99,99", "OK"]}],
+            "AT+CREG?": [{"lines": ["+CREG: 2,2", "OK"]}],
+            "AT+CGREG?": [{"lines": ["+CGREG: 2,2", "OK"]}],
+            "AT+CEREG?": [{"lines": ["+CEREG: 2,4", "OK"]}],
+            "AT+COPS?": [{"lines": ["+COPS: 0", "OK"]}],
+        })
+        config = json.loads(json.dumps(hack_wanderer.DEFAULT_CONFIG))
+        hack_wanderer._LAST_AUTO_REGISTER_ATTEMPT_MONO = 100.0
+
+        with mock.patch.object(hack_wanderer.time, "monotonic", return_value=120.0):
+            network = hack_wanderer.collect_network(at, config)
+
+        self.assertFalse(hack_wanderer.network_is_registered(network))
+        self.assertNotIn("AT+COPS=0", at.commands)
+
+    def test_collect_network_retries_auto_register_after_cooldown(self):
+        at = FakeAT({
+            "AT+CSQ": [
+                {"lines": ["+CSQ: 99,99", "OK"]},
+                {"lines": ["+CSQ: 31,0", "OK"]},
+            ],
+            "AT+CREG?": [
+                {"lines": ["+CREG: 2,2", "OK"]},
+                {"lines": ["+CREG: 2,5,FFFE,17F900", "OK"]},
+            ],
+            "AT+CGREG?": [
+                {"lines": ["+CGREG: 2,2", "OK"]},
+                {"lines": ["+CGREG: 2,5,DA4,17F900", "OK"]},
+            ],
+            "AT+CEREG?": [
+                {"lines": ["+CEREG: 2,4", "OK"]},
+                {"lines": ["+CEREG: 2,5,DA4,17F900,7", "OK"]},
+            ],
+            "AT+COPS?": [{"lines": ["+COPS: 0,2,\"21670\",7", "OK"]}],
+        })
+        config = json.loads(json.dumps(hack_wanderer.DEFAULT_CONFIG))
+        hack_wanderer._LAST_AUTO_REGISTER_ATTEMPT_MONO = 100.0
+
+        with mock.patch.object(hack_wanderer.time, "monotonic", return_value=200.0):
+            network = hack_wanderer.collect_network(at, config)
+
+        self.assertTrue(hack_wanderer.network_is_registered(network))
+        self.assertIn("AT+COPS=0", at.commands)
 
 
 if __name__ == "__main__":
