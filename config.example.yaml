@@ -14,6 +14,7 @@ serial:
 timeouts:
   default_s: 4.0
   operator_scan_s: 120.0
+  auto_register_retry_s: 60.0
   gps_s: 6.0
   sim_read_s: 4.0
   vendor_s: 10.0
