@@ -53,7 +53,9 @@ python3 tower_intel_server.py serve
 
 Then open `http://127.0.0.1:8890`.
 
-The dashboard stores raw samples and tower observations in `tower_intel.sqlite`, including valid GPS altitude, lets you tune anomaly thresholds, softens geo-heavy anomaly methods when observations came from elevated positions, shows per-tower XAI explanations, and exports tower reports as Markdown or DOCX. See `TOWER_INTEL_APP.md`.
+`recompute` now skips the expensive stationary-flag rebuild by default because ingest already refreshes those flags. Use `python3 tower_intel_server.py recompute --refresh-stationary` only when you explicitly need a full stationary rebuild.
+
+The dashboard stores raw samples and tower observations in `tower_intel.sqlite`, including valid GPS altitude, lets you tune anomaly thresholds, softens geo-heavy anomaly methods when observations came from elevated positions, shows per-tower XAI explanations, and exports tower reports as Markdown or DOCX. Imports now report live progress in both the CLI and the web UI. See `TOWER_INTEL_APP.md`.
 
 ## Configuration
 
@@ -77,6 +79,7 @@ serial:
 timeouts:
   default_s: 4.0
   operator_scan_s: 120.0
+  auto_register_retry_s: 60.0
   gps_s: 6.0
   sim_read_s: 4.0
   vendor_s: 5.0
@@ -157,8 +160,10 @@ An external NMEA GPS receiver (defaults to `/dev/ttyACM0`) is sampled alongside 
 ## Notes
 
 - `AT+COPS=?` can take a long time. It is disabled by default; enable with `--operator-scan`.
+- `auto_register: true` now retries `AT+COPS=0` only when the modem is unregistered, and it is throttled by `timeouts.auto_register_retry_s` so wardrive mode does not force network reselection every loop.
 - SIM file reads are limited to a small list of common EF files. Full SIM exploration requires APDU workflows (e.g., `AT+CSIM`), which are not implemented yet.
 - GPS commands are queried only (no power-on commands are issued).
+- On SIMCom modems such as `SIM7600G-H`, some modem-GPS probes can still log `ERROR` for unsupported commands like `AT+QGPS?` or `AT+QGPSLOC?`. That does not mean the external USB GPS is bad; check `gps_device`, `status/status.json`, or `GPS (device ...)` log lines for the real fix state.
 - If you see `SIM PIN` or `SIM PUK`, the SIM is locked or blocked. The tool only reports it.
 - Raspberry Pi + SIM7600: to expose the USB Ethernet interface and AT command ports, set the USB composition once with `AT+CUSBPIDSWITCH=9011,1,1` (run via UART or an existing AT port, then reboot the modem). This switches the modem into a composite mode that presents ECM/NCM networking plus AT serial devices.
 
@@ -229,6 +234,27 @@ Run `python hack-wanderer.py --help` for the full list. Key flags:
   sudo systemctl enable --now hack-wanderer-display.service
   ```
   This starts a tiny local web server on `http://127.0.0.1:8800/` and opens it in kiosk mode. It assumes `chromium-browser` is installed, `DISPLAY=:0`, and `.Xauthority` is in `/home/pi`.
+
+## Realtime tower CLI
+
+- `tower_capture_cli.py` prints the current GPS position plus the latest captured towers in a terminal-friendly table.
+- Source priority in `--source auto` is: live status JSON first, then `tower_intel.sqlite`, then the newest JSONL log. This matches the current code path: `hack-wanderer.py` updates the status JSON every loop, while SQLite is only refreshed by the separate ingest flow.
+- One-shot view:
+  ```bash
+  python3 tower_capture_cli.py
+  ```
+- Live watch on the Raspberry Pi:
+  ```bash
+  python3 tower_capture_cli.py --watch --interval 2
+  ```
+- Force the SQLite-backed view:
+  ```bash
+  python3 tower_capture_cli.py --source db --db tower_intel.sqlite --limit 20
+  ```
+- JSON output for piping:
+  ```bash
+  python3 tower_capture_cli.py --json
+  ```
 
 ## Autostart on boot (systemd)
 
