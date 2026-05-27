@@ -22,13 +22,15 @@ import random
 import re
 import sqlite3
 import statistics
+import sys
 import threading
+import time
 import textwrap
 import zipfile
 from collections import Counter, defaultdict
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 try:
     from starlette.requests import Request as StarletteRequest
@@ -105,10 +107,21 @@ ANALYSIS_STATUS_VALUES = ("", "under analysis", "analyzed", "benign", "suspiciou
 # SQLite allows only one writer. Imports and recompute are write-heavy, so we
 # serialize them at the app layer to avoid "database is locked" crashes.
 WRITE_TASK_LOCK = threading.Lock()
+IMPORT_STATUS_LOCK = threading.Lock()
+IMPORT_STATUS: Dict[str, Any] = {
+    "active": False,
+    "phase": "idle",
+    "message": "Ready to import JSONL files.",
+    "started_at": None,
+    "updated_at": utc_now() if "utc_now" in globals() else None,  # placeholder overwritten after function definition
+}
 
 
 def utc_now() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+
+
+IMPORT_STATUS["updated_at"] = utc_now()
 
 
 def json_dumps(obj: Any) -> str:
@@ -122,6 +135,109 @@ def json_loads(text: Optional[str], default: Any = None) -> Any:
         return json.loads(text)
     except Exception:
         return default
+
+
+def import_status_snapshot() -> Dict[str, Any]:
+    with IMPORT_STATUS_LOCK:
+        return dict(IMPORT_STATUS)
+
+
+def set_import_status(**updates: Any) -> Dict[str, Any]:
+    with IMPORT_STATUS_LOCK:
+        IMPORT_STATUS.update(updates)
+        IMPORT_STATUS["updated_at"] = utc_now()
+        return dict(IMPORT_STATUS)
+
+
+def reset_import_status(message: str = "Ready to import JSONL files.") -> Dict[str, Any]:
+    return set_import_status(
+        active=False,
+        phase="idle",
+        task=None,
+        message=message,
+        started_at=None,
+        finished_at=None,
+        total_files=0,
+        file_index=0,
+        current_path="",
+        current_file_size=0,
+        current_file_bytes=0,
+        current_file_percent=0.0,
+        current_rows=0,
+        current_observations=0,
+        current_errors=0,
+        imported_rows=0,
+        tower_observations=0,
+        files_imported=0,
+        files_skipped=0,
+        errors=0,
+        result=None,
+        detail=None,
+    )
+
+
+def format_import_progress(progress: Dict[str, Any]) -> str:
+    phase = str(progress.get("phase") or "")
+    total_files = int(progress.get("total_files") or 0)
+    file_index = int(progress.get("file_index") or 0)
+    current_path = Path(str(progress.get("current_path") or "")).name or "-"
+    current_rows = int(progress.get("current_rows") or 0)
+    current_obs = int(progress.get("current_observations") or 0)
+    current_errors = int(progress.get("current_errors") or 0)
+    imported_rows = int(progress.get("imported_rows") or 0)
+    files_imported = int(progress.get("files_imported") or 0)
+    files_skipped = int(progress.get("files_skipped") or 0)
+    percent = progress.get("current_file_percent")
+    percent_text = ""
+    if isinstance(percent, (int, float)) and percent > 0:
+        percent_text = f" {float(percent):.1f}%"
+    if phase == "starting":
+        return f"Preparing import of {total_files} file(s)…"
+    if phase == "skipped":
+        return f"Skipping {current_path} ({file_index}/{total_files}); already imported."
+    if phase == "finalizing":
+        return f"Finalizing import after {files_imported} imported file(s), {imported_rows} rows total…"
+    if phase == "finalizing_stationary_scan":
+        done = int(progress.get("finalize_scan_done") or 0)
+        total = int(progress.get("finalize_scan_total") or 0)
+        return f"Finalizing: scanning GPS samples for stationary segments ({done}/{total})…"
+    if phase == "finalizing_stationary_apply":
+        done = int(progress.get("finalize_apply_done") or 0)
+        total = int(progress.get("finalize_apply_total") or 0)
+        return f"Finalizing: writing stationary flags ({done}/{total})…"
+    if phase == "done":
+        result = progress.get("result") or {}
+        return (
+            f"Import complete: {int(result.get('files_imported') or 0)} file(s) imported, "
+            f"{int(result.get('files_skipped') or 0)} skipped, "
+            f"{int(result.get('new_towers') or 0)} new towers added."
+        )
+    if phase == "error":
+        return str(progress.get("detail") or progress.get("message") or "Import failed.")
+    if current_path and file_index and total_files:
+        return (
+            f"Importing {current_path} ({file_index}/{total_files}){percent_text} "
+            f"rows={current_rows} obs={current_obs} errors={current_errors} "
+            f"total_rows={imported_rows} imported={files_imported} skipped={files_skipped}"
+        )
+    return str(progress.get("message") or "Import in progress…")
+
+
+def emit_import_progress(
+    callback: Optional[Callable[[Dict[str, Any]], None]],
+    progress: Dict[str, Any],
+) -> None:
+    if callback is None:
+        return
+    payload = dict(progress)
+    payload["message"] = format_import_progress(payload)
+    callback(payload)
+
+
+def _iter_chunks(items: Sequence[Any], size: int = 500) -> Iterable[Sequence[Any]]:
+    step = max(1, int(size))
+    for idx in range(0, len(items), step):
+        yield items[idx:idx + step]
 
 
 def set_app_setting(con: sqlite3.Connection, key: str, value: Any) -> None:
@@ -1053,12 +1169,13 @@ def enrich_method_result(method: Dict[str, Any], features: Dict[str, Any]) -> Di
     return enriched
 
 
-def init_db(db_path: str) -> None:
+def init_db(db_path: str, *, seed_reference_data: bool = True) -> None:
     with connect_db(db_path) as con:
         con.executescript(SCHEMA_SQL)
         migrate_db(con)
-        seed_methods(con)
-        seed_app_settings(con)
+        if seed_reference_data:
+            seed_methods_if_missing(con)
+            seed_app_settings_if_missing(con)
 
 
 def ensure_column(con: sqlite3.Connection, table: str, column: str, spec: str) -> None:
@@ -1132,6 +1249,15 @@ def seed_methods(con: sqlite3.Connection) -> None:
     con.commit()
 
 
+def seed_methods_if_missing(con: sqlite3.Connection) -> None:
+    existing_methods = {str(row["id"]) for row in con.execute("SELECT id FROM anomaly_methods").fetchall()}
+    existing_settings = {str(row["method_id"]) for row in con.execute("SELECT method_id FROM method_settings").fetchall()}
+    required = {str(method["id"]) for method in METHOD_REGISTRY}
+    if required.issubset(existing_methods) and required.issubset(existing_settings):
+        return
+    seed_methods(con)
+
+
 def seed_app_settings(con: sqlite3.Connection) -> None:
     now = utc_now()
     for key, value in GLOBAL_CONFIG_DEFAULTS.items():
@@ -1143,6 +1269,14 @@ def seed_app_settings(con: sqlite3.Connection) -> None:
             (key, json_dumps(value), now),
         )
     con.commit()
+
+
+def seed_app_settings_if_missing(con: sqlite3.Connection) -> None:
+    existing = {str(row["key"]) for row in con.execute("SELECT key FROM app_settings").fetchall()}
+    required = set(GLOBAL_CONFIG_DEFAULTS.keys())
+    if required.issubset(existing):
+        return
+    seed_app_settings(con)
 
 
 def get_app_config(con: sqlite3.Connection) -> Dict[str, Any]:
@@ -1176,7 +1310,6 @@ def update_app_config(con: sqlite3.Connection, updates: Dict[str, Any]) -> Dict[
 
 
 def get_method_settings(con: sqlite3.Connection) -> Dict[str, Dict[str, Any]]:
-    seed_methods(con)
     rows = con.execute(
         """
         SELECT m.*, s.enabled, s.weight, s.thresholds_json
@@ -1832,8 +1965,14 @@ def parse_multipart_paths(content_type: str, body: bytes, upload_dir: Path) -> L
     return paths
 
 
-def ingest_files(db_path: str, paths: Sequence[str], *, max_lines: Optional[int] = None) -> Dict[str, Any]:
-    init_db(db_path)
+def ingest_files(
+    db_path: str,
+    paths: Sequence[str],
+    *,
+    max_lines: Optional[int] = None,
+    progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+) -> Dict[str, Any]:
+    init_db(db_path, seed_reference_data=False)
     summary = {
         "files": [],
         "imported_rows": 0,
@@ -1844,13 +1983,53 @@ def ingest_files(db_path: str, paths: Sequence[str], *, max_lines: Optional[int]
         "new_observations": 0,
         "errors": 0,
         "skipped": 0,
+        "files_imported": 0,
+        "files_skipped": 0,
     }
+    progress_state: Dict[str, Any] = {
+        "active": True,
+        "task": "import",
+        "phase": "starting",
+        "started_at": utc_now(),
+        "total_files": len(paths),
+        "file_index": 0,
+        "current_path": "",
+        "current_file_size": 0,
+        "current_file_bytes": 0,
+        "current_file_percent": 0.0,
+        "current_rows": 0,
+        "current_observations": 0,
+        "current_errors": 0,
+        "imported_rows": 0,
+        "tower_observations": 0,
+        "files_imported": 0,
+        "files_skipped": 0,
+        "errors": 0,
+        "result": None,
+        "detail": None,
+    }
+    emit_import_progress(progress_callback, progress_state)
     with connect_db(db_path) as con:
         db_before = _count_db_entities(con)
-        for path0 in paths:
+        for file_index, path0 in enumerate(paths, 1):
             path = str(Path(path0).expanduser().resolve())
             st = os.stat(path)
             digest = file_sha256(path)
+            progress_state.update({
+                "phase": "checking",
+                "file_index": file_index,
+                "current_path": path,
+                "current_file_size": int(st.st_size),
+                "current_file_bytes": 0,
+                "current_file_percent": 0.0,
+                "current_rows": 0,
+                "current_observations": 0,
+                "current_errors": 0,
+                "files_imported": summary["files_imported"] if "files_imported" in summary else 0,
+                "files_skipped": summary["skipped"],
+                "errors": summary["errors"],
+            })
+            emit_import_progress(progress_callback, progress_state)
             existing = con.execute(
                 """
                 SELECT id, imported_rows, new_samples, tower_fingerprints, new_towers, observation_rows, new_observations, errors
@@ -1871,6 +2050,12 @@ def ingest_files(db_path: str, paths: Sequence[str], *, max_lines: Optional[int]
                     "new_observations": existing["new_observations"],
                     "errors": existing["errors"],
                 })
+                progress_state.update({
+                    "phase": "skipped",
+                    "files_skipped": summary["skipped"],
+                    "errors": summary["errors"],
+                })
+                emit_import_progress(progress_callback, progress_state)
                 continue
             counts_before_file = _count_db_entities(con)
             cur = con.execute(
@@ -1883,10 +2068,15 @@ def ingest_files(db_path: str, paths: Sequence[str], *, max_lines: Optional[int]
             observation_rows = 0
             errors = 0
             prev_fix: Optional[Tuple[float, float, float]] = None
+            bytes_read = 0
+            last_progress_emit = time.monotonic()
+            progress_state.update({"phase": "importing"})
+            emit_import_progress(progress_callback, progress_state)
             with open(path, "rb") as f:
                 for line_no, raw in enumerate(f, 1):
                     if max_lines is not None and line_no > max_lines:
                         break
+                    bytes_read += len(raw)
                     line = raw.strip()
                     if not line:
                         continue
@@ -1951,6 +2141,23 @@ def ingest_files(db_path: str, paths: Sequence[str], *, max_lines: Optional[int]
                             (obs_uid, sample_uid, tower_id, base_identity_key(BaseKey(key.operator, key.rat, key.tac_lac, key.cell_id)), ts, lat, lon, place_id, signal, json_dumps(cell), bad_gps),
                         )
                     imported_rows += 1
+                    now_mono = time.monotonic()
+                    if imported_rows == 1 or imported_rows % 200 == 0 or (now_mono - last_progress_emit) >= 0.75:
+                        progress_state.update({
+                            "phase": "importing",
+                            "current_file_bytes": bytes_read,
+                            "current_file_percent": (100.0 * bytes_read / max(1, int(st.st_size))),
+                            "current_rows": imported_rows,
+                            "current_observations": observation_rows,
+                            "current_errors": errors,
+                            "imported_rows": summary["imported_rows"] + imported_rows,
+                            "tower_observations": summary["tower_observations"] + observation_rows,
+                            "files_imported": summary.get("files_imported", 0),
+                            "files_skipped": summary["skipped"],
+                            "errors": summary["errors"] + errors,
+                        })
+                        emit_import_progress(progress_callback, progress_state)
+                        last_progress_emit = now_mono
                     # Commit in smaller batches to reduce long-held write locks,
                     # so the UI can still perform small updates (e.g. ignore a point).
                     if imported_rows % 200 == 0:
@@ -1993,7 +2200,31 @@ def ingest_files(db_path: str, paths: Sequence[str], *, max_lines: Optional[int]
             summary["tower_observations"] += file_summary["tower_observations"]
             summary["new_observations"] += file_summary["new_observations"]
             summary["errors"] += file_summary["errors"]
-        refresh_stationary_flags(con)
+            summary["files_imported"] = summary.get("files_imported", 0) + 1
+            progress_state.update({
+                "phase": "file_done",
+                "current_file_bytes": int(st.st_size),
+                "current_file_percent": 100.0,
+                "current_rows": imported_rows,
+                "current_observations": observation_rows,
+                "current_errors": errors,
+                "imported_rows": summary["imported_rows"],
+                "tower_observations": summary["tower_observations"],
+                "files_imported": summary["files_imported"],
+                "files_skipped": summary["skipped"],
+                "errors": summary["errors"],
+            })
+            emit_import_progress(progress_callback, progress_state)
+        progress_state.update({
+            "phase": "finalizing",
+            "files_imported": summary.get("files_imported", 0),
+            "files_skipped": summary["skipped"],
+            "errors": summary["errors"],
+            "imported_rows": summary["imported_rows"],
+            "tower_observations": summary["tower_observations"],
+        })
+        emit_import_progress(progress_callback, progress_state)
+        refresh_stationary_flags(con, progress_callback=progress_callback)
         con.commit()
         db_after = _count_db_entities(con)
     summary["db_before"] = db_before
@@ -2001,19 +2232,46 @@ def ingest_files(db_path: str, paths: Sequence[str], *, max_lines: Optional[int]
     summary["db_delta"] = {key: db_after[key] - db_before[key] for key in db_before.keys()}
     summary["files_imported"] = sum(1 for item in summary["files"] if item.get("status") == "imported")
     summary["files_skipped"] = sum(1 for item in summary["files"] if item.get("status") == "skipped")
+    progress_state.update({
+        "active": False,
+        "phase": "done",
+        "finished_at": utc_now(),
+        "files_imported": summary["files_imported"],
+        "files_skipped": summary["files_skipped"],
+        "errors": summary["errors"],
+        "imported_rows": summary["imported_rows"],
+        "tower_observations": summary["tower_observations"],
+        "result": summary,
+    })
+    emit_import_progress(progress_callback, progress_state)
     return summary
 
 
-def refresh_stationary_flags(con: sqlite3.Connection) -> None:
-    rows = con.execute(
-        "SELECT sample_uid, ts, lat, lon, bad_gps, raw_json FROM raw_samples WHERE ts IS NOT NULL AND lat IS NOT NULL AND lon IS NOT NULL ORDER BY ts, id"
-    ).fetchall()
-    con.execute("UPDATE raw_samples SET stationary=0, stationary_segment=NULL")
-    con.execute("UPDATE tower_observations SET stationary=0, stationary_segment=NULL")
+def refresh_stationary_flags(
+    con: sqlite3.Connection,
+    progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+) -> None:
+    total_rows = int(con.execute(
+        "SELECT COUNT(*) FROM raw_samples WHERE ts IS NOT NULL AND lat IS NOT NULL AND lon IS NOT NULL"
+    ).fetchone()[0] or 0)
     segments: List[List[sqlite3.Row]] = []
     cur: List[sqlite3.Row] = []
     anchor: Optional[sqlite3.Row] = None
     prev: Optional[sqlite3.Row] = None
+    processed = 0
+    last_progress_emit = time.monotonic()
+
+    def report_scan(force: bool = False) -> None:
+        nonlocal last_progress_emit
+        now_mono = time.monotonic()
+        if not force and processed and processed % 1000 != 0 and (now_mono - last_progress_emit) < 0.75:
+            return
+        emit_import_progress(progress_callback, {
+            "phase": "finalizing_stationary_scan",
+            "finalize_scan_done": processed,
+            "finalize_scan_total": total_rows,
+        })
+        last_progress_emit = now_mono
 
     def flush() -> None:
         nonlocal cur
@@ -2026,11 +2284,16 @@ def refresh_stationary_flags(con: sqlite3.Connection) -> None:
             segments.append(list(cur))
         cur = []
 
-    for row in rows:
+    cursor = con.execute(
+        "SELECT sample_uid, ts, lat, lon, bad_gps, raw_json FROM raw_samples WHERE ts IS NOT NULL AND lat IS NOT NULL AND lon IS NOT NULL ORDER BY ts, id"
+    )
+    for row in cursor:
+        processed += 1
         if row["bad_gps"]:
             flush()
             anchor = None
             prev = None
+            report_scan()
             continue
         ok = False
         if anchor is None:
@@ -2059,12 +2322,45 @@ def refresh_stationary_flags(con: sqlite3.Connection) -> None:
                 anchor = row
             cur.append(row)
         prev = row
+        report_scan()
     flush()
+    report_scan(force=True)
+    con.execute("UPDATE raw_samples SET stationary=0, stationary_segment=NULL")
+    con.execute("UPDATE tower_observations SET stationary=0, stationary_segment=NULL")
+
+    total_apply = sum(len(seg) for seg in segments)
+    applied = 0
+    last_apply_emit = time.monotonic()
+
+    def report_apply(force: bool = False) -> None:
+        nonlocal last_apply_emit
+        now_mono = time.monotonic()
+        if not force and applied and applied % 1000 != 0 and (now_mono - last_apply_emit) < 0.75:
+            return
+        emit_import_progress(progress_callback, {
+            "phase": "finalizing_stationary_apply",
+            "finalize_apply_done": applied,
+            "finalize_apply_total": total_apply,
+        })
+        last_apply_emit = now_mono
+
+    report_apply(force=True)
     for seg_id, seg in enumerate(segments, 1):
-        uids = [r["sample_uid"] for r in seg]
-        for uid in uids:
-            con.execute("UPDATE raw_samples SET stationary=1, stationary_segment=? WHERE sample_uid=?", (seg_id, uid))
-            con.execute("UPDATE tower_observations SET stationary=1, stationary_segment=? WHERE sample_uid=?", (seg_id, uid))
+        uids = [str(r["sample_uid"]) for r in seg]
+        for chunk in _iter_chunks(uids, 500):
+            placeholders = ",".join("?" for _ in chunk)
+            params = [seg_id, *chunk]
+            con.execute(
+                f"UPDATE raw_samples SET stationary=1, stationary_segment=? WHERE sample_uid IN ({placeholders})",
+                params,
+            )
+            con.execute(
+                f"UPDATE tower_observations SET stationary=1, stationary_segment=? WHERE sample_uid IN ({placeholders})",
+                params,
+            )
+            applied += len(chunk)
+            report_apply()
+    report_apply(force=True)
 
 
 def row_to_tower_key(row: sqlite3.Row) -> TowerKey:
@@ -2187,13 +2483,22 @@ def add_altitude_obs(acc: Dict[str, Any], relative_alt_m: float, *, stationary: 
         _reservoir_add(acc["stationary_sample"], int(acc["stationary_seen"]), rel, sample_size, rng)
 
 
-def recompute(db_path: str, *, sample_size: int = 2500) -> Dict[str, Any]:
+def recompute(
+    db_path: str,
+    *,
+    sample_size: int = 2500,
+    refresh_stationary: bool = False,
+    backfill_altitudes: bool = True,
+) -> Dict[str, Any]:
     init_db(db_path)
     rng = random.Random(1)
     with connect_db(db_path) as con:
-        backfill_raw_sample_altitudes(con)
-        refresh_stationary_flags(con)
-        con.commit()
+        if backfill_altitudes:
+            backfill_raw_sample_altitudes(con)
+        if refresh_stationary:
+            refresh_stationary_flags(con)
+        if backfill_altitudes or refresh_stationary:
+            con.commit()
         settings = get_method_settings(con)
         app_config = get_app_config(con)
         tower_rows = {int(r["id"]): r for r in con.execute("SELECT * FROM towers").fetchall()}
@@ -3417,7 +3722,7 @@ def index_html() -> str:
     </section>
     <section id="towersView" class="view"><div class="toolbar"><input id="towerSearch" placeholder="Search identifiers, notes, tags"><button class="ghost" onclick="loadTowerTable()">Search</button></div><div class="table-wrap"><table id="towerTable"></table></div></section>
     <section id="methodsView" class="view"><div class="toolbar"><button class="primary" onclick="saveMethods()">Save settings</button><button class="ghost" onclick="saveAppConfig()">Save altitude config</button><button class="ghost" onclick="recompute('methods')">Recompute scores</button><span class="small">Method thresholds and altitude discount settings are editable for experiments.</span><span id="methodsStatus" class="small toolbar-note"></span></div><div class="cards"><div class="card span-all"><h3>Altitude discount configuration</h3><p class="small">These settings control how much elevated positions soften geo-heavy evidence. Ground-level points remain full strength; higher positions are discounted using local ground/floor baselines per place bucket.</p><div id="appConfigBox" class="config-grid"></div><div id="appConfigCurve" class="table-wrap compact" style="margin-top:12px"><table id="appConfigCurveTable"></table></div></div></div><div id="methodsList" class="cards"></div></section>
-    <section id="importsView" class="view"><div class="imports-shell"><div id="importsStatus" class="status-line idle">Ready to import JSONL files.</div><div class="imports-grid"><div class="card"><h3>Import by path</h3><p class="small">Local server reads files from this machine. Separate multiple paths with newlines.</p><textarea id="importPaths" style="width:100%;min-height:140px" placeholder="logs/14-5-2026.jsonl"></textarea><div class="inline-actions"><button class="primary" onclick="doImport()">Import</button><button class="ghost" onclick="recompute('imports')">Recompute</button></div></div><div class="card"><h3>Upload JSONL</h3><div class="upload-stack"><input id="uploadFiles" type="file" multiple><div id="uploadSelection" class="small">No files selected.</div><button class="primary" onclick="uploadImport()">Upload + import</button></div></div><div class="card stats-card-col"><h3>DB Stats</h3><div class="inline-actions" style="margin-top:0"><button class="ghost" onclick="loadStats()">Refresh stats</button></div><div id="statsBox" class="stats-grid" style="margin-top:12px"></div><div id="statsMeta" class="small" style="margin-top:10px"></div></div><div class="card span-all"><h3>Last import result</h3><p class="small">Every import shows a compact status line plus per-file counts. No popup windows; results stay here for review.</p><div id="importSummaryMetrics" class="stats-grid" style="margin-top:12px"></div><div class="table-wrap compact" style="margin-top:12px"><table id="importResultTable"></table></div></div><div class="card span-all"><h3>Imported files history</h3><p class="small">Persistent list from the SQLite <code>import_files</code> table. Manual path imports and browser uploads both appear here.</p><div class="inline-actions" style="margin-top:0"><button class="ghost" onclick="loadImports()">Refresh imported files</button></div><div class="table-wrap compact" style="margin-top:12px"><table id="importsTable"></table></div></div></div></div></section>
+    <section id="importsView" class="view"><div class="imports-shell"><div id="importsStatus" class="status-line idle">Ready to import JSONL files.</div><div id="importsProgressMeta" class="small toolbar-note" style="margin:8px 0 14px 0"></div><div class="imports-grid"><div class="card"><h3>Import by path</h3><p class="small">Local server reads files from this machine. Separate multiple paths with newlines.</p><textarea id="importPaths" style="width:100%;min-height:140px" placeholder="logs/14-5-2026.jsonl"></textarea><div class="inline-actions"><button class="primary" onclick="doImport()">Import</button><button class="ghost" onclick="recompute('imports')">Recompute</button></div></div><div class="card"><h3>Upload JSONL</h3><div class="upload-stack"><input id="uploadFiles" type="file" multiple><div id="uploadSelection" class="small">No files selected.</div><button class="primary" onclick="uploadImport()">Upload + import</button></div></div><div class="card stats-card-col"><h3>DB Stats</h3><div class="inline-actions" style="margin-top:0"><button class="ghost" onclick="loadStats()">Refresh stats</button></div><div id="statsBox" class="stats-grid" style="margin-top:12px"></div><div id="statsMeta" class="small" style="margin-top:10px"></div></div><div class="card span-all"><h3>Last import result</h3><p class="small">Every import shows a compact status line plus per-file counts. No popup windows; results stay here for review.</p><div id="importSummaryMetrics" class="stats-grid" style="margin-top:12px"></div><div class="table-wrap compact" style="margin-top:12px"><table id="importResultTable"></table></div></div><div class="card span-all"><h3>Imported files history</h3><p class="small">Persistent list from the SQLite <code>import_files</code> table. Manual path imports and browser uploads both appear here.</p><div class="inline-actions" style="margin-top:0"><button class="ghost" onclick="loadImports()">Refresh imported files</button></div><div class="table-wrap compact" style="margin-top:12px"><table id="importsTable"></table></div></div></div></div></section>
     <section id="adminView" class="view"><div class="toolbar"><input id="adminSearch" placeholder="Search DB, notes, tags"><button class="ghost" onclick="loadAdmin()">Search</button></div><div class="table-wrap"><table id="adminTable"></table></div></section>
     <section id="helpView" class="view"><div class="help" id="helpBox"></div></section>
   </main>
@@ -3739,9 +4044,9 @@ function renderMapTowers(fit){
     // Put these on `window` so inline onclick handlers can see them reliably.
     // Used only when the user explicitly clicks "Load table".
     window.AUTO_OBS_TABLE_LIMIT = 2000; // keep drawer snappy; user can "Load all" if needed
-    async function openTower(id){
+    async function openTower(id, opts={}){
       const t=await api('/api/towers/'+id); currentTowerData=t; drawerShowAllMethods=false; renderDrawer(t);
-      if(t.center_lat!=null) map.setView([t.center_lat,t.center_lon], Math.max(map.getZoom(),17));
+      if(opts.recenter && t.center_lat!=null) map.setView([t.center_lat,t.center_lon], Math.max(map.getZoom(),17));
     }
 	function pickFeatures(f){const keys=['count','days_seen','stationary_count','gps_spread_m','clusters','cluster_top2_sep_m','stationary_clusters','stationary_cluster_top2_sep_m','signal_dist_model','stationary_signal_mad','stationary_signal_mad_z','stationary_jump_rate_8db','stationary_jump_rate_z','stationary_param_obs','stationary_pci_change_rate_z','stationary_earfcn_change_rate_z','local_stationary_window_min','local_stationary_window_frac','change_places_frac_stationary','place_rat_surprise','new_place_id','new_place_count','new_place_first_seen_local','new_place_prior_range','new_place_prior_count','new_place_prior_days','new_place_prior_stationary_count','new_place_prior_stationary_days','new_place_post_count','new_place_post_days','new_place_post_stationary_count','new_place_post_stationary_days','stability_bonus','bad_gps_skipped','altitude_samples','altitude_rel_median_m','altitude_rel_p90_m','high_altitude_obs_frac','geo_altitude_confidence','stationary_altitude_samples','stationary_altitude_rel_median_m','stationary_altitude_rel_p90_m','stationary_high_altitude_obs_frac','stationary_geo_altitude_confidence']; let o={}; keys.forEach(k=>{if(f&&f[k]!==undefined)o[k]=f[k]}); return o}
 	function bucketExplainerHtml(){
@@ -4002,7 +4307,7 @@ async function showTowerOnMap(id,event){
   document.getElementById('scoreMin').value=0;
   document.getElementById('scoreSlider').value=0;
   await loadTowers();
-  await openTower(id);
+  await openTower(id,{recenter:true});
 }
 function renderTowerTable(id,items,admin){
   const sorted=sortTowerItems(items,id);
@@ -4051,6 +4356,35 @@ async function saveTowerMetadata(id){
 }
 async function deleteTower(id){if(confirm('Delete tower and observations?')){await api('/api/admin/towers/'+id,{method:'DELETE'}); await loadAdmin(); await loadTowerTable(); await loadTowers();}}
 async function loadMethods(){const d=await api('/api/methods'); window.__helpGlossary=d.glossary||{}; appConfig={...(d.app_config||{})}; appConfigHelp={...(d.app_config_help||{})}; renderAppConfigPanel(appConfig, appConfigHelp); document.getElementById('methodsList').innerHTML=d.methods.map(m=>`<div class="card method-row"><h3>${esc(m.label)}</h3><p>${esc(m.help)}</p><label><input type="checkbox" data-mid="${m.id}" data-field="enabled" ${m.enabled?'checked':''}> enabled</label><br><label>Weight <input data-mid="${m.id}" data-field="weight" type="number" step="0.1" value="${m.weight}"></label><p><b>Equation:</b> <code>${esc(m.equation)}</code></p><p><b>Variables:</b> ${(m.variables||[]).map(v=>`<code title="${esc(d.glossary[v]||'')}">${esc(v)}</code>`).join(' ')}</p><textarea data-mid="${m.id}" data-field="thresholds">${esc(JSON.stringify(m.thresholds,null,2))}</textarea></div>`).join('')}
+let importStatusPollTimer=null;
+function stopImportStatusPolling(){
+  if(importStatusPollTimer){ clearInterval(importStatusPollTimer); importStatusPollTimer=null; }
+}
+function renderImportProgressMeta(state){
+  const el=document.getElementById('importsProgressMeta');
+  if(!el) return;
+  const msg=(state&&state.message)?String(state.message):'';
+  el.textContent=msg;
+}
+async function refreshImportStatus(){
+  try{
+    const state=await api('/api/import-status');
+    renderImportProgressMeta(state);
+    if(state&&state.active){
+      setStatusLine('importsStatus','working',state.message||'Import in progress…');
+    }else if(state&&state.phase==='error'){
+      setStatusLine('importsStatus','error',state.message||'Import failed.');
+    }
+    return state;
+  }catch(_e){
+    return null;
+  }
+}
+function startImportStatusPolling(){
+  stopImportStatusPolling();
+  refreshImportStatus();
+  importStatusPollTimer=setInterval(refreshImportStatus, 800);
+}
 async function saveAppConfig(){
   try{
     setMethodsStatus('working','Saving altitude discount configuration…');
@@ -4105,17 +4439,22 @@ async function doImport(){
   }
   try{
     setStatusLine('importsStatus','working',`Importing ${paths.length} path${paths.length===1?'':'s'}…`);
+    startImportStatusPolling();
     const r=await api('/api/import',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({paths})});
     renderImportResult(r);
     const msg=r.error
       ? `Import failed: ${r.error}`
       : `Import complete: ${formatInt(r.files_imported||0)} file(s) imported, ${formatInt(r.files_skipped||0)} skipped, ${formatInt(r.new_towers||0)} new towers added.`;
     setStatusLine('importsStatus', r.error ? 'error' : ((r.files_imported||0) ? 'success' : 'warn'), msg);
+    renderImportProgressMeta({message:msg});
     await loadStats(); await loadImports(); await loadTowers(); await loadTowerTable(); await loadAdmin();
   }catch(e){
     const msg=`Import failed: ${e&&e.message?e.message:String(e)}`;
     setStatusLine('importsStatus','error',msg);
     renderImportResult({error:msg});
+    renderImportProgressMeta({message:msg});
+  }finally{
+    stopImportStatusPolling();
   }
 }
 async function uploadImport(){
@@ -4129,12 +4468,14 @@ async function uploadImport(){
     const fd=new FormData();
     for(const f of files) fd.append('files',f);
     setStatusLine('importsStatus','working',`Uploading and importing ${files.length} file${files.length===1?'':'s'}…`);
+    startImportStatusPolling();
     const r=await api('/api/import',{method:'POST',body:fd});
     renderImportResult(r);
     const msg=r.error
       ? `Upload import failed: ${r.error}`
       : `Upload import complete: ${formatInt(r.files_imported||0)} file(s) imported, ${formatInt(r.files_skipped||0)} skipped, ${formatInt(r.new_towers||0)} new towers added.`;
     setStatusLine('importsStatus', r.error ? 'error' : ((r.files_imported||0) ? 'success' : 'warn'), msg);
+    renderImportProgressMeta({message:msg});
     document.getElementById('uploadFiles').value='';
     document.getElementById('uploadSelection').textContent='No files selected.';
     await loadStats(); await loadImports(); await loadTowers(); await loadTowerTable(); await loadAdmin();
@@ -4142,6 +4483,9 @@ async function uploadImport(){
     const msg=`Upload import failed: ${e&&e.message?e.message:String(e)}`;
     setStatusLine('importsStatus','error',msg);
     renderImportResult({error:msg});
+    renderImportProgressMeta({message:msg});
+  }finally{
+    stopImportStatusPolling();
   }
 }
 async function loadStats(){renderStatsBox(await api('/api/stats'))}
@@ -4151,7 +4495,7 @@ document.querySelectorAll('.nav button').forEach(b=>b.onclick=()=>{document.quer
 document.getElementById('uploadFiles').addEventListener('change',e=>{const files=[...(e.target.files||[])]; document.getElementById('uploadSelection').textContent=files.length?files.map(f=>`${f.name} (${formatBytes(f.size)})`).join(' · '):'No files selected.'});
 renderImportResult(null);
 document.getElementById('mapSearch').addEventListener('keydown',e=>{if(e.key==='Enter')loadTowers()});
-initMap(); initDrawerUX(); loadTowers(); loadMethods(); loadStats(); loadImports(); loadHelp(); loadTowerTable(); loadAdmin();
+initMap(); initDrawerUX(); loadTowers(); loadMethods(); loadStats(); loadImports(); loadHelp(); loadTowerTable(); loadAdmin(); refreshImportStatus();
 </script>
 </body></html>"""
 
@@ -4165,6 +4509,9 @@ def create_app(db_path: str):
 
     init_db(db_path)
     app = FastAPI(title="Tower Intelligence Dashboard")
+
+    def db_busy_response(detail: str = "Database is busy (import/recompute in progress). Try again in a moment.") -> JSONResponse:
+        return JSONResponse({"error": "db_busy", "detail": detail}, status_code=409)
 
     @app.get("/", response_class=HTMLResponse)
     def root() -> str:
@@ -4188,6 +4535,10 @@ def create_app(db_path: str):
                 (limit, int(offset)),
             ).fetchall()
         return {"items": [dict(r) for r in rows], "limit": limit, "offset": offset}
+
+    @app.get("/api/import-status")
+    def api_import_status() -> Dict[str, Any]:
+        return import_status_snapshot()
 
     @app.post("/api/import")
     async def api_import(request: StarletteRequest) -> Dict[str, Any]:
@@ -4221,27 +4572,62 @@ def create_app(db_path: str):
                 paths.extend(parse_multipart_paths(ctype, body, upload_dir))
         if not paths:
             return {"error": "No paths or files provided"}
-        # Run ingest off the event loop so the UI stays responsive while importing,
-        # and serialize write-heavy tasks to avoid SQLite writer lock errors.
+        if not WRITE_TASK_LOCK.acquire(blocking=False):
+            return db_busy_response()
+        set_import_status(
+            active=True,
+            task="import",
+            phase="queued",
+            started_at=utc_now(),
+            total_files=len(paths),
+            file_index=0,
+            current_path="",
+            current_file_size=0,
+            current_file_bytes=0,
+            current_file_percent=0.0,
+            current_rows=0,
+            current_observations=0,
+            current_errors=0,
+            imported_rows=0,
+            tower_observations=0,
+            files_imported=0,
+            files_skipped=0,
+            errors=0,
+            detail=None,
+            result=None,
+            message=f"Queued import of {len(paths)} file(s)…",
+        )
+
+        def _progress(state: Dict[str, Any]) -> None:
+            set_import_status(**state)
+
         def _run() -> Dict[str, Any]:
-            with WRITE_TASK_LOCK:
-                return ingest_files(db_path, paths)
+            return ingest_files(db_path, paths, progress_callback=_progress)
         try:
             return await asyncio.to_thread(_run)
         except sqlite3.OperationalError as exc:
             if "locked" in str(exc).lower():
-                return JSONResponse({"error": "db_busy", "detail": "Database is busy (import/recompute in progress). Try again in a moment."}, status_code=409)
+                set_import_status(active=False, phase="error", detail=str(exc), message=f"Import failed: {exc}", finished_at=utc_now())
+                return db_busy_response()
             raise
+        except Exception as exc:
+            set_import_status(active=False, phase="error", detail=str(exc), message=f"Import failed: {exc}", finished_at=utc_now())
+            raise
+        finally:
+            try:
+                WRITE_TASK_LOCK.release()
+            except RuntimeError:
+                pass
 
     @app.post("/api/recompute")
     def api_recompute() -> Dict[str, Any]:
         if not WRITE_TASK_LOCK.acquire(blocking=False):
-            return JSONResponse({"error": "db_busy", "detail": "Database is busy (import/recompute in progress). Try again in a moment."}, status_code=409)
+            return db_busy_response()
         try:
             return recompute(db_path)
         except sqlite3.OperationalError as exc:
             if "locked" in str(exc).lower():
-                return JSONResponse({"error": "db_busy", "detail": "Database is busy (import/recompute in progress). Try again in a moment."}, status_code=409)
+                return db_busy_response()
             raise
         finally:
             try:
@@ -4252,14 +4638,14 @@ def create_app(db_path: str):
     @app.post("/api/towers/{tower_id}/recompute")
     def api_recompute_one(tower_id: int) -> Dict[str, Any]:
         if not WRITE_TASK_LOCK.acquire(blocking=False):
-            return JSONResponse({"error": "db_busy", "detail": "Database is busy (import/recompute in progress). Try again in a moment."}, status_code=409)
+            return db_busy_response()
         try:
             return recompute_one_tower(db_path, int(tower_id))
         except ValueError:
             return JSONResponse({"error": "not found"}, status_code=404)
         except sqlite3.OperationalError as exc:
             if "locked" in str(exc).lower():
-                return JSONResponse({"error": "db_busy", "detail": "Database is busy (import/recompute in progress). Try again in a moment."}, status_code=409)
+                return db_busy_response()
             raise
         finally:
             try:
@@ -4376,6 +4762,8 @@ def create_app(db_path: str):
         if not isinstance(ignored, (bool, int, float)):
             return JSONResponse({"error": "ignored must be boolean"}, status_code=400)
         ignored_i = 1 if bool(ignored) else 0
+        if not WRITE_TASK_LOCK.acquire(blocking=False):
+            return db_busy_response()
         try:
             with connect_db(db_path) as con:
                 migrate_db(con)
@@ -4388,8 +4776,13 @@ def create_app(db_path: str):
         except sqlite3.OperationalError as exc:
             # SQLite allows only one writer; imports/recompute may hold a write lock.
             if "locked" in str(exc).lower():
-                return JSONResponse({"error": "db_busy", "detail": "Database is busy (import/recompute in progress). Try again in a moment."}, status_code=409)
+                return db_busy_response()
             raise
+        finally:
+            try:
+                WRITE_TASK_LOCK.release()
+            except RuntimeError:
+                pass
 
     @app.get("/api/towers/{tower_id}/export.md")
     def api_export_md(tower_id: int) -> PlainTextResponse:
@@ -4412,17 +4805,29 @@ def create_app(db_path: str):
 
     @app.put("/api/methods")
     def api_put_methods(payload: Dict[str, Any]) -> Dict[str, Any]:
-        with connect_db(db_path) as con:
-            for item in payload.get("methods", []):
-                mid = item.get("id")
-                if not mid:
-                    continue
-                con.execute(
-                    "UPDATE method_settings SET enabled=?, weight=?, thresholds_json=?, updated_at=? WHERE method_id=?",
-                    (1 if item.get("enabled", True) else 0, float(item.get("weight", 0)), json_dumps(item.get("thresholds", {})), utc_now(), mid),
-                )
-            con.commit()
-        return {"ok": True}
+        if not WRITE_TASK_LOCK.acquire(blocking=False):
+            return db_busy_response()
+        try:
+            with connect_db(db_path) as con:
+                for item in payload.get("methods", []):
+                    mid = item.get("id")
+                    if not mid:
+                        continue
+                    con.execute(
+                        "UPDATE method_settings SET enabled=?, weight=?, thresholds_json=?, updated_at=? WHERE method_id=?",
+                        (1 if item.get("enabled", True) else 0, float(item.get("weight", 0)), json_dumps(item.get("thresholds", {})), utc_now(), mid),
+                    )
+                con.commit()
+            return {"ok": True}
+        except sqlite3.OperationalError as exc:
+            if "locked" in str(exc).lower():
+                return db_busy_response()
+            raise
+        finally:
+            try:
+                WRITE_TASK_LOCK.release()
+            except RuntimeError:
+                pass
 
     @app.get("/api/config")
     def api_config() -> Dict[str, Any]:
@@ -4445,9 +4850,21 @@ def create_app(db_path: str):
                     continue
             else:
                 normalized[key] = value
-        with connect_db(db_path) as con:
-            config = update_app_config(con, normalized)
-        return {"ok": True, "config": config}
+        if not WRITE_TASK_LOCK.acquire(blocking=False):
+            return db_busy_response()
+        try:
+            with connect_db(db_path) as con:
+                config = update_app_config(con, normalized)
+            return {"ok": True, "config": config}
+        except sqlite3.OperationalError as exc:
+            if "locked" in str(exc).lower():
+                return db_busy_response()
+            raise
+        finally:
+            try:
+                WRITE_TASK_LOCK.release()
+            except RuntimeError:
+                pass
 
     @app.put("/api/admin/towers/{tower_id}")
     def api_update_tower(tower_id: int, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -4468,17 +4885,41 @@ def create_app(db_path: str):
         sets.append("updated_at=?")
         params.append(utc_now())
         params.append(tower_id)
-        with connect_db(db_path) as con:
-            con.execute(f"UPDATE towers SET {', '.join(sets)} WHERE id=?", params)
-            con.commit()
-        return {"ok": True}
+        if not WRITE_TASK_LOCK.acquire(blocking=False):
+            return db_busy_response()
+        try:
+            with connect_db(db_path) as con:
+                con.execute(f"UPDATE towers SET {', '.join(sets)} WHERE id=?", params)
+                con.commit()
+            return {"ok": True}
+        except sqlite3.OperationalError as exc:
+            if "locked" in str(exc).lower():
+                return db_busy_response()
+            raise
+        finally:
+            try:
+                WRITE_TASK_LOCK.release()
+            except RuntimeError:
+                pass
 
     @app.delete("/api/admin/towers/{tower_id}")
     def api_delete_tower(tower_id: int) -> Dict[str, Any]:
-        with connect_db(db_path) as con:
-            con.execute("DELETE FROM towers WHERE id=?", (tower_id,))
-            con.commit()
-        return {"ok": True}
+        if not WRITE_TASK_LOCK.acquire(blocking=False):
+            return db_busy_response()
+        try:
+            with connect_db(db_path) as con:
+                con.execute("DELETE FROM towers WHERE id=?", (tower_id,))
+                con.commit()
+            return {"ok": True}
+        except sqlite3.OperationalError as exc:
+            if "locked" in str(exc).lower():
+                return db_busy_response()
+            raise
+        finally:
+            try:
+                WRITE_TASK_LOCK.release()
+            except RuntimeError:
+                pass
 
     @app.get("/api/help")
     def api_help() -> Dict[str, Any]:
@@ -4508,6 +4949,29 @@ def serve(db_path: str, host: str, port: int) -> None:
     uvicorn.run(app, host=host, port=port)
 
 
+def cli_import_progress_reporter() -> Callable[[Dict[str, Any]], None]:
+    last_len = 0
+
+    def _report(progress: Dict[str, Any]) -> None:
+        nonlocal last_len
+        msg = format_import_progress(progress)
+        if not msg:
+            return
+        line = f"[import] {msg}"
+        pad = " " * max(0, last_len - len(line))
+        phase = str(progress.get("phase") or "")
+        if phase in {"done", "error"}:
+            sys.stderr.write("\r" + line + pad + "\n")
+            sys.stderr.flush()
+            last_len = 0
+            return
+        sys.stderr.write("\r" + line + pad)
+        sys.stderr.flush()
+        last_len = len(line)
+
+    return _report
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Persistent local tower intelligence dashboard.")
     parser.add_argument("--db", default=DEFAULT_DB, help=f"SQLite DB path (default: {DEFAULT_DB})")
@@ -4523,6 +4987,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     p_recompute = sub.add_parser("recompute", help="Recompute tower features and scores")
     p_recompute.add_argument("--sample-size", type=int, default=2500, help="Per-tower reservoir sample size for derived features (default: 2500)")
+    p_recompute.add_argument("--refresh-stationary", action="store_true", help="Rebuild stationary flags before recomputing (usually unnecessary right after ingest).")
+    p_recompute.add_argument("--no-backfill-altitudes", action="store_true", help="Skip raw-sample altitude backfill during recompute.")
 
     sub.add_parser("stats", help="Show DB summary")
     sub.add_parser("vacuum", help="Run SQLite VACUUM")
@@ -4531,9 +4997,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.cmd == "serve":
         serve(args.db, args.host, args.port)
     elif args.cmd == "ingest":
-        print(json.dumps(ingest_files(args.db, args.files, max_lines=args.max_lines), indent=2))
+        progress = cli_import_progress_reporter()
+        print(json.dumps(ingest_files(args.db, args.files, max_lines=args.max_lines, progress_callback=progress), indent=2))
     elif args.cmd == "recompute":
-        print(json.dumps(recompute(args.db, sample_size=args.sample_size), indent=2, default=str))
+        print(json.dumps(
+            recompute(
+                args.db,
+                sample_size=args.sample_size,
+                refresh_stationary=bool(args.refresh_stationary),
+                backfill_altitudes=not bool(args.no_backfill_altitudes),
+            ),
+            indent=2,
+            default=str,
+        ))
     elif args.cmd == "stats":
         print(json.dumps(db_stats(args.db), indent=2))
     elif args.cmd == "vacuum":
