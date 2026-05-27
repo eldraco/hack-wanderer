@@ -39,6 +39,7 @@ DEFAULT_CONFIG = {
     "timeouts": {
         "default_s": 4.0,
         "operator_scan_s": 120.0,
+        "auto_register_retry_s": 60.0,
         "gps_s": 6.0,
         "sim_read_s": 4.0,
         "vendor_s": 10.0,
@@ -111,6 +112,7 @@ DEFAULT_CONFIG = {
 
 _STATUS_SESSION_STARTED_UTC = None
 _STATUS_SESSION_STARTED_LOCAL = None
+_LAST_AUTO_REGISTER_ATTEMPT_MONO = None
 
 
 ACT_RAT = {
@@ -1264,6 +1266,17 @@ def build_reg_entry(stat, lac, ci, act):
     return entry
 
 
+def reg_is_registered(entry):
+    return (entry or {}).get("stat_code") in (1, 5)
+
+
+def network_is_registered(network):
+    for key in ("cereg", "cgreg", "creg"):
+        if reg_is_registered((network or {}).get(key)):
+            return True
+    return False
+
+
 def safe_int(value):
     try:
         return int(str(value).strip().strip('"'))
@@ -1683,18 +1696,34 @@ def read_sim_files(at, config):
 
 
 def collect_network(at, config):
+    global _LAST_AUTO_REGISTER_ATTEMPT_MONO
     network = {}
     at.send("AT+CREG=2")
     at.send("AT+CGREG=2")
     at.send("AT+CEREG=2")
 
-    if config["features"].get("auto_register"):
-        at.send("AT+COPS=0", timeout_s=config["timeouts"]["operator_scan_s"])
-
     network["csq"] = parse_csq(at.send("AT+CSQ")["lines"])
     network["creg"] = parse_reg(at.send("AT+CREG?")["lines"], "CREG")
     network["cgreg"] = parse_reg(at.send("AT+CGREG?")["lines"], "CGREG")
     network["cereg"] = parse_reg(at.send("AT+CEREG?")["lines"], "CEREG")
+
+    if config["features"].get("auto_register") and not network_is_registered(network):
+        now = time.monotonic()
+        retry_s = safe_float(config.get("timeouts", {}).get("auto_register_retry_s"))
+        if retry_s is None or retry_s < 0:
+            retry_s = 60.0
+        should_retry = (
+            _LAST_AUTO_REGISTER_ATTEMPT_MONO is None
+            or (now - _LAST_AUTO_REGISTER_ATTEMPT_MONO) >= retry_s
+        )
+        if should_retry:
+            at.send("AT+COPS=0", timeout_s=config["timeouts"]["operator_scan_s"])
+            _LAST_AUTO_REGISTER_ATTEMPT_MONO = now
+            network["csq"] = parse_csq(at.send("AT+CSQ")["lines"])
+            network["creg"] = parse_reg(at.send("AT+CREG?")["lines"], "CREG")
+            network["cgreg"] = parse_reg(at.send("AT+CGREG?")["lines"], "CGREG")
+            network["cereg"] = parse_reg(at.send("AT+CEREG?")["lines"], "CEREG")
+
     network["cops_current"] = parse_cops_current(at.send("AT+COPS?")["lines"])
 
     if config["features"].get("operator_scan"):
