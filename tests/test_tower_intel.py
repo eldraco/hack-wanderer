@@ -1,8 +1,10 @@
 import json
+import sqlite3
 import tempfile
 import unittest
 import zipfile
 from pathlib import Path
+from unittest import mock
 
 import tower_intel_server as intel
 
@@ -106,6 +108,20 @@ class TowerIntelTests(unittest.TestCase):
             self.assertEqual(imports[0]["observation_rows"], 21)
             self.assertEqual(imports[0]["new_observations"], 21)
 
+    def test_recompute_skips_stationary_refresh_by_default(self):
+        write_jsonl(self.log, self.make_rows())
+        intel.ingest_files(self.db, [str(self.log)])
+        with mock.patch.object(intel, "refresh_stationary_flags", wraps=intel.refresh_stationary_flags) as refresh_mock:
+            intel.recompute(self.db, sample_size=100)
+        refresh_mock.assert_not_called()
+
+    def test_recompute_can_force_stationary_refresh(self):
+        write_jsonl(self.log, self.make_rows())
+        intel.ingest_files(self.db, [str(self.log)])
+        with mock.patch.object(intel, "refresh_stationary_flags", wraps=intel.refresh_stationary_flags) as refresh_mock:
+            intel.recompute(self.db, sample_size=100, refresh_stationary=True)
+        self.assertGreaterEqual(refresh_mock.call_count, 1)
+
     def test_method_setting_changes_score_after_recompute(self):
         write_jsonl(self.log, self.make_rows())
         intel.ingest_files(self.db, [str(self.log)])
@@ -147,6 +163,39 @@ class TowerIntelTests(unittest.TestCase):
         self.assertGreater(rows["odds_multiplier"]["value"], 1.0)
         self.assertIn("clamp", enriched["equation_note"])
         self.assertIn("Requires", enriched["trigger_summary"])
+
+    def test_get_method_settings_is_read_only_under_foreign_write_lock(self):
+        intel.init_db(self.db)
+        writer = intel.connect_db(self.db)
+        try:
+            writer.execute("BEGIN IMMEDIATE")
+            writer.execute("UPDATE app_settings SET updated_at=updated_at WHERE key=?", ("altitude_high_point_m",))
+            with intel.connect_db(self.db) as reader:
+                settings = intel.get_method_settings(reader)
+            self.assertIn("multi_location", settings)
+        finally:
+            try:
+                writer.rollback()
+            except sqlite3.Error:
+                pass
+            writer.close()
+
+    def test_ingest_progress_callback_reports_live_rows_and_done(self):
+        write_jsonl(self.log, self.make_rows())
+        seen = []
+
+        def progress(payload):
+            seen.append(dict(payload))
+
+        result = intel.ingest_files(self.db, [str(self.log)], progress_callback=progress)
+
+        self.assertEqual(result["files_imported"], 1)
+        self.assertTrue(seen)
+        self.assertEqual(seen[0]["phase"], "starting")
+        self.assertTrue(any(item["phase"] == "importing" and item["current_rows"] >= 1 for item in seen))
+        self.assertEqual(seen[-1]["phase"], "done")
+        self.assertFalse(seen[-1]["active"])
+        self.assertIn("Import complete", seen[-1]["message"])
 
     def test_stationary_detection_uses_direct_gps_speed_when_available(self):
         rows = []
