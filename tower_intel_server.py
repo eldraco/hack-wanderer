@@ -557,6 +557,13 @@ VARIABLE_GLOSSARY: Dict[str, str] = {
     "new_place_first_seen_ts": "Epoch seconds (UTC) when this tower fingerprint was first observed in its main place bucket.",
     "new_place_first_seen_local": "Local time (machine running the server) when this tower fingerprint was first observed in its main place bucket.",
     "new_place_prior_range": "Human-readable date range of prior coverage in new_place_id before the tower first appeared there.",
+    "new_area_code_prior_same_rat_count": "How many prior good-GPS observations in this tower's main place bucket had the same operator and RAT and also reported any TAC/LAC value before this tower first appeared there.",
+    "new_area_code_prior_same_rat_days": "How many distinct UTC days contributed prior same-operator/RAT TAC/LAC observations in this tower's main place bucket.",
+    "new_area_code_prior_same_code_count": "How many prior same-operator/RAT observations in this place already used this exact TAC/LAC before the tower first appeared there. Zero means the area code was locally unseen.",
+    "new_area_code_prior_distinct_codes": "How many distinct TAC/LAC values were already seen for the same operator and RAT in this place before the tower first appeared there.",
+    "new_area_code_prior_dominant_code": "The most common prior TAC/LAC value for the same operator and RAT in this place before the tower first appeared there.",
+    "new_area_code_prior_dominant_frac": "Fraction of prior same-operator/RAT observations in this place that used the dominant TAC/LAC. Higher means the local area-code pattern was more stable before the new tower appeared.",
+    "new_area_code_prior_range": "Human-readable date range of prior same-operator/RAT TAC/LAC coverage in this place before the tower first appeared there.",
     "new_place_post_count": "How many total (good-GPS) tower observations existed in new_place_id after this tower was last seen there. Higher implies more opportunity to have seen it again if it still existed.",
     "new_place_post_days": "How many distinct UTC days had any (good-GPS) observations in new_place_id after this tower was last seen there.",
     "new_place_post_stationary_count": "How many stationary (good-GPS) observations existed in new_place_id after this tower was last seen there.",
@@ -621,6 +628,15 @@ VARIABLE_GLOSSARY: Dict[str, str] = {
     "min_window_min": "Minimum stationary opportunity window, in minutes, required before the bursty-opportunity method can trigger.",
     "max_frac": "Upper local-window fraction used by the bursty-opportunity method. Above this, the burst signal weakens toward zero.",
     "full_frac": "Lower local-window fraction used by the bursty-opportunity method. At or below this, the method reaches full normalized evidence.",
+    "prior_count_start": "Lower prior-coverage threshold. Below this count, the local novelty methods give zero normalized evidence.",
+    "prior_count_full": "Upper prior-coverage threshold. At or above this count, the local novelty methods reach full normalized evidence.",
+    "post_count_start": "Lower post-coverage threshold. Below this, the disappearance method gives zero evidence.",
+    "post_count_full": "Upper post-coverage threshold. At or above this count, the disappearance method reaches full normalized evidence.",
+    "dominant_frac_start": "Lower dominant-area-code fraction threshold. Below this, the TAC/LAC stability term gives zero evidence.",
+    "dominant_frac_full": "Upper dominant-area-code fraction threshold. At or above this fraction, the TAC/LAC stability term reaches full normalized evidence.",
+    "min_prior_days": "Minimum number of distinct prior days required before the new local novelty methods can trigger.",
+    "min_post_days": "Minimum number of distinct later-coverage days required before the disappearance method can trigger.",
+    "min_tower_count_in_place": "Minimum number of observations this tower must have in its main place bucket before local place-based novelty methods can trigger.",
     "surprise_start": "Lower RAT-surprise threshold. Below this, the RAT surprise method gives zero evidence.",
     "surprise_full": "Upper RAT-surprise threshold. At or above this, the RAT surprise method reaches full normalized evidence.",
     "stable_spread_m": "GPS spread threshold used when awarding negative stability evidence.",
@@ -674,6 +690,33 @@ METHOD_REGISTRY: List[Dict[str, Any]] = [
         ],
         "equation": "norm01 = clamp((new_place_post_count - post_count_start) / (post_count_full - post_count_start), 0, 1) if new_place_post_days >= min_post_days",
         "help": "If a tower is observed in a place bucket, and then later we spend lots of time in that same bucket (seeing other towers), but never see this tower again, that is evidence it was short-lived or inconsistent. This is still probabilistic: phones do not observe every tower on every pass.",
+        "map_layers": ["place_buckets", "points"],
+    },
+    {
+        "id": "new_area_code_in_well_covered_place",
+        "label": "New TAC/LAC in a well-covered place",
+        "direction": "up",
+        "weight": 1.2,
+        "thresholds": {
+            "prior_count_start": 40,
+            "prior_count_full": 300,
+            "dominant_frac_start": 0.65,
+            "dominant_frac_full": 0.90,
+            "min_tower_count_in_place": 4,
+            "min_prior_days": 2,
+        },
+        "variables": [
+            "tac_lac",
+            "new_area_code_prior_same_rat_count",
+            "new_area_code_prior_same_rat_days",
+            "new_area_code_prior_same_code_count",
+            "new_area_code_prior_distinct_codes",
+            "new_area_code_prior_dominant_code",
+            "new_area_code_prior_dominant_frac",
+            "new_place_count",
+        ],
+        "equation": "coverage_norm = clamp((new_area_code_prior_same_rat_count - prior_count_start) / (prior_count_full - prior_count_start), 0, 1); stability_norm = clamp((new_area_code_prior_dominant_frac - dominant_frac_start) / (dominant_frac_full - dominant_frac_start), 0, 1); norm01 = coverage_norm * stability_norm when this TAC/LAC was unseen before in that same place for the same operator and RAT.",
+        "help": "Conservative local-context evidence only. LTE/5G uses TAC; older RATs use LAC in the same field. If a tower first appears in a place where the same operator and RAT were already well covered, and this TAC/LAC was not seen there before, that is mildly suspicious. The signal is stronger only when the previous local TAC/LAC pattern was itself stable.",
         "map_layers": ["place_buckets", "points"],
     },
     {
@@ -874,6 +917,27 @@ METHOD_XAI_SPECS: Dict[str, Dict[str, Any]] = {
             ("Context", "new_place_id"),
             ("Context", "new_place_post_stationary_count"),
             ("Context", "new_place_post_stationary_days"),
+        ],
+    },
+    "new_area_code_in_well_covered_place": {
+        "trigger_summary": "Requires enough observations in the tower's main place bucket, enough prior same-operator/RAT coverage days in that bucket, this TAC/LAC to have been unseen there before, and the prior local TAC/LAC pattern to have been fairly stable.",
+        "rows": [
+            ("Context", "tac_lac"),
+            ("Gate", "new_place_count"),
+            ("Gate", "min_tower_count_in_place"),
+            ("Gate", "new_area_code_prior_same_rat_days"),
+            ("Gate", "min_prior_days"),
+            ("Gate", "new_area_code_prior_same_code_count"),
+            ("Equation", "new_area_code_prior_same_rat_count"),
+            ("Equation", "prior_count_start"),
+            ("Equation", "prior_count_full"),
+            ("Equation", "new_area_code_prior_dominant_frac"),
+            ("Equation", "dominant_frac_start"),
+            ("Equation", "dominant_frac_full"),
+            ("Context", "new_area_code_prior_distinct_codes"),
+            ("Context", "new_area_code_prior_dominant_code"),
+            ("Context", "new_area_code_prior_range"),
+            ("Context", "new_place_id"),
         ],
     },
     "multi_location_stationary": {
@@ -1383,13 +1447,14 @@ def add_method_result(
     direction = method["direction"]
     base_norm01 = clamp01(norm01)
     altitude_factor = clamp01(altitude_factor)
-    effective_norm01 = base_norm01 * altitude_factor
+    effective_norm01 = base_norm01 * altitude_factor if triggered else 0.0
     delta = weight * effective_norm01
     if direction == "down":
         delta = -delta
     if not method["enabled"]:
         delta = 0.0
         triggered = False
+        effective_norm01 = 0.0
     result = {
         "id": method["id"],
         "label": method["label"],
@@ -1525,6 +1590,53 @@ def evaluate_methods(
                 else ""
             )
             + (f"Prior good-GPS obs in bucket: {int(prior_count)}. " if isinstance(prior_count, (int, float)) else "")
+        ).strip(),
+        altitude_factor=geo_altitude_factor(),
+        altitude_factor_name="geo_altitude_confidence",
+    )
+
+    mid = "new_area_code_in_well_covered_place"
+    prior_rr_count = features.get("new_area_code_prior_same_rat_count")
+    prior_rr_days = features.get("new_area_code_prior_same_rat_days")
+    prior_same_code_count = features.get("new_area_code_prior_same_code_count")
+    prior_dom_frac = features.get("new_area_code_prior_dominant_frac")
+    tower_place_n3 = features.get("new_place_count") or 0
+    coverage_n = norm_range(prior_rr_count, th(mid, "prior_count_start", 40), th(mid, "prior_count_full", 300))
+    stability_n = norm_range(prior_dom_frac, th(mid, "dominant_frac_start", 0.65), th(mid, "dominant_frac_full", 0.90))
+    n = coverage_n * stability_n
+    triggered = bool(
+        features.get("tac_lac") is not None
+        and isinstance(prior_same_code_count, (int, float))
+        and float(prior_same_code_count) <= 0.0
+        and isinstance(prior_rr_days, (int, float))
+        and prior_rr_days >= th(mid, "min_prior_days", 2)
+        and tower_place_n3 >= th(mid, "min_tower_count_in_place", 4)
+        and n > 0
+    )
+    total_delta += add_method_result(
+        results,
+        m(mid),
+        context,
+        n,
+        triggered,
+        (
+            "This tower's TAC/LAC first appears in a locally well-covered place for the same operator and RAT. "
+            + (f"Current TAC/LAC: {features.get('tac_lac')}. " if features.get("tac_lac") is not None else "")
+            + (
+                f"Prior same-operator/RAT TAC/LAC coverage in this bucket: {int(prior_rr_count)} obs across {int(prior_rr_days)} day(s). "
+                if isinstance(prior_rr_count, (int, float)) and isinstance(prior_rr_days, (int, float))
+                else ""
+            )
+            + (
+                f"Dominant prior TAC/LAC: {features.get('new_area_code_prior_dominant_code')} ({float(prior_dom_frac) * 100.0:.1f}% of prior same-operator/RAT observations). "
+                if features.get("new_area_code_prior_dominant_code") is not None and isinstance(prior_dom_frac, (int, float))
+                else ""
+            )
+            + (
+                f"Prior same-operator/RAT coverage window: {features.get('new_area_code_prior_range')}. "
+                if features.get("new_area_code_prior_range")
+                else ""
+            )
         ).strip(),
         altitude_factor=geo_altitude_factor(),
         altitude_factor_name="geo_altitude_confidence",
@@ -2516,9 +2628,15 @@ def recompute(
         place_first_day: Dict[str, int] = {}
         place_stationary_day_count: Dict[str, int] = defaultdict(int)
         place_stationary_last_day: Dict[str, int] = {}
+        place_rr_seen_total: Dict[Tuple[str, str, str], int] = defaultdict(int)
+        place_rr_day_count: Dict[Tuple[str, str, str], int] = defaultdict(int)
+        place_rr_last_day: Dict[Tuple[str, str, str], int] = {}
+        place_rr_first_day: Dict[Tuple[str, str, str], int] = {}
+        place_rr_code_counts: Dict[Tuple[str, str, str], Counter] = defaultdict(Counter)
 
         first_seen_in_place: set[Tuple[int, str]] = set()
         tower_place_prior: Dict[Tuple[int, str], Dict[str, Any]] = {}
+        tower_place_area_prior: Dict[Tuple[int, str], Dict[str, Any]] = {}
         tower_main_place: Dict[int, str] = {}
 
         def day_id_utc(ts: float) -> int:
@@ -2562,6 +2680,27 @@ def recompute(
                         "prior_last_day": place_last_day.get(pid),
                         "first_seen_ts": ts,
                     }
+                    if key.tac_lac is not None:
+                        rr_key = (pid, key.operator or "", key.rat or "")
+                        rr_counts = place_rr_code_counts.get(rr_key) or Counter()
+                        dominant_code = None
+                        dominant_count = 0
+                        if rr_counts:
+                            dominant_code, dominant_count = max(
+                                rr_counts.items(),
+                                key=lambda kv: (int(kv[1]), str(kv[0])),
+                            )
+                        rr_total = int(place_rr_seen_total.get(rr_key, 0))
+                        tower_place_area_prior[tp] = {
+                            "prior_same_rat_count": rr_total,
+                            "prior_same_rat_days": int(place_rr_day_count.get(rr_key, 0)),
+                            "prior_same_code_count": int(rr_counts.get(key.tac_lac, 0)),
+                            "prior_distinct_codes": int(len(rr_counts)),
+                            "prior_dominant_code": dominant_code,
+                            "prior_dominant_frac": (float(dominant_count) / float(rr_total)) if rr_total > 0 else None,
+                            "prior_first_day": place_rr_first_day.get(rr_key),
+                            "prior_last_day": place_rr_last_day.get(rr_key),
+                        }
                     first_seen_in_place.add(tp)
             alt_m = float(row["alt_m"]) if isinstance(row["alt_m"], (int, float)) else None
             place_floor = place_altitude_floor.get(str(place_id)) if place_id else None
@@ -2621,6 +2760,15 @@ def recompute(
                         place_stationary_last_day[pid] = day
                         place_stationary_day_count[pid] += 1
                     place_seen_stationary[pid] += 1
+                if key.tac_lac is not None:
+                    rr_key = (pid, key.operator or "", key.rat or "")
+                    if rr_key not in place_rr_first_day:
+                        place_rr_first_day[rr_key] = day
+                    if place_rr_last_day.get(rr_key) != day:
+                        place_rr_last_day[rr_key] = day
+                        place_rr_day_count[rr_key] += 1
+                    place_rr_seen_total[rr_key] += 1
+                    place_rr_code_counts[rr_key][key.tac_lac] += 1
                 place_aggs.setdefault(place_id, PlaceAgg(place_id)).add(ts, key, signal, stationary=bool(row["stationary"]))
 
         # Post-coverage ("disappears despite coverage") stats per tower's main place bucket.
@@ -2692,6 +2840,7 @@ def recompute(
         for tid, a in aggs.items():
             a.features, a.anomaly_score = compute_features(a, global_stats)
             a.features["rat"] = a.key.rat
+            a.features["tac_lac"] = a.key.tac_lac
             coarse = base_identity_key(BaseKey(a.key.operator, a.key.rat, a.key.tac_lac, a.key.cell_id))
             ba = base_aggs.get(coarse)
             if ba and ba.stationary_obs > 0:
@@ -2785,6 +2934,21 @@ def recompute(
                     a.features["new_place_prior_range"] = f"{d0}"
                 else:
                     a.features["new_place_prior_range"] = None
+                area_prior = tower_place_area_prior.get((tid, str(top_pid))) or {}
+                a.features["new_area_code_prior_same_rat_count"] = area_prior.get("prior_same_rat_count")
+                a.features["new_area_code_prior_same_rat_days"] = area_prior.get("prior_same_rat_days")
+                a.features["new_area_code_prior_same_code_count"] = area_prior.get("prior_same_code_count")
+                a.features["new_area_code_prior_distinct_codes"] = area_prior.get("prior_distinct_codes")
+                a.features["new_area_code_prior_dominant_code"] = area_prior.get("prior_dominant_code")
+                a.features["new_area_code_prior_dominant_frac"] = area_prior.get("prior_dominant_frac")
+                d0 = _day_id_to_datestr(area_prior.get("prior_first_day"))
+                d1 = _day_id_to_datestr(area_prior.get("prior_last_day"))
+                if d0 and d1:
+                    a.features["new_area_code_prior_range"] = f"{d0} .. {d1}"
+                elif d0:
+                    a.features["new_area_code_prior_range"] = f"{d0}"
+                else:
+                    a.features["new_area_code_prior_range"] = None
                 post = tower_place_post.get((tid, str(top_pid))) or {}
                 a.features["new_place_post_count"] = post.get("post_count")
                 a.features["new_place_post_days"] = post.get("post_days")
@@ -3012,6 +3176,7 @@ def recompute_one_tower(db_path: str, tower_id: int, *, sample_size: int = 2500)
         agg.features = feats
         agg.anomaly_score = rule_score
         agg.features["rat"] = agg.key.rat
+        agg.features["tac_lac"] = agg.key.tac_lac
 
         # Altitude features (same shape as full recompute).
         agg.features["altitude_samples"] = alt_acc["count"]
@@ -3138,6 +3303,84 @@ def recompute_one_tower(db_path: str, tower_id: int, *, sample_size: int = 2500)
                     agg.features["new_place_prior_range"] = f"{d0}"
                 else:
                     agg.features["new_place_prior_range"] = None
+                if key.tac_lac is not None:
+                    row = con.execute(
+                        """
+                        SELECT COUNT(*) c
+                        FROM tower_observations o
+                        JOIN towers t ON t.id=o.tower_id
+                        WHERE o.place_id=? AND o.ts<? AND o.bad_gps=0 AND COALESCE(o.ignored,0)=0
+                          AND COALESCE(t.operator,'')=? AND COALESCE(t.rat,'')=?
+                          AND t.tac_lac IS NOT NULL
+                        """,
+                        (str(top_pid), float(first_ts), key.operator or "", key.rat or ""),
+                    ).fetchone()
+                    agg.features["new_area_code_prior_same_rat_count"] = int(row["c"] or 0)
+                    row = con.execute(
+                        """
+                        SELECT COUNT(DISTINCT CAST(o.ts/86400 AS INT)) d
+                        FROM tower_observations o
+                        JOIN towers t ON t.id=o.tower_id
+                        WHERE o.place_id=? AND o.ts<? AND o.bad_gps=0 AND COALESCE(o.ignored,0)=0
+                          AND COALESCE(t.operator,'')=? AND COALESCE(t.rat,'')=?
+                          AND t.tac_lac IS NOT NULL
+                        """,
+                        (str(top_pid), float(first_ts), key.operator or "", key.rat or ""),
+                    ).fetchone()
+                    agg.features["new_area_code_prior_same_rat_days"] = int(row["d"] or 0)
+                    row = con.execute(
+                        """
+                        SELECT COUNT(*) c
+                        FROM tower_observations o
+                        JOIN towers t ON t.id=o.tower_id
+                        WHERE o.place_id=? AND o.ts<? AND o.bad_gps=0 AND COALESCE(o.ignored,0)=0
+                          AND COALESCE(t.operator,'')=? AND COALESCE(t.rat,'')=?
+                          AND t.tac_lac=?
+                        """,
+                        (str(top_pid), float(first_ts), key.operator or "", key.rat or "", key.tac_lac),
+                    ).fetchone()
+                    agg.features["new_area_code_prior_same_code_count"] = int(row["c"] or 0)
+                    code_rows = con.execute(
+                        """
+                        SELECT t.tac_lac, COUNT(*) c
+                        FROM tower_observations o
+                        JOIN towers t ON t.id=o.tower_id
+                        WHERE o.place_id=? AND o.ts<? AND o.bad_gps=0 AND COALESCE(o.ignored,0)=0
+                          AND COALESCE(t.operator,'')=? AND COALESCE(t.rat,'')=?
+                          AND t.tac_lac IS NOT NULL
+                        GROUP BY t.tac_lac
+                        """,
+                        (str(top_pid), float(first_ts), key.operator or "", key.rat or ""),
+                    ).fetchall()
+                    agg.features["new_area_code_prior_distinct_codes"] = int(len(code_rows))
+                    if code_rows:
+                        dominant_row = max(code_rows, key=lambda r: (int(r["c"] or 0), str(r["tac_lac"])))
+                        dominant_count = int(dominant_row["c"] or 0)
+                        dominant_code = dominant_row["tac_lac"]
+                        total_count = int(agg.features.get("new_area_code_prior_same_rat_count") or 0)
+                        agg.features["new_area_code_prior_dominant_code"] = dominant_code
+                        agg.features["new_area_code_prior_dominant_frac"] = (float(dominant_count) / float(total_count)) if total_count > 0 else None
+                    rrange = con.execute(
+                        """
+                        SELECT
+                          MIN(CAST(strftime('%Y%m%d', o.ts, 'unixepoch') AS INT)) AS mn,
+                          MAX(CAST(strftime('%Y%m%d', o.ts, 'unixepoch') AS INT)) AS mx
+                        FROM tower_observations o
+                        JOIN towers t ON t.id=o.tower_id
+                        WHERE o.place_id=? AND o.ts<? AND o.bad_gps=0 AND COALESCE(o.ignored,0)=0
+                          AND COALESCE(t.operator,'')=? AND COALESCE(t.rat,'')=?
+                          AND t.tac_lac IS NOT NULL
+                        """,
+                        (str(top_pid), float(first_ts), key.operator or "", key.rat or ""),
+                    ).fetchone()
+                    d0 = _day_id_to_datestr(rrange["mn"] if rrange else None)
+                    d1 = _day_id_to_datestr(rrange["mx"] if rrange else None)
+                    if d0 and d1:
+                        agg.features["new_area_code_prior_range"] = f"{d0} .. {d1}"
+                    elif d0:
+                        agg.features["new_area_code_prior_range"] = f"{d0}"
+                    else:
+                        agg.features["new_area_code_prior_range"] = None
                 row = con.execute(
                     "SELECT COUNT(*) c FROM tower_observations WHERE place_id=? AND ts<? AND bad_gps=0 AND COALESCE(ignored,0)=0 AND stationary=1",
                     (str(top_pid), float(first_ts)),
@@ -3700,6 +3943,7 @@ def index_html() -> str:
   <nav class="nav">
     <button data-view="mapView" class="active">🗺️<br>Map</button>
     <button data-view="towersView">📡<br>Towers</button>
+    <button data-view="anomaliesView">⚠️<br>Anomalies</button>
     <button data-view="methodsView">⚙️<br>Methods</button>
     <button data-view="importsView">⬆️<br>Imports</button>
     <button data-view="adminView">🧰<br>Admin</button>
@@ -3721,6 +3965,7 @@ def index_html() -> str:
       <aside id="drawer" class="drawer"><div class="drawer-resizer" title="Drag to resize"></div><div class="drawer-scroll"><header><div class="drawer-top"><div><button class="ghost" onclick="closeDrawer()">Close</button><h2 id="drawerTitle"></h2><div id="drawerSub" class="small"></div></div><div class="drawer-tools"><button class="ghost" onclick="changeDrawerFont(-1)">A−</button><button class="ghost" onclick="resetDrawerFont()">A</button><button class="ghost" onclick="changeDrawerFont(1)">A+</button><span id="drawerFontLabel" class="small"></span></div></div></header><div class="body" id="drawerBody"></div></div></aside>
     </section>
     <section id="towersView" class="view"><div class="toolbar"><input id="towerSearch" placeholder="Search identifiers, notes, tags"><button class="ghost" onclick="loadTowerTable()">Search</button></div><div class="table-wrap"><table id="towerTable"></table></div></section>
+    <section id="anomaliesView" class="view"><div class="toolbar"><input id="anomalySearch" placeholder="Search identifiers, notes, tags"><select id="anomalyMethod" onchange="loadAnomalyTable()"><option value="">All triggered anomalies</option></select><label><input id="anomalyIgnored" type="checkbox" onchange="loadAnomalyTable()"> include ignored</label><button class="ghost" onclick="loadAnomalyTable()">Search</button><span id="anomalyStatus" class="small"></span></div><div class="table-wrap"><table id="anomalyTable"></table></div></section>
     <section id="methodsView" class="view"><div class="toolbar"><button class="primary" onclick="saveMethods()">Save settings</button><button class="ghost" onclick="saveAppConfig()">Save altitude config</button><button class="ghost" onclick="recompute('methods')">Recompute scores</button><span class="small">Method thresholds and altitude discount settings are editable for experiments.</span><span id="methodsStatus" class="small toolbar-note"></span></div><div class="cards"><div class="card span-all"><h3>Altitude discount configuration</h3><p class="small">These settings control how much elevated positions soften geo-heavy evidence. Ground-level points remain full strength; higher positions are discounted using local ground/floor baselines per place bucket.</p><div id="appConfigBox" class="config-grid"></div><div id="appConfigCurve" class="table-wrap compact" style="margin-top:12px"><table id="appConfigCurveTable"></table></div></div></div><div id="methodsList" class="cards"></div></section>
     <section id="importsView" class="view"><div class="imports-shell"><div id="importsStatus" class="status-line idle">Ready to import JSONL files.</div><div id="importsProgressMeta" class="small toolbar-note" style="margin:8px 0 14px 0"></div><div class="imports-grid"><div class="card"><h3>Import by path</h3><p class="small">Local server reads files from this machine. Separate multiple paths with newlines.</p><textarea id="importPaths" style="width:100%;min-height:140px" placeholder="logs/14-5-2026.jsonl"></textarea><div class="inline-actions"><button class="primary" onclick="doImport()">Import</button><button class="ghost" onclick="recompute('imports')">Recompute</button></div></div><div class="card"><h3>Upload JSONL</h3><div class="upload-stack"><input id="uploadFiles" type="file" multiple><div id="uploadSelection" class="small">No files selected.</div><button class="primary" onclick="uploadImport()">Upload + import</button></div></div><div class="card stats-card-col"><h3>DB Stats</h3><div class="inline-actions" style="margin-top:0"><button class="ghost" onclick="loadStats()">Refresh stats</button></div><div id="statsBox" class="stats-grid" style="margin-top:12px"></div><div id="statsMeta" class="small" style="margin-top:10px"></div></div><div class="card span-all"><h3>Last import result</h3><p class="small">Every import shows a compact status line plus per-file counts. No popup windows; results stay here for review.</p><div id="importSummaryMetrics" class="stats-grid" style="margin-top:12px"></div><div class="table-wrap compact" style="margin-top:12px"><table id="importResultTable"></table></div></div><div class="card span-all"><h3>Imported files history</h3><p class="small">Persistent list from the SQLite <code>import_files</code> table. Manual path imports and browser uploads both appear here.</p><div class="inline-actions" style="margin-top:0"><button class="ghost" onclick="loadImports()">Refresh imported files</button></div><div class="table-wrap compact" style="margin-top:12px"><table id="importsTable"></table></div></div></div></div></section>
     <section id="adminView" class="view"><div class="toolbar"><input id="adminSearch" placeholder="Search DB, notes, tags"><button class="ghost" onclick="loadAdmin()">Search</button></div><div class="table-wrap"><table id="adminTable"></table></div></section>
@@ -3730,8 +3975,8 @@ def index_html() -> str:
 <script>
 let map, towerLayer, estimateLayer, pointLayer, clusterLayer, badLayer, placeLayer, centerLayer;
 let allTowers=[];
-let towerTableItems=[], adminTableItems=[];
-let tableSort={towerTable:{key:'bayes_post_p',dir:-1},adminTable:{key:'bayes_post_p',dir:-1}};
+let towerTableItems=[], anomalyTableItems=[], adminTableItems=[];
+let tableSort={towerTable:{key:'bayes_post_p',dir:-1},anomalyTable:{key:'bayes_post_p',dir:-1},adminTable:{key:'bayes_post_p',dir:-1}};
 let appConfig={}, appConfigHelp={};
 let currentTowerData=null, drawerShowAllMethods=false;
 let obsMarkers=new Map(); // obs_uid -> {layer, point}
@@ -4048,7 +4293,7 @@ function renderMapTowers(fit){
       const t=await api('/api/towers/'+id); currentTowerData=t; drawerShowAllMethods=false; renderDrawer(t);
       if(opts.recenter && t.center_lat!=null) map.setView([t.center_lat,t.center_lon], Math.max(map.getZoom(),17));
     }
-	function pickFeatures(f){const keys=['count','days_seen','stationary_count','gps_spread_m','clusters','cluster_top2_sep_m','stationary_clusters','stationary_cluster_top2_sep_m','signal_dist_model','stationary_signal_mad','stationary_signal_mad_z','stationary_jump_rate_8db','stationary_jump_rate_z','stationary_param_obs','stationary_pci_change_rate_z','stationary_earfcn_change_rate_z','local_stationary_window_min','local_stationary_window_frac','change_places_frac_stationary','place_rat_surprise','new_place_id','new_place_count','new_place_first_seen_local','new_place_prior_range','new_place_prior_count','new_place_prior_days','new_place_prior_stationary_count','new_place_prior_stationary_days','new_place_post_count','new_place_post_days','new_place_post_stationary_count','new_place_post_stationary_days','stability_bonus','bad_gps_skipped','altitude_samples','altitude_rel_median_m','altitude_rel_p90_m','high_altitude_obs_frac','geo_altitude_confidence','stationary_altitude_samples','stationary_altitude_rel_median_m','stationary_altitude_rel_p90_m','stationary_high_altitude_obs_frac','stationary_geo_altitude_confidence']; let o={}; keys.forEach(k=>{if(f&&f[k]!==undefined)o[k]=f[k]}); return o}
+	function pickFeatures(f){const keys=['count','days_seen','stationary_count','gps_spread_m','clusters','cluster_top2_sep_m','stationary_clusters','stationary_cluster_top2_sep_m','signal_dist_model','stationary_signal_mad','stationary_signal_mad_z','stationary_jump_rate_8db','stationary_jump_rate_z','stationary_param_obs','stationary_pci_change_rate_z','stationary_earfcn_change_rate_z','local_stationary_window_min','local_stationary_window_frac','change_places_frac_stationary','place_rat_surprise','new_place_id','new_place_count','new_place_first_seen_local','new_place_prior_range','new_place_prior_count','new_place_prior_days','new_place_prior_stationary_count','new_place_prior_stationary_days','new_area_code_prior_same_rat_count','new_area_code_prior_same_rat_days','new_area_code_prior_same_code_count','new_area_code_prior_distinct_codes','new_area_code_prior_dominant_code','new_area_code_prior_dominant_frac','new_area_code_prior_range','new_place_post_count','new_place_post_days','new_place_post_stationary_count','new_place_post_stationary_days','stability_bonus','bad_gps_skipped','altitude_samples','altitude_rel_median_m','altitude_rel_p90_m','high_altitude_obs_frac','geo_altitude_confidence','stationary_altitude_samples','stationary_altitude_rel_median_m','stationary_altitude_rel_p90_m','stationary_high_altitude_obs_frac','stationary_geo_altitude_confidence']; let o={}; keys.forEach(k=>{if(f&&f[k]!==undefined)o[k]=f[k]}); return o}
 	function bucketExplainerHtml(){
 	  return `<details class="small" style="margin:8px 0 0">
 	    <summary><b>What is a place bucket?</b></summary>
@@ -4113,7 +4358,7 @@ async function recomputeOneTower(towerId){
     setTowerRecomputeStatus('working','Recomputing…');
     const r=await api(`/api/towers/${towerId}/recompute`,{method:'POST'});
     setTowerRecomputeStatus('success',`Done.`);
-    await loadTowers(); await loadTowerTable(); await loadAdmin(); await loadStats();
+    await loadTowers(); await loadTowerTable(); await loadAnomalyTable(); await loadAdmin(); await loadStats();
     // Refresh drawer with recomputed values.
     await openTower(towerId);
   }catch(e){
@@ -4271,6 +4516,18 @@ async function showPoints(id,mode){clearOverlays(); resetObsMarkers(); currentPo
 	  }
 	}
 async function loadTowerTable(){const q=document.getElementById('towerSearch').value.trim(); const data=await api('/api/towers?limit=5000&q='+encodeURIComponent(q)+'&include_ignored=1'); towerTableItems=data.items; renderTowerTable('towerTable',towerTableItems,false)}
+async function loadAnomalyTable(){
+  const q=document.getElementById('anomalySearch').value.trim();
+  const method=document.getElementById('anomalyMethod').value;
+  const includeIgnored=document.getElementById('anomalyIgnored').checked?1:0;
+  const data=await api('/api/anomaly-towers?q='+encodeURIComponent(q)+'&method_id='+encodeURIComponent(method)+'&include_ignored='+includeIgnored);
+  anomalyTableItems=data.items;
+  const select=document.getElementById('anomalyMethod'), selected=select.value;
+  select.innerHTML='<option value="">All triggered anomalies</option>'+(data.available_methods||[]).map(m=>`<option value="${esc(m.id)}">${esc(m.label)} (${m.count})</option>`).join('');
+  select.value=selected;
+  document.getElementById('anomalyStatus').textContent=`${data.items.length} tower${data.items.length===1?'':'s'} with triggered anomalies`;
+  renderAnomalyTable();
+}
 async function loadAdmin(){const q=document.getElementById('adminSearch').value.trim(); const data=await api('/api/towers?limit=5000&q='+encodeURIComponent(q)+'&include_ignored=1'); adminTableItems=data.items; renderTowerTable('adminTable',adminTableItems,true)}
 function sortValue(t,key){
   if(key==='bayes_post_p'||key==='rule_score'||key==='count'||key==='tac_lac'||key==='cell_id'||key==='pci'||key==='earfcn') return Number(t[key]??-Infinity);
@@ -4294,7 +4551,8 @@ function sortHeader(tableId,key,label){
 function setTowerSort(tableId,key){
   const s=tableSort[tableId]||{key,dir:1};
   tableSort[tableId]={key,dir:s.key===key?-s.dir:((key==='bayes_post_p'||key==='rule_score'||key==='count')?-1:1)};
-  renderTowerTable(tableId,tableId==='adminTable'?adminTableItems:towerTableItems,tableId==='adminTable');
+  if(tableId==='anomalyTable') renderAnomalyTable();
+  else renderTowerTable(tableId,tableId==='adminTable'?adminTableItems:towerTableItems,tableId==='adminTable');
 }
 async function showTowerOnMap(id,event){
   if(event) event.stopPropagation();
@@ -4330,6 +4588,21 @@ function renderTowerTable(id,items,admin){
   ].join('');
   document.getElementById(id).innerHTML=`<tr>${headers}</tr>`+sorted.map(t=>`<tr><td><button class="ghost" onclick="showTowerOnMap(${t.id},event)">Show</button></td><td class="score">${pct(t.bayes_post_p)}</td><td class="score">${Number(t.rule_score||0).toFixed(2)}</td><td>${t.count}</td><td>${esc(t.operator)}</td><td>${esc(t.rat)}</td><td><code>${esc(t.tac_lac)}</code></td><td><code>${esc(t.cell_id)}</code></td><td><code>${esc(t.pci)}</code></td><td><code>${esc(t.earfcn)}</code></td><td>${analysisTagHtml(t.analysis_status)}</td><td>${noteIndicatorHtml(t.notes)}</td><td onclick="event.stopPropagation()"><input type="checkbox" ${t.known?'checked':''} onchange="patchTower(${t.id},{known:this.checked})" title="Known tower"></td><td onclick="event.stopPropagation()"><input type="checkbox" ${t.ignored?'checked':''} onchange="patchTower(${t.id},{ignored:this.checked})" title="Ignored tower"></td>${admin?`<td onclick="event.stopPropagation()"><button class="ghost" onclick="deleteTower(${t.id})">Delete</button></td>`:''}</tr>`).join('');
 }
+function renderAnomalyTable(){
+  const id='anomalyTable', sorted=sortTowerItems(anomalyTableItems,id);
+  const headers=[
+    '<th>Map</th>',
+    sortHeader(id,'bayes_post_p','Bayes'),
+    sortHeader(id,'rule_score','Rules'),
+    sortHeader(id,'count','Seen'),
+    sortHeader(id,'operator','Operator'),
+    sortHeader(id,'rat','RAT'),
+    sortHeader(id,'tac_lac','TAC/LAC'),
+    sortHeader(id,'cell_id','Cell ID'),
+    '<th>Triggered anomalies</th>'
+  ].join('');
+  document.getElementById(id).innerHTML=`<tr>${headers}</tr>`+sorted.map(t=>`<tr><td><button class="ghost" onclick="showTowerOnMap(${t.id},event)">Show</button></td><td class="score">${pct(t.bayes_post_p)}</td><td class="score">${Number(t.rule_score||0).toFixed(2)}</td><td>${t.count}</td><td>${esc(t.operator)}</td><td>${esc(t.rat)}</td><td><code>${esc(t.tac_lac)}</code></td><td><code>${esc(t.cell_id)}</code></td><td><div class="pillbar">${(t.triggered_anomalies||[]).map(m=>`<span class="tag-badge" title="${esc(m.why||'')}">${esc(m.label)} <code>+${Number(m.delta_logodds||0).toFixed(2)}</code></span>`).join('')}</div></td></tr>`).join('');
+}
 function setTowerMetaStatus(kind,text){
   const el=document.getElementById('towerMetaStatus'); if(!el) return;
   el.textContent=text||'';
@@ -4337,7 +4610,7 @@ function setTowerMetaStatus(kind,text){
 }
 async function patchTower(id,obj,opts={}){
   await api('/api/admin/towers/'+id,{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify(obj)});
-  await loadTowers(); await loadTowerTable(); await loadAdmin();
+  await loadTowers(); await loadTowerTable(); await loadAnomalyTable(); await loadAdmin();
   if(opts.reloadDrawer) await openTower(id);
 }
 async function saveTowerMetadata(id){
@@ -4354,7 +4627,7 @@ async function saveTowerMetadata(id){
     setTowerMetaStatus('error',`Save failed: ${e&&e.message?e.message:String(e)}`);
   }
 }
-async function deleteTower(id){if(confirm('Delete tower and observations?')){await api('/api/admin/towers/'+id,{method:'DELETE'}); await loadAdmin(); await loadTowerTable(); await loadTowers();}}
+async function deleteTower(id){if(confirm('Delete tower and observations?')){await api('/api/admin/towers/'+id,{method:'DELETE'}); await loadAdmin(); await loadTowerTable(); await loadAnomalyTable(); await loadTowers();}}
 async function loadMethods(){const d=await api('/api/methods'); window.__helpGlossary=d.glossary||{}; appConfig={...(d.app_config||{})}; appConfigHelp={...(d.app_config_help||{})}; renderAppConfigPanel(appConfig, appConfigHelp); document.getElementById('methodsList').innerHTML=d.methods.map(m=>`<div class="card method-row"><h3>${esc(m.label)}</h3><p>${esc(m.help)}</p><label><input type="checkbox" data-mid="${m.id}" data-field="enabled" ${m.enabled?'checked':''}> enabled</label><br><label>Weight <input data-mid="${m.id}" data-field="weight" type="number" step="0.1" value="${m.weight}"></label><p><b>Equation:</b> <code>${esc(m.equation)}</code></p><p><b>Variables:</b> ${(m.variables||[]).map(v=>`<code title="${esc(d.glossary[v]||'')}">${esc(v)}</code>`).join(' ')}</p><textarea data-mid="${m.id}" data-field="thresholds">${esc(JSON.stringify(m.thresholds,null,2))}</textarea></div>`).join('')}
 let importStatusPollTimer=null;
 function stopImportStatusPolling(){
@@ -4417,7 +4690,7 @@ async function recompute(origin='general'){
     if(origin==='imports') setStatusLine('importsStatus','working','Recomputing tower features and scores…');
     else setMethodsStatus('working','Recomputing tower features and scores…');
     const r=await api('/api/recompute',{method:'POST'});
-    await loadTowers(); await loadTowerTable(); await loadAdmin(); await loadStats();
+    await loadTowers(); await loadTowerTable(); await loadAnomalyTable(); await loadAdmin(); await loadStats();
     const msg=`Recomputed ${formatInt(r.updated_towers||0)} towers.`;
     if(origin==='imports') setStatusLine('importsStatus','success',msg);
     else setMethodsStatus('success',msg);
@@ -4447,7 +4720,7 @@ async function doImport(){
       : `Import complete: ${formatInt(r.files_imported||0)} file(s) imported, ${formatInt(r.files_skipped||0)} skipped, ${formatInt(r.new_towers||0)} new towers added.`;
     setStatusLine('importsStatus', r.error ? 'error' : ((r.files_imported||0) ? 'success' : 'warn'), msg);
     renderImportProgressMeta({message:msg});
-    await loadStats(); await loadImports(); await loadTowers(); await loadTowerTable(); await loadAdmin();
+    await loadStats(); await loadImports(); await loadTowers(); await loadTowerTable(); await loadAnomalyTable(); await loadAdmin();
   }catch(e){
     const msg=`Import failed: ${e&&e.message?e.message:String(e)}`;
     setStatusLine('importsStatus','error',msg);
@@ -4478,7 +4751,7 @@ async function uploadImport(){
     renderImportProgressMeta({message:msg});
     document.getElementById('uploadFiles').value='';
     document.getElementById('uploadSelection').textContent='No files selected.';
-    await loadStats(); await loadImports(); await loadTowers(); await loadTowerTable(); await loadAdmin();
+    await loadStats(); await loadImports(); await loadTowers(); await loadTowerTable(); await loadAnomalyTable(); await loadAdmin();
   }catch(e){
     const msg=`Upload import failed: ${e&&e.message?e.message:String(e)}`;
     setStatusLine('importsStatus','error',msg);
@@ -4495,7 +4768,8 @@ document.querySelectorAll('.nav button').forEach(b=>b.onclick=()=>{document.quer
 document.getElementById('uploadFiles').addEventListener('change',e=>{const files=[...(e.target.files||[])]; document.getElementById('uploadSelection').textContent=files.length?files.map(f=>`${f.name} (${formatBytes(f.size)})`).join(' · '):'No files selected.'});
 renderImportResult(null);
 document.getElementById('mapSearch').addEventListener('keydown',e=>{if(e.key==='Enter')loadTowers()});
-initMap(); initDrawerUX(); loadTowers(); loadMethods(); loadStats(); loadImports(); loadHelp(); loadTowerTable(); loadAdmin(); refreshImportStatus();
+document.getElementById('anomalySearch').addEventListener('keydown',e=>{if(e.key==='Enter')loadAnomalyTable()});
+initMap(); initDrawerUX(); loadTowers(); loadMethods(); loadStats(); loadImports(); loadHelp(); loadTowerTable(); loadAnomalyTable(); loadAdmin(); refreshImportStatus();
 </script>
 </body></html>"""
 
@@ -4689,6 +4963,72 @@ def create_app(db_path: str):
         with connect_db(db_path) as con:
             rows = con.execute(sql, (*params, limit, int(offset))).fetchall()
         return {"items": [tower_payload(r) for r in rows], "limit": limit, "offset": offset}
+
+    @app.get("/api/anomaly-towers")
+    def api_anomaly_towers(
+        q: str = "",
+        method_id: str = "",
+        include_ignored: int = 0,
+    ) -> Dict[str, Any]:
+        clauses = ["1=1"]
+        if not include_ignored:
+            clauses.append("t.ignored=0")
+        sql = f"""
+          SELECT t.*, f.* FROM towers t
+          LEFT JOIN tower_features f ON f.tower_id=t.id
+          WHERE {' AND '.join(clauses)}
+          ORDER BY COALESCE(f.bayes_post_p,0) DESC, COALESCE(f.rule_score,0) DESC
+        """
+        method_counts: Counter = Counter()
+        items: List[Dict[str, Any]] = []
+        with connect_db(db_path) as con:
+            rows = con.execute(sql).fetchall()
+        query = q.strip().lower()
+        for row in rows:
+            payload = tower_payload(row)
+            anomalies = [
+                method for method in payload.get("methods", [])
+                if method.get("triggered")
+                and method.get("direction") == "up"
+                and float(method.get("delta_logodds") or 0.0) > 0.0
+            ]
+            tower_search_values = [
+                payload.get("label"),
+                payload.get("operator"),
+                payload.get("rat"),
+                payload.get("tac_lac"),
+                payload.get("cell_id"),
+                payload.get("pci"),
+                payload.get("earfcn"),
+                payload.get("notes"),
+                payload.get("analysis_status"),
+            ]
+            anomaly_search_values = [
+                value
+                for method in anomalies
+                for value in (method.get("id"), method.get("label"))
+            ]
+            if query and not any(query in str(value or "").lower() for value in tower_search_values + anomaly_search_values):
+                continue
+            for method in anomalies:
+                method_counts[str(method.get("id") or "")] += 1
+            if method_id and not any(str(method.get("id") or "") == method_id for method in anomalies):
+                continue
+            if not anomalies:
+                continue
+            payload["triggered_anomalies"] = anomalies
+            items.append(payload)
+        available_methods = [
+            {
+                "id": str(method["id"]),
+                "label": method["label"],
+                "count": int(method_counts.get(str(method["id"]), 0)),
+            }
+            for method in METHOD_REGISTRY
+            if method.get("direction") == "up"
+        ]
+        available_methods.sort(key=lambda method: (-int(method["count"]), str(method["label"])))
+        return {"items": items, "available_methods": available_methods}
 
     @app.get("/api/towers/{tower_id}")
     def api_tower(tower_id: int) -> Dict[str, Any]:
