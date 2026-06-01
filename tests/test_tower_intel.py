@@ -135,6 +135,69 @@ class TowerIntelTests(unittest.TestCase):
             after = con.execute("SELECT bayes_post_p FROM tower_features").fetchone()[0]
         self.assertGreater(after, before)
 
+    def test_new_area_code_in_well_covered_place_triggers_for_locally_unseen_tac(self):
+        rows = []
+        for i in range(50):
+            day = 1 if i < 25 else 2
+            minute = i % 25
+            rows.append({
+                "timestamp_utc": f"2027-01-0{day}T12:{minute:02d}:00Z",
+                "location": {"lat": 50.0, "lon": 14.0},
+                "network": {
+                    "cops_current": {"operator": "TestNet"},
+                    "csq": {"rssi_dbm": -72},
+                },
+                "towers": [{
+                    "rat": "LTE",
+                    "tac_lac": 100,
+                    "cell_id": 456,
+                    "pci": 7,
+                    "earfcn": 1400,
+                    "rsrp": -92,
+                }],
+            })
+        for i in range(6):
+            rows.append({
+                "timestamp_utc": f"2027-01-03T12:{i:02d}:00Z",
+                "location": {"lat": 50.0, "lon": 14.0},
+                "network": {
+                    "cops_current": {"operator": "TestNet"},
+                    "csq": {"rssi_dbm": -70},
+                },
+                "towers": [{
+                    "rat": "LTE",
+                    "tac_lac": 200,
+                    "cell_id": 789,
+                    "pci": 8,
+                    "earfcn": 1400,
+                    "rsrp": -89,
+                }],
+            })
+        write_jsonl(self.log, rows)
+        intel.ingest_files(self.db, [str(self.log)])
+        intel.recompute(self.db, sample_size=200)
+
+        with intel.connect_db(self.db) as con:
+            row = con.execute(
+                """
+                SELECT f.features_json, f.methods_json
+                FROM tower_features f
+                JOIN towers t ON t.id=f.tower_id
+                WHERE t.operator=? AND t.rat=? AND t.tac_lac=? AND t.cell_id=?
+                """,
+                ("TestNet", "LTE", 200, 789),
+            ).fetchone()
+        self.assertIsNotNone(row)
+        features = json.loads(row["features_json"])
+        methods = json.loads(row["methods_json"])
+        method = next(m for m in methods if m["id"] == "new_area_code_in_well_covered_place")
+
+        self.assertTrue(method["triggered"])
+        self.assertGreater(features["new_area_code_prior_same_rat_count"], 40)
+        self.assertEqual(features["new_area_code_prior_same_code_count"], 0)
+        self.assertEqual(features["new_area_code_prior_dominant_code"], 100)
+        self.assertGreater(features["new_area_code_prior_dominant_frac"], 0.9)
+
     def test_method_xai_rows_explain_equation_thresholds_and_effects(self):
         intel.init_db(self.db)
         with intel.connect_db(self.db) as con:
@@ -163,6 +226,32 @@ class TowerIntelTests(unittest.TestCase):
         self.assertGreater(rows["odds_multiplier"]["value"], 1.0)
         self.assertIn("clamp", enriched["equation_note"])
         self.assertIn("Requires", enriched["trigger_summary"])
+
+    def test_non_triggered_method_does_not_change_score(self):
+        intel.init_db(self.db)
+        with intel.connect_db(self.db) as con:
+            settings = intel.get_method_settings(con)
+        features = {
+            "rat": "LTE",
+            "count": 1,
+            "new_place_count": 1,
+            "new_place_prior_count": 500,
+            "new_place_prior_days": 5,
+        }
+        methods, bayes, rule_score, post = intel.evaluate_methods(
+            features,
+            settings,
+            mostly_lte=True,
+            known=False,
+            ignored=False,
+        )
+        method = next(m for m in methods if m["id"] == "new_in_well_covered_place")
+        self.assertFalse(method["triggered"])
+        self.assertEqual(method["norm01"], 0.0)
+        self.assertEqual(method["delta_logodds"], 0.0)
+        self.assertEqual(rule_score, 0.0)
+        self.assertAlmostEqual(post, bayes["posterior"])
+        self.assertEqual(bayes["total_delta_logodds"], 0.0)
 
     def test_get_method_settings_is_read_only_under_foreign_write_lock(self):
         intel.init_db(self.db)
@@ -370,6 +459,34 @@ class TowerIntelTests(unittest.TestCase):
         tag_match = client.get("/api/towers", params={"q": "under analysis", "include_ignored": 1}).json()["items"]
         self.assertEqual(len(tag_match), 1)
         self.assertEqual(tag_match[0]["id"], tower_id)
+
+    @unittest.skipIf(TestClient is None, "FastAPI test client not available")
+    def test_api_anomaly_towers_filters_by_triggered_positive_method(self):
+        write_jsonl(self.log, self.make_rows())
+        intel.ingest_files(self.db, [str(self.log)])
+        intel.recompute(self.db, sample_size=100)
+        app = intel.create_app(self.db)
+        client = TestClient(app)
+
+        payload = client.get("/api/anomaly-towers").json()
+        self.assertEqual(len(payload["items"]), 1)
+        tower = payload["items"][0]
+        triggered = tower["triggered_anomalies"]
+        self.assertTrue(triggered)
+        self.assertTrue(all(m["triggered"] and m["direction"] == "up" for m in triggered))
+
+        method_id = triggered[0]["id"]
+        filtered = client.get("/api/anomaly-towers", params={"method_id": method_id}).json()
+        self.assertEqual([item["id"] for item in filtered["items"]], [tower["id"]])
+        self.assertIn(method_id, {method["id"] for method in filtered["available_methods"]})
+
+        label_query = triggered[0]["label"].split()[0]
+        searched = client.get("/api/anomaly-towers", params={"q": label_query}).json()
+        self.assertEqual([item["id"] for item in searched["items"]], [tower["id"]])
+
+        id_query = method_id.replace("_", " ").split()[0]
+        searched = client.get("/api/anomaly-towers", params={"q": id_query}).json()
+        self.assertEqual([item["id"] for item in searched["items"]], [tower["id"]])
 
     @unittest.skipIf(TestClient is None, "FastAPI test client not available")
     def test_api_points_include_raw_point_payloads(self):
