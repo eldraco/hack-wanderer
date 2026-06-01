@@ -281,10 +281,22 @@ Useful endpoints:
 - `GET /api/anomaly-towers`: all towers with triggered positive anomaly evidence, with optional search and method filtering.
 - `GET /api/towers/{id}`: full tower profile.
 - `GET /api/towers/{id}/points`: raw, stationary, bad GPS, clusters, place buckets, center.
+- `POST /api/towers/{id}/wigle-enrich`: optional click-only WiGLE lookup using server-side credentials from `.env`.
 - `GET/PUT /api/methods`: read/edit method settings.
 - `GET/PUT /api/config`: read/edit global configuration such as the altitude discount model.
 - `GET/PUT/DELETE /api/admin/towers/{id}`: edit/delete towers.
 - `GET /api/help`: method and variable glossary.
+
+The tower drawer has a **Check WiGLE** button. Set `WIGLE_API_NAME` and `WIGLE_API_TOKEN`
+in `.env` to enable it. Successful lookups are stored in SQLite and shown automatically
+when the tower drawer is reopened. Use **Refresh WiGLE** to explicitly ask WiGLE again.
+The credentials stay on the server; the browser receives only the lookup result. Tesco
+Mobile and O2 Czech operator labels are mapped to PLMN `23002`.
+
+Stored WiGLE checks also feed two editable Bayes/XAI methods:
+
+- **Absent from checked WiGLE records** raises suspicion when an explicit lookup found no exact match.
+- **Historical WiGLE presence** lowers suspicion. Older first appearance and more recent last appearance strengthen that normality evidence.
 
 ## Maintenance
 
