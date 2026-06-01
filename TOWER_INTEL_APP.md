@@ -127,6 +127,10 @@ Terminology note: a **place bucket** is a small local area bucketed from GPS usi
 
 Search and sort the tower list by operator, RAT, TAC/LAC, cell ID, PCI, EARFCN, count, and score. Click a row to open the same tower detail drawer.
 
+### Anomalies
+
+Browse every tower that currently triggers positive anomaly evidence. Search tower identifiers, notes, tags, anomaly names, and anomaly method IDs, or filter the table to one anomaly method. Each row lists its triggered methods and their score contributions. Ignored towers are hidden unless explicitly included.
+
 ### Methods
 
 Each anomaly method is data-driven:
@@ -274,6 +278,7 @@ Useful endpoints:
 - `POST /api/import`: import local paths or uploaded JSONL files.
 - `POST /api/recompute`: recompute all derived evidence.
 - `GET /api/towers`: searchable tower list.
+- `GET /api/anomaly-towers`: all towers with triggered positive anomaly evidence, with optional search and method filtering.
 - `GET /api/towers/{id}`: full tower profile.
 - `GET /api/towers/{id}/points`: raw, stationary, bad GPS, clusters, place buckets, center.
 - `GET/PUT /api/methods`: read/edit method settings.
