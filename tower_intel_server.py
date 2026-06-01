@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import datetime as dt
 import hashlib
 import html
@@ -26,6 +27,9 @@ import sys
 import threading
 import time
 import textwrap
+import urllib.error
+import urllib.parse
+import urllib.request
 import zipfile
 from collections import Counter, defaultdict
 from dataclasses import asdict
@@ -103,6 +107,11 @@ GLOBAL_CONFIG_HELP: Dict[str, str] = {
 }
 
 ANALYSIS_STATUS_VALUES = ("", "under analysis", "analyzed", "benign", "suspicious", "CSS")
+WIGLE_CELL_SEARCH_URL = "https://api.wigle.net/api/v2/cell/search"
+WIGLE_OPERATOR_ALIASES = {
+    "tesco mobile": "23002",
+    "o2 czech": "23002",
+}
 
 # SQLite allows only one writer. Imports and recompute are write-heavy, so we
 # serialize them at the app layer to avoid "database is locked" crashes.
@@ -135,6 +144,164 @@ def json_loads(text: Optional[str], default: Any = None) -> Any:
         return json.loads(text)
     except Exception:
         return default
+
+
+def load_local_env(path: Optional[Path] = None) -> None:
+    env_path = path or (Path(__file__).resolve().parent / ".env")
+    if not env_path.exists():
+        return
+    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        if key:
+            os.environ.setdefault(key, value)
+
+
+def infer_wigle_cell_op(operator: Any) -> Optional[str]:
+    text = str(operator or "").strip()
+    numeric = re.search(r"(?<!\d)(\d{5,6})(?!\d)", text)
+    if numeric:
+        return numeric.group(1)
+    lowered = text.lower()
+    for alias, cell_op in WIGLE_OPERATOR_ALIASES.items():
+        if alias in lowered:
+            return cell_op
+    return None
+
+
+def get_wigle_enrichment(con: sqlite3.Connection, tower_id: int) -> Optional[Dict[str, Any]]:
+    row = con.execute(
+        "SELECT checked_at,result_json FROM wigle_enrichments WHERE tower_id=?",
+        (int(tower_id),),
+    ).fetchone()
+    if not row:
+        return None
+    result = json_loads(row["result_json"], {})
+    if not isinstance(result, dict):
+        return None
+    result["checked_at"] = row["checked_at"]
+    result["cached"] = True
+    return result
+
+
+def apply_wigle_features(features: Dict[str, Any], enrichment: Optional[Dict[str, Any]]) -> None:
+    features["wigle_checked"] = bool(enrichment)
+    features["wigle_exists"] = bool(enrichment and enrichment.get("exists"))
+    features["wigle_match_count"] = int(enrichment.get("match_count") or 0) if enrichment else 0
+    features["wigle_first_seen"] = None
+    features["wigle_last_seen"] = None
+    features["wigle_first_seen_age_days"] = None
+    features["wigle_last_seen_age_days"] = None
+    if not enrichment or not enrichment.get("exists"):
+        return
+    checked = parse_time(str(enrichment.get("checked_at") or ""))
+    checked_ts = to_epoch_seconds(checked) if checked else None
+    first_values: List[Tuple[float, str]] = []
+    last_values: List[Tuple[float, str]] = []
+    for result in enrichment.get("results") or []:
+        if not isinstance(result, dict):
+            continue
+        first_text = str(result.get("firsttime") or "")
+        first = parse_time(first_text) if first_text else None
+        first_ts = to_epoch_seconds(first) if first else None
+        if isinstance(first_ts, (int, float)):
+            first_values.append((float(first_ts), first_text))
+        last_text = str(result.get("lasttime") or result.get("lastupdt") or "")
+        last = parse_time(last_text) if last_text else None
+        last_ts = to_epoch_seconds(last) if last else None
+        if isinstance(last_ts, (int, float)):
+            last_values.append((float(last_ts), last_text))
+    if first_values:
+        first_ts, first_text = min(first_values)
+        features["wigle_first_seen"] = first_text
+        if isinstance(checked_ts, (int, float)):
+            features["wigle_first_seen_age_days"] = max(0.0, (float(checked_ts) - first_ts) / 86400.0)
+    if last_values:
+        last_ts, last_text = max(last_values)
+        features["wigle_last_seen"] = last_text
+        if isinstance(checked_ts, (int, float)):
+            features["wigle_last_seen_age_days"] = max(0.0, (float(checked_ts) - last_ts) / 86400.0)
+
+
+def wigle_enrich_tower(db_path: str, tower_id: int, *, refresh: bool = False) -> Dict[str, Any]:
+    load_local_env()
+    with connect_db(db_path) as con:
+        if not refresh:
+            cached = get_wigle_enrichment(con, tower_id)
+            if cached is not None:
+                return cached
+        tower = con.execute(
+            "SELECT id,operator,rat,tac_lac,cell_id,pci,earfcn FROM towers WHERE id=?",
+            (int(tower_id),),
+        ).fetchone()
+    if not tower:
+        raise KeyError("tower not found")
+    if tower["tac_lac"] is None or tower["cell_id"] is None:
+        raise ValueError("WiGLE enrichment requires TAC/LAC and Cell ID.")
+    api_name = os.environ.get("WIGLE_API_NAME") or os.environ.get("WIGLE_NAME")
+    api_token = os.environ.get("WIGLE_API_TOKEN") or os.environ.get("WIGLE_KEY")
+    if not api_name or not api_token:
+        raise RuntimeError("WiGLE enrichment is not configured. Set WIGLE_API_NAME and WIGLE_API_TOKEN in .env.")
+
+    cell_op = infer_wigle_cell_op(tower["operator"])
+    params = {
+        "cell_net": str(tower["tac_lac"]),
+        "cell_id": str(tower["cell_id"]),
+        "resultsPerPage": "100",
+    }
+    if cell_op:
+        params["cell_op"] = cell_op
+    url = f"{WIGLE_CELL_SEARCH_URL}?{urllib.parse.urlencode(params)}"
+    basic = base64.b64encode(f"{api_name}:{api_token}".encode("utf-8")).decode("ascii")
+    request = urllib.request.Request(url, headers={"Accept": "application/json", "Authorization": f"Basic {basic}"})
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", "replace")
+        raise RuntimeError(f"WiGLE request failed with HTTP {exc.code}: {detail}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"WiGLE request failed: {exc.reason}") from exc
+
+    results = payload.get("results") if isinstance(payload, dict) else []
+    if not isinstance(results, list):
+        results = []
+    expected_id = f"{cell_op}_{tower['tac_lac']}_{tower['cell_id']}" if cell_op else None
+    exact_results = [result for result in results if not expected_id or str(result.get("id") or "") == expected_id]
+    checked_at = utc_now()
+    result = {
+        "configured": True,
+        "exists": bool(exact_results),
+        "match_count": len(exact_results),
+        "wigle_total_results": int(payload.get("totalResults") or len(results)),
+        "query": {
+            "cell_op": cell_op,
+            "cell_net": tower["tac_lac"],
+            "cell_id": tower["cell_id"],
+        },
+        "results": exact_results,
+        "checked_at": checked_at,
+        "cached": False,
+    }
+    with connect_db(db_path) as con:
+        con.execute(
+            """
+            INSERT INTO wigle_enrichments(tower_id,checked_at,result_json)
+            VALUES (?,?,?)
+            ON CONFLICT(tower_id) DO UPDATE SET
+              checked_at=excluded.checked_at,
+              result_json=excluded.result_json
+            """,
+            (int(tower_id), checked_at, json_dumps(result)),
+        )
+        con.commit()
+    return result
 
 
 def import_status_snapshot() -> Dict[str, Any]:
@@ -464,6 +631,13 @@ CREATE TABLE IF NOT EXISTS tower_features (
   FOREIGN KEY(tower_id) REFERENCES towers(id) ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS wigle_enrichments (
+  tower_id INTEGER PRIMARY KEY,
+  checked_at TEXT NOT NULL,
+  result_json TEXT NOT NULL,
+  FOREIGN KEY(tower_id) REFERENCES towers(id) ON DELETE CASCADE
+);
+
 CREATE TABLE IF NOT EXISTS anomaly_methods (
   id TEXT PRIMARY KEY,
   label TEXT NOT NULL,
@@ -643,6 +817,17 @@ VARIABLE_GLOSSARY: Dict[str, str] = {
     "min_days": "Minimum number of distinct days required before the stability method can lower suspicion.",
     "days_start": "Distinct-day count where the many-days negative evidence starts to reduce suspicion.",
     "days_full": "Distinct-day count where the many-days negative evidence reaches full configured strength.",
+    "wigle_checked": "Whether this tower has been explicitly checked against WiGLE and stored locally.",
+    "wigle_exists": "Whether the stored WiGLE lookup found an exact PLMN/TAC-LAC/Cell-ID match.",
+    "wigle_match_count": "Number of exact WiGLE records stored for this tower.",
+    "wigle_first_seen": "Earliest first-seen timestamp among exact stored WiGLE matches.",
+    "wigle_last_seen": "Most recent last-seen timestamp among exact stored WiGLE matches.",
+    "wigle_first_seen_age_days": "Days between the WiGLE check and the earliest stored WiGLE first-seen timestamp. Older records are stronger normality evidence.",
+    "wigle_last_seen_age_days": "Days between the WiGLE check and the most recent stored WiGLE last-seen timestamp. Smaller values are stronger normality evidence.",
+    "first_age_start_days": "WiGLE first-seen age where historical-presence normality evidence starts.",
+    "first_age_full_days": "WiGLE first-seen age where the historical-age component reaches full strength.",
+    "last_age_full_days": "WiGLE last-seen recency at or below which the recency component has full strength.",
+    "last_age_max_days": "WiGLE last-seen age at or above which the recency component contributes no normality evidence.",
 }
 
 
@@ -863,6 +1048,41 @@ METHOD_REGISTRY: List[Dict[str, Any]] = [
         "map_layers": [],
     },
     {
+        "id": "wigle_absent",
+        "label": "Absent from checked WiGLE records",
+        "direction": "up",
+        "weight": 1.5,
+        "thresholds": {},
+        "variables": ["wigle_checked", "wigle_exists", "wigle_match_count"],
+        "equation": "norm01 = 1 when WiGLE was checked and returned no exact PLMN/TAC-LAC/Cell-ID match.",
+        "help": "External-database evidence. After an explicit WiGLE lookup, an exact-match absence raises suspicion. WiGLE coverage is incomplete, so this is evidence rather than proof.",
+        "map_layers": [],
+    },
+    {
+        "id": "wigle_historical_presence",
+        "label": "Historical WiGLE presence",
+        "direction": "down",
+        "weight": 2.0,
+        "thresholds": {
+            "first_age_start_days": 90,
+            "first_age_full_days": 730,
+            "last_age_full_days": 90,
+            "last_age_max_days": 730,
+        },
+        "variables": [
+            "wigle_checked",
+            "wigle_exists",
+            "wigle_match_count",
+            "wigle_first_seen",
+            "wigle_last_seen",
+            "wigle_first_seen_age_days",
+            "wigle_last_seen_age_days",
+        ],
+        "equation": "norm01 = clamp((wigle_first_seen_age_days - first_age_start_days) / (first_age_full_days - first_age_start_days), 0, 1) * clamp((last_age_max_days - wigle_last_seen_age_days) / (last_age_max_days - last_age_full_days), 0, 1); contribution is negative.",
+        "help": "External-database normality evidence. An exact WiGLE match lowers suspicion more when it was first recorded long ago and was also seen recently.",
+        "map_layers": [],
+    },
+    {
         "id": "stability",
         "label": "Stability evidence",
         "direction": "down",
@@ -993,6 +1213,30 @@ METHOD_XAI_SPECS: Dict[str, Dict[str, Any]] = {
             ("Equation", "dist_outlier_frac"),
             ("Equation", "frac_start"),
             ("Equation", "frac_full"),
+        ],
+    },
+    "wigle_absent": {
+        "trigger_summary": "Requires an explicit stored WiGLE lookup with no exact PLMN/TAC-LAC/Cell-ID match.",
+        "rows": [
+            ("Gate", "wigle_checked"),
+            ("Gate", "wigle_exists"),
+            ("Context", "wigle_match_count"),
+        ],
+    },
+    "wigle_historical_presence": {
+        "trigger_summary": "Requires an explicit stored WiGLE lookup with an exact match. Older first appearance and more recent last appearance increase the normality evidence.",
+        "rows": [
+            ("Gate", "wigle_checked"),
+            ("Gate", "wigle_exists"),
+            ("Context", "wigle_match_count"),
+            ("Context", "wigle_first_seen"),
+            ("Context", "wigle_last_seen"),
+            ("Equation", "wigle_first_seen_age_days"),
+            ("Equation", "first_age_start_days"),
+            ("Equation", "first_age_full_days"),
+            ("Equation", "wigle_last_seen_age_days"),
+            ("Equation", "last_age_full_days"),
+            ("Equation", "last_age_max_days"),
         ],
     },
     "stationary_signal_mad": {
@@ -1686,6 +1930,31 @@ def evaluate_methods(
     rat = str(features.get("rat") or "").upper()
     n = 1.0 if rat in {"GSM", "2G"} and mostly_lte else 0.0
     total_delta += add_method_result(results, m(mid), context, n, n > 0, "This is a non-LTE tower in a mostly-LTE dataset.")
+
+    mid = "wigle_absent"
+    checked = bool(features.get("wigle_checked"))
+    exists = bool(features.get("wigle_exists"))
+    n = 1.0 if checked and not exists else 0.0
+    total_delta += add_method_result(results, m(mid), context, n, n > 0, "An explicit WiGLE lookup found no exact PLMN/TAC-LAC/Cell-ID match.")
+
+    mid = "wigle_historical_presence"
+    first_age = features.get("wigle_first_seen_age_days")
+    last_age = features.get("wigle_last_seen_age_days")
+    historical_n = norm_range(first_age, th(mid, "first_age_start_days", 90), th(mid, "first_age_full_days", 730))
+    recent_n = 0.0
+    last_age_full = float(th(mid, "last_age_full_days", 90))
+    last_age_max = float(th(mid, "last_age_max_days", 730))
+    if isinstance(last_age, (int, float)) and last_age_max != last_age_full:
+        recent_n = clamp01((last_age_max - float(last_age)) / (last_age_max - last_age_full))
+    n = historical_n * recent_n
+    total_delta += add_method_result(
+        results,
+        m(mid),
+        context,
+        n,
+        bool(checked and exists and n > 0),
+        "An exact WiGLE record lowers suspicion more when its first appearance is older and its latest appearance is recent.",
+    )
 
     mid = "stability"
     n = clamp01(float(features.get("stability_bonus") or 0.0) / 1.5)
@@ -2975,6 +3244,7 @@ def recompute(
             tower_row = tower_rows.get(tid)
             known = bool(tower_row["known"]) if tower_row else False
             ignored = bool(tower_row["ignored"]) if tower_row else False
+            apply_wigle_features(agg.features, get_wigle_enrichment(con, tid))
             methods, bayes, rule_score, post = evaluate_methods(agg.features, settings, mostly_lte=mostly_lte, known=known, ignored=ignored)
             con.execute(
                 """
@@ -3424,6 +3694,7 @@ def recompute_one_tower(db_path: str, tower_id: int, *, sample_size: int = 2500)
         mostly_lte = bool(global_stats.get("mostly_lte"))
         known = bool(tower_row["known"])
         ignored = bool(tower_row["ignored"])
+        apply_wigle_features(agg.features, get_wigle_enrichment(con, tower_id))
         methods, bayes, rule_score2, post = evaluate_methods(agg.features, settings, mostly_lte=mostly_lte, known=known, ignored=ignored)
 
         now = utc_now()
@@ -4314,7 +4585,8 @@ function renderMapTowers(fit){
 	  document.getElementById('drawerBody').innerHTML=`
 	    <div class="pillbar"><button class="ghost" onclick="showPoints(${t.id},'all')" title="Overlay all good-GPS observation points for this tower (blue).">Obs points</button><button class="ghost" onclick="showPoints(${t.id},'raw')" title="Overlay all good-GPS observation points for this tower as small green dots.">Raw obs</button><button class="ghost" onclick="showPoints(${t.id},'stationary')" title="Overlay only stationary observations for this tower (green).">Stationary</button><button class="ghost" onclick="showPoints(${t.id},'bad')" title="Overlay excluded bad-GPS observations (orange).">Bad GPS</button><button class="ghost" onclick="showPoints(${t.id},'clusters')" title="Show cluster centers/radii used by multi-location methods.">Clusters</button><button class="ghost" onclick="showPoints(${t.id},'places')" title="Show place buckets (z17 tiles) where this tower was seen.">Place buckets</button><button class="ghost" onclick="clearOverlays()" title="Clear overlay layers.">Clear overlays</button></div>
 	    ${bucketExplainerHtml()}
-	    <div class="pillbar"><a class="badge" href="/api/towers/${t.id}/export.md">Export MD</a><a class="badge" href="/api/towers/${t.id}/export.docx">Export DOCX</a><button class="ghost" onclick="recomputeOneTower(${t.id})">Recompute this tower</button><span id="towerRecomputeStatus" class="small"></span></div>
+	    <div class="pillbar"><a class="badge" href="/api/towers/${t.id}/export.md">Export MD</a><a class="badge" href="/api/towers/${t.id}/export.docx">Export DOCX</a><button class="ghost" onclick="recomputeOneTower(${t.id})">Recompute this tower</button><button id="wigleEnrichButton" class="ghost" onclick="enrichTowerWithWigle(${t.id},${Boolean(t.wigle_enrichment)})">${t.wigle_enrichment?'Refresh WiGLE':'Check WiGLE'}</button><span id="towerRecomputeStatus" class="small"></span></div>
+      <div id="wigleEnrichmentBox"></div>
 	    <div class="meta-editor">
 	      <h3 style="margin-top:0">Tower review metadata</h3>
 	      <div class="meta-grid">
@@ -4346,12 +4618,36 @@ function renderMapTowers(fit){
       <div id="obsListBox"><p class="small">Press “Load table” to list this tower’s observation points here.</p></div>
       <div class="pillbar" style="justify-content:space-between;align-items:center"><h3 style="margin:0">XAI score breakdown</h3><button class="ghost" onclick="toggleDrawerMethods()">${esc(toggleLabel)}</button></div>
       ${shownMethods.map(renderMethod).join('') || '<p class="small">No methods to show.</p>'}`;
+      renderWigleEnrichment(t.wigle_enrichment);
     }
 
 function setTowerRecomputeStatus(kind,text){
   const el=document.getElementById('towerRecomputeStatus'); if(!el) return;
   el.textContent=text||'';
   el.style.color = kind==='error' ? '#b91c1c' : kind==='success' ? '#15803d' : kind==='working' ? '#1d4ed8' : '#64748b';
+}
+function renderWigleEnrichment(data){
+  const box=document.getElementById('wigleEnrichmentBox'); if(!box) return;
+  if(!data){box.innerHTML=''; return;}
+  if(data.loading){box.innerHTML='<div class="card"><h3>WiGLE enrichment</h3><p class="small">Checking WiGLE…</p></div>'; return;}
+  if(data.error){box.innerHTML=`<div class="card"><h3>WiGLE enrichment</h3><p class="small" style="color:#b91c1c">${esc(data.error)}</p></div>`; return;}
+  const q=data.query||{};
+  const rows=(data.results||[]).map(r=>`<tr><td><code>${esc(r.id||'')}</code></td><td>${esc(r.ssid||'')}</td><td>${esc(r.gentype||'')}</td><td>${esc(r.channel??'')}</td><td>${esc(r.qos??'')}</td><td>${esc(r.firsttime||'')}</td><td>${esc(r.lasttime||'')}</td></tr>`).join('');
+  const summary=data.exists?`Confirmed: ${data.match_count} exact WiGLE match${data.match_count===1?'':'es'}.`:`No exact WiGLE match found.`;
+  box.innerHTML=`<div class="card"><h3>WiGLE enrichment</h3><p><b>${esc(summary)}</b></p><p class="small">Queried PLMN/operator <code>${esc(q.cell_op??'not inferred')}</code>, TAC/LAC <code>${esc(q.cell_net??'')}</code>, Cell ID <code>${esc(q.cell_id??'')}</code>. WiGLE returned ${esc(data.wigle_total_results??0)} candidate result(s). Checked <code>${esc(data.checked_at||'')}</code>${data.cached?' (stored result)':''}.</p>${rows?`<div class="term-table-wrap"><table><tr><th>WiGLE ID</th><th>Network</th><th>Type</th><th>Channel</th><th>QoS</th><th>First seen</th><th>Last seen</th></tr>${rows}</table></div>`:''}</div>`;
+}
+async function enrichTowerWithWigle(towerId,refresh=false){
+  renderWigleEnrichment({loading:true});
+  try{
+    const result=await api(`/api/towers/${towerId}/wigle-enrich?refresh=${refresh?1:0}`,{method:'POST'});
+    renderWigleEnrichment(result);
+    if(currentTowerData&&Number(currentTowerData.id)===Number(towerId)) currentTowerData.wigle_enrichment=result;
+    const button=document.getElementById('wigleEnrichButton');
+    if(button){button.textContent='Refresh WiGLE'; button.onclick=()=>enrichTowerWithWigle(towerId,true);}
+    await openTower(towerId);
+  }catch(e){
+    renderWigleEnrichment({error:`WiGLE lookup failed: ${e&&e.message?e.message:String(e)}`});
+  }
 }
 async function recomputeOneTower(towerId){
   try{
@@ -5040,7 +5336,21 @@ def create_app(db_path: str):
             payload = tower_payload(row, enrich_methods=True)
             payload["app_config"] = app_config
             payload["altitude_view"] = altitude_view_payload(payload.get("methods", []), payload.get("features", {}), app_config)
+            payload["wigle_enrichment"] = get_wigle_enrichment(con, tower_id)
             return payload
+
+    @app.post("/api/towers/{tower_id}/wigle-enrich")
+    def api_wigle_enrich(tower_id: int, refresh: int = 0) -> Dict[str, Any]:
+        try:
+            result = wigle_enrich_tower(db_path, int(tower_id), refresh=bool(int(refresh)))
+            recompute_one_tower(db_path, int(tower_id))
+            return result
+        except KeyError:
+            return JSONResponse({"error": "not found"}, status_code=404)
+        except ValueError as exc:
+            return JSONResponse({"error": "invalid_tower", "detail": str(exc)}, status_code=400)
+        except RuntimeError as exc:
+            return JSONResponse({"error": "wigle_error", "detail": str(exc)}, status_code=502)
 
     @app.get("/api/towers/{tower_id}/points")
     def api_points(tower_id: int, kind: str = "all", limit: int = 20000, raw: int = 1) -> Dict[str, Any]:
