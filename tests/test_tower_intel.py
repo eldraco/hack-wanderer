@@ -1,4 +1,5 @@
 import json
+import os
 import sqlite3
 import tempfile
 import unittest
@@ -253,6 +254,51 @@ class TowerIntelTests(unittest.TestCase):
         self.assertAlmostEqual(post, bayes["posterior"])
         self.assertEqual(bayes["total_delta_logodds"], 0.0)
 
+    def test_wigle_evidence_absence_raises_suspicion_and_history_lowers_it(self):
+        intel.init_db(self.db)
+        with intel.connect_db(self.db) as con:
+            settings = intel.get_method_settings(con)
+
+        absent_features = {}
+        intel.apply_wigle_features(absent_features, {
+            "checked_at": "2026-06-01T00:00:00+00:00",
+            "exists": False,
+            "match_count": 0,
+            "results": [],
+        })
+        absent_methods, _bayes, _rule, _post = intel.evaluate_methods(
+            absent_features, settings, mostly_lte=True, known=False, ignored=False,
+        )
+        absent = next(m for m in absent_methods if m["id"] == "wigle_absent")
+        self.assertTrue(absent["triggered"])
+        self.assertGreater(absent["delta_logodds"], 0.0)
+
+        recent_historical = {}
+        intel.apply_wigle_features(recent_historical, {
+            "checked_at": "2026-06-01T00:00:00+00:00",
+            "exists": True,
+            "match_count": 1,
+            "results": [{"firsttime": "2020-01-01T00:00:00.000Z", "lasttime": "2026-05-01T00:00:00.000Z"}],
+        })
+        stale_young = {}
+        intel.apply_wigle_features(stale_young, {
+            "checked_at": "2026-06-01T00:00:00+00:00",
+            "exists": True,
+            "match_count": 1,
+            "results": [{"firsttime": "2026-01-01T00:00:00.000Z", "lasttime": "2024-01-01T00:00:00.000Z"}],
+        })
+        historical_methods, _bayes, _rule, _post = intel.evaluate_methods(
+            recent_historical, settings, mostly_lte=True, known=False, ignored=False,
+        )
+        weak_methods, _bayes, _rule, _post = intel.evaluate_methods(
+            stale_young, settings, mostly_lte=True, known=False, ignored=False,
+        )
+        historical = next(m for m in historical_methods if m["id"] == "wigle_historical_presence")
+        weak = next(m for m in weak_methods if m["id"] == "wigle_historical_presence")
+        self.assertTrue(historical["triggered"])
+        self.assertLess(historical["delta_logodds"], 0.0)
+        self.assertLess(historical["delta_logodds"], weak["delta_logodds"])
+
     def test_get_method_settings_is_read_only_under_foreign_write_lock(self):
         intel.init_db(self.db)
         writer = intel.connect_db(self.db)
@@ -432,6 +478,69 @@ class TowerIntelTests(unittest.TestCase):
         result = intel.ingest_files(self.db, paths)
         self.assertEqual(result["imported_rows"], 1)
         self.assertEqual(result["new_towers"], 1)
+
+    def test_wigle_enrichment_infers_tesco_o2_plmn_and_filters_exact_match(self):
+        rows = [{
+            "timestamp_utc": "2027-01-01T00:00:00Z",
+            "location": {"lat": 50.0, "lon": 14.0},
+            "network": {"cops_current": {"operator": "TESCO Mobile TESCO mobile"}},
+            "towers": [{"rat": "LTE", "tac_lac": 1137, "cell_id": 154762598, "pci": 228, "earfcn": 1404}],
+        }]
+        write_jsonl(self.log, rows)
+        intel.ingest_files(self.db, [str(self.log)])
+        with intel.connect_db(self.db) as con:
+            tower_id = con.execute("SELECT id FROM towers").fetchone()["id"]
+
+        response_payload = {
+            "success": True,
+            "totalResults": 1,
+            "results": [{
+                "id": "23002_1137_154762598",
+                "ssid": "O2 Czech Republic",
+                "gentype": "LTE",
+                "channel": 1404,
+                "qos": 7,
+                "firsttime": "2022-10-15T13:00:00.000Z",
+                "lasttime": "2025-10-27T05:00:00.000Z",
+            }],
+        }
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+            def read(self):
+                return json.dumps(response_payload).encode("utf-8")
+
+        with mock.patch.dict(os.environ, {"WIGLE_API_NAME": "api-name", "WIGLE_API_TOKEN": "api-token"}):
+            with mock.patch.object(intel.urllib.request, "urlopen", return_value=FakeResponse()) as urlopen:
+                result = intel.wigle_enrich_tower(self.db, tower_id)
+                cached = intel.wigle_enrich_tower(self.db, tower_id)
+
+        requested_url = urlopen.call_args.args[0].full_url
+        self.assertEqual(urlopen.call_count, 1)
+        self.assertIn("cell_op=23002", requested_url)
+        self.assertIn("cell_net=1137", requested_url)
+        self.assertIn("cell_id=154762598", requested_url)
+        self.assertTrue(result["exists"])
+        self.assertEqual(result["match_count"], 1)
+        self.assertEqual(result["results"][0]["channel"], 1404)
+        self.assertFalse(result["cached"])
+        self.assertTrue(cached["cached"])
+        self.assertEqual(cached["results"][0]["id"], "23002_1137_154762598")
+        with intel.connect_db(self.db) as con:
+            stored = intel.get_wigle_enrichment(con, tower_id)
+        self.assertIsNotNone(stored)
+        self.assertTrue(stored["cached"])
+        intel.recompute_one_tower(self.db, tower_id)
+        with intel.connect_db(self.db) as con:
+            methods = json.loads(con.execute("SELECT methods_json FROM tower_features WHERE tower_id=?", (tower_id,)).fetchone()[0])
+        historical = next(m for m in methods if m["id"] == "wigle_historical_presence")
+        self.assertTrue(historical["triggered"])
+        self.assertLess(historical["delta_logodds"], 0.0)
 
     @unittest.skipIf(TestClient is None, "FastAPI test client not available")
     def test_api_towers_searches_notes_and_analysis_status(self):
