@@ -570,6 +570,46 @@ class TowerIntelTests(unittest.TestCase):
         self.assertEqual(tag_match[0]["id"], tower_id)
 
     @unittest.skipIf(TestClient is None, "FastAPI test client not available")
+    def test_api_towers_filters_by_inclusive_last_seen_date_range(self):
+        rows = self.make_rows()
+        rows.append({
+            "timestamp_utc": "2027-01-03T23:59:59Z",
+            "location": {"lat": 50.1, "lon": 14.1},
+            "network": {"cops_current": {"operator": "LaterNet"}},
+            "towers": [{
+                "rat": "LTE",
+                "tac_lac": 999,
+                "cell_id": 888,
+                "pci": 6,
+                "earfcn": 1300,
+            }],
+        })
+        write_jsonl(self.log, rows)
+        intel.ingest_files(self.db, [str(self.log)])
+        intel.recompute(self.db, sample_size=100)
+        client = TestClient(intel.create_app(self.db))
+
+        first_day = client.get(
+            "/api/towers",
+            params={"last_seen_from": "2027-01-01", "last_seen_to": "2027-01-01"},
+        )
+        self.assertEqual(first_day.status_code, 200)
+        self.assertEqual([item["operator"] for item in first_day.json()["items"]], ["TestNet"])
+
+        through_third = client.get(
+            "/api/towers",
+            params={"last_seen_from": "2027-01-03", "last_seen_to": "2027-01-03"},
+        )
+        self.assertEqual(through_third.status_code, 200)
+        self.assertEqual([item["operator"] for item in through_third.json()["items"]], ["LaterNet"])
+
+        reversed_range = client.get(
+            "/api/towers",
+            params={"last_seen_from": "2027-01-04", "last_seen_to": "2027-01-03"},
+        )
+        self.assertEqual(reversed_range.status_code, 400)
+
+    @unittest.skipIf(TestClient is None, "FastAPI test client not available")
     def test_api_anomaly_towers_filters_by_triggered_positive_method(self):
         write_jsonl(self.log, self.make_rows())
         intel.ingest_files(self.db, [str(self.log)])
