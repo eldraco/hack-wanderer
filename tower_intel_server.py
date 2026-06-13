@@ -4225,6 +4225,9 @@ def index_html() -> str:
       <div class="toolbar">
         <input id="mapSearch" placeholder="Search cell/TAC/PCI/operator/notes" style="min-width:280px">
         <label class="score-filter">Min Bayes <input id="scoreSlider" type="range" min="0" max="100" step="0.01" value="0" oninput="syncScoreFilter('slider')"><input id="scoreMin" type="number" min="0" max="100" step="0.01" value="0" oninput="syncScoreFilter('number')"><span>%</span></label>
+        <label>Last seen from <input id="lastSeenFrom" type="date" onchange="changeLastSeenFilter('from')"></label>
+        <label>through <input id="lastSeenTo" type="date" onchange="changeLastSeenFilter('to')"></label>
+        <button class="ghost" onclick="clearLastSeenFilter()">Clear dates</button>
         <label><input id="showNormal" type="checkbox" checked onchange="renderMapTowers(false)"> normal</label>
         <label><input id="showAnom" type="checkbox" checked onchange="renderMapTowers(false)"> anomalous</label>
         <label><input id="showKnown" type="checkbox" checked onchange="renderMapTowers(false)"> known</label>
@@ -4522,8 +4525,25 @@ function syncScoreFilter(source){
   renderMapTowers(false);
 }
 async function loadTowers(){
-  const q=document.getElementById('mapSearch').value.trim(); const params=new URLSearchParams({limit:5000,q,include_ignored:1});
+  const q=document.getElementById('mapSearch').value.trim();
+  const lastSeenFrom=document.getElementById('lastSeenFrom').value;
+  const lastSeenTo=document.getElementById('lastSeenTo').value;
+  const params=new URLSearchParams({limit:5000,q,include_ignored:1});
+  if(lastSeenFrom) params.set('last_seen_from',lastSeenFrom);
+  if(lastSeenTo) params.set('last_seen_to',lastSeenTo);
   const data=await api('/api/towers?'+params); allTowers=data.items; renderMapTowers(true);
+}
+function clearLastSeenFilter(){
+  document.getElementById('lastSeenFrom').value='';
+  document.getElementById('lastSeenTo').value='';
+  loadTowers();
+}
+function changeLastSeenFilter(source){
+  const from=document.getElementById('lastSeenFrom'), to=document.getElementById('lastSeenTo');
+  if(from.value&&to.value&&from.value>to.value){
+    if(source==='from') to.value=from.value; else from.value=to.value;
+  }
+  loadTowers();
 }
 function towerCategory(t){
   if(t.ignored) return 'ignored';
@@ -4554,7 +4574,9 @@ function renderMapTowers(fit){
     m.bindTooltip(`${esc(t.label)}<br>Bayes ${pct(t.bayes_post_p)} / seen ${t.count}${spread!==null?`<br>GPS spread ${Math.round(spread)} m`:''}`);
     m.on('click',()=>openTower(t.id)); bounds.push([t.center_lat,t.center_lon]);
   }
-  document.getElementById('mapStatus').textContent=`${shown}/${allTowers.length} shown · normal ${counts.normal} · anomalous ${counts.anom} · known ${counts.known} · ignored ${counts.ignored} · min Bayes ${pct(threshold)}`;
+  const from=document.getElementById('lastSeenFrom').value, to=document.getElementById('lastSeenTo').value;
+  const dateStatus=(from||to)?` · last seen ${from||'any date'} to ${to||'any date'} UTC`:'';
+  document.getElementById('mapStatus').textContent=`${shown}/${allTowers.length} shown · normal ${counts.normal} · anomalous ${counts.anom} · known ${counts.known} · ignored ${counts.ignored} · min Bayes ${pct(threshold)}${dateStatus}`;
   if(fit&&bounds.length) map.fitBounds(bounds,{padding:[30,30],maxZoom:17});
 }
     // Put these on `window` so inline onclick handlers can see them reliably.
@@ -5072,7 +5094,7 @@ initMap(); initDrawerUX(); loadTowers(); loadMethods(); loadStats(); loadImports
 
 def create_app(db_path: str):
     try:
-        from fastapi import FastAPI
+        from fastapi import FastAPI, HTTPException
         from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
     except Exception as exc:  # pragma: no cover
         raise SystemExit("FastAPI server dependencies missing. Install with: pip install fastapi uvicorn python-multipart") from exc
@@ -5232,16 +5254,32 @@ def create_app(db_path: str):
         include_ignored: int = 0,
         hide_known: int = 0,
         anomaly_only: int = 0,
+        last_seen_from: Optional[dt.date] = None,
+        last_seen_to: Optional[dt.date] = None,
     ) -> Dict[str, Any]:
         limit = max(1, min(int(limit), 5000))
         clauses = ["1=1"]
         params: List[Any] = []
+        if last_seen_from and last_seen_to and last_seen_from > last_seen_to:
+            raise HTTPException(status_code=400, detail="last_seen_from must be on or before last_seen_to")
         if not include_ignored:
             clauses.append("t.ignored=0")
         if hide_known:
             clauses.append("t.known=0")
         if anomaly_only:
             clauses.append("COALESCE(f.bayes_post_p,0) >= 0.001")
+        if last_seen_from:
+            from_ts = dt.datetime.combine(last_seen_from, dt.time.min, tzinfo=dt.timezone.utc).timestamp()
+            clauses.append("f.last_seen_ts >= ?")
+            params.append(from_ts)
+        if last_seen_to:
+            through_ts = dt.datetime.combine(
+                last_seen_to + dt.timedelta(days=1),
+                dt.time.min,
+                tzinfo=dt.timezone.utc,
+            ).timestamp()
+            clauses.append("f.last_seen_ts < ?")
+            params.append(through_ts)
         if q:
             like = f"%{q}%"
             clauses.append("(t.label LIKE ? OR t.operator LIKE ? OR t.rat LIKE ? OR CAST(t.tac_lac AS TEXT) LIKE ? OR CAST(t.cell_id AS TEXT) LIKE ? OR CAST(t.pci AS TEXT) LIKE ? OR CAST(t.earfcn AS TEXT) LIKE ? OR t.notes LIKE ? OR t.analysis_status LIKE ?)")
