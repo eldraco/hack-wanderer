@@ -108,7 +108,7 @@ Shows towers as Leaflet markers. Marker color follows Bayes posterior:
 - orange: review-worthy,
 - red: higher anomaly probability.
 
-Use the toolbar to search identifiers, hide known towers, include ignored towers, or show anomaly-only towers.
+Use the toolbar to search identifiers, filter towers by an inclusive UTC last-seen date range, hide known towers, include ignored towers, or show anomaly-only towers.
 
 Click a tower to open the side drawer. The drawer shows:
 
