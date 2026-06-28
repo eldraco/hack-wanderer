@@ -15,6 +15,7 @@ fix.
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import glob
 import json
 import os
@@ -82,11 +83,17 @@ def maybe_restart(service: str) -> None:
         run(["systemctl", "restart", service], timeout=60)
 
 
-def read_gps(status_path: Path) -> Optional[Tuple[float, float]]:
+def read_status_payload(status_path: Path) -> Optional[dict]:
     try:
-        payload = json.loads(status_path.read_text(encoding="utf-8"))
+        return json.loads(status_path.read_text(encoding="utf-8"))
     except Exception as exc:
         log(f"GPS status not ready at {status_path}: {exc}")
+        return None
+
+
+def read_gps(status_path: Path) -> Optional[Tuple[float, float]]:
+    payload = read_status_payload(status_path)
+    if not payload:
         return None
     candidates = [
         payload.get("location") or {},
@@ -102,6 +109,52 @@ def read_gps(status_path: Path) -> Optional[Tuple[float, float]]:
             return lat, lon
     log("GPS status exists but has no usable lat/lon yet.")
     return None
+
+
+def parse_utc_timestamp(value: Any) -> Optional[float]:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = dt.datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=dt.timezone.utc)
+        return parsed.astimezone(dt.timezone.utc).timestamp()
+    except Exception:
+        return None
+
+
+def gps_utc_timestamp_from_status(status_path: Path) -> Optional[float]:
+    payload = read_status_payload(status_path)
+    if not payload:
+        return None
+    candidates = [
+        payload.get("gps_time_utc"),
+        (payload.get("location") or {}).get("timestamp_utc"),
+        ((payload.get("gps_device") or {}).get("location") or {}).get("timestamp_utc"),
+        (payload.get("gps_device") or {}).get("timestamp_utc"),
+    ]
+    for candidate in candidates:
+        ts = parse_utc_timestamp(candidate)
+        if ts is not None:
+            return ts
+    log("GPS status exists but has no usable UTC timestamp yet.")
+    return None
+
+
+def sync_clock_from_gps(status_path: Path, *, min_skew_seconds: float) -> bool:
+    gps_ts = gps_utc_timestamp_from_status(status_path)
+    if gps_ts is None:
+        return False
+    now_ts = time.time()
+    skew = gps_ts - now_ts
+    gps_dt = dt.datetime.fromtimestamp(gps_ts, dt.timezone.utc)
+    if abs(skew) < min_skew_seconds:
+        log(f"System clock close to GPS UTC ({skew:+.1f}s skew).")
+        return False
+    stamp = gps_dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+    log(f"Setting system clock from GPS UTC {stamp} ({skew:+.1f}s skew).")
+    run(["date", "-u", "-s", stamp], timeout=30, check=True)
+    return True
 
 
 def add_venv_site_packages(venv: Path) -> None:
@@ -232,6 +285,7 @@ def main(argv=None) -> int:
     parser.add_argument("--interval-seconds", type=int, default=60)
     parser.add_argument("--restart-service", default="")
     parser.add_argument("--install", action="store_true", help="Try to install timezonefinder into the helper venv when internet is available.")
+    parser.add_argument("--gps-clock-min-skew-seconds", type=float, default=120.0)
     args = parser.parse_args(argv)
 
     deadline = time.monotonic() + max(0, args.wait_seconds)
@@ -239,6 +293,11 @@ def main(argv=None) -> int:
     while True:
         attempt += 1
         log(f"Timezone update attempt {attempt}; current={current_timezone() or '(unknown)'}")
+        try:
+            if sync_clock_from_gps(Path(args.status_path), min_skew_seconds=args.gps_clock_min_skew_seconds):
+                maybe_restart(args.restart_service)
+        except Exception as exc:
+            log(f"GPS clock sync failed: {exc}")
         tz = choose_timezone(args)
         if tz:
             changed = set_timezone(tz)
