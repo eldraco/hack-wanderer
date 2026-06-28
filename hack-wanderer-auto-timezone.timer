@@ -1,0 +1,12 @@
+[Unit]
+Description=Run Hack-Wanderer automatic timezone updater periodically
+
+[Timer]
+OnBootSec=2min
+OnActiveSec=2min
+OnUnitInactiveSec=30min
+Persistent=true
+RandomizedDelaySec=30s
+
+[Install]
+WantedBy=timers.target
