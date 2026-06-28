@@ -7,4 +7,4 @@ After=network-online.target hack-wanderer.service
 [Service]
 Type=oneshot
 TimeoutStartSec=7500
-ExecStart=/usr/bin/python3 /home/pi/code/hack-wanderer/scripts/auto_timezone.py --status-path /home/pi/code/hack-wanderer/status/status.json --wait-seconds 7200 --interval-seconds 120 --install --restart-service hack-wanderer.service
+ExecStart=/usr/bin/python3 /home/pi/code/hack-wanderer/scripts/auto_timezone.py --status-path /home/pi/code/hack-wanderer/status/status.json --wait-seconds 7200 --interval-seconds 120 --gps-clock-min-skew-seconds 120 --install --restart-service hack-wanderer.service
