@@ -62,6 +62,10 @@ The dashboard stores raw samples and tower observations in `tower_intel.sqlite`,
 All settings can be provided via CLI flags or a YAML file. CLI flags override the YAML values.
 Set `output.json_path` in YAML to always write JSON results without a CLI flag.
 
+For roaming deployments, set `timezone: auto` to use the Pi's current system
+timezone for `timestamp_local` and the status page. Keep `timestamp_utc` and
+JSONL filenames in UTC; that remains stable when moving between countries.
+
 Example config (`config.example.yaml`):
 
 ```yaml
