@@ -525,6 +525,8 @@ def get_timezone(config):
     cfg = config or {}
     name = cfg.get("timezone")
     offset_min = safe_int(cfg.get("timezone_offset_minutes"))
+    if str(name or "").strip().lower() in ("auto", "local", "system"):
+        return datetime.datetime.now().astimezone().tzinfo or datetime.timezone.utc
     if name and ZoneInfo is not None:
         try:
             return ZoneInfo(name)
@@ -536,6 +538,33 @@ def get_timezone(config):
         except Exception:
             pass
     return datetime.timezone.utc
+
+
+def timezone_label(config):
+    name = str((config or {}).get("timezone") or "").strip()
+    if name.lower() in ("auto", "local", "system"):
+        try:
+            import subprocess
+            out = subprocess.run(
+                ["timedatectl", "show", "-p", "Timezone", "--value"],
+                text=True,
+                capture_output=True,
+                timeout=2,
+            )
+            label = out.stdout.strip()
+            if out.returncode == 0 and label:
+                return label
+        except Exception:
+            pass
+        try:
+            with open("/etc/timezone", "r", encoding="utf-8") as f:
+                label = f.read().strip()
+                if label:
+                    return label
+        except Exception:
+            pass
+        return datetime.datetime.now().astimezone().tzname() or "local"
+    return name or "UTC"
 
 
 def local_timestamp(config):
@@ -2073,7 +2102,7 @@ def build_snapshot(at, config, logger):
     snapshot = {
         "timestamp_utc": iso_timestamp(),
         "timestamp_local": local_timestamp(config),
-        "timezone": config.get("timezone") or "UTC",
+        "timezone": timezone_label(config),
         "network": network,
         "vendor": vendor,
         "gps": gps_modem,
