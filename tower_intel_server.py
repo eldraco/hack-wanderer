@@ -4205,6 +4205,7 @@ def index_html() -> str:
     .table-wrap.compact{height:auto;max-height:360px}.table-wrap.compact table{min-width:100%}.path-cell code{display:block;white-space:normal;overflow-wrap:anywhere}.status-tag{display:inline-flex;align-items:center;border-radius:999px;padding:3px 9px;font-size:12px;font-weight:800;text-transform:capitalize}.status-tag.imported{background:#dcfce7;color:#166534}.status-tag.skipped{background:#e2e8f0;color:#334155}.status-tag.error{background:#fee2e2;color:#991b1b}
     .toolbar-note{margin-left:auto}
     .meta-editor{border:1px solid var(--line);border-radius:14px;padding:14px;background:#f8fafc}.meta-editor textarea{width:100%;min-height:120px;resize:vertical}.meta-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px}.meta-grid label{display:flex;gap:8px;align-items:center}.note-indicator{font-weight:700}.note-indicator.yes{color:#1d4ed8}.note-indicator.no{color:#64748b}.tag-badge{display:inline-flex;align-items:center;border:1px solid #cbd5e1;border-radius:999px;padding:3px 8px;background:#f8fafc;font-size:12px;font-weight:700}.leaflet-tooltip.point-raw-tooltip,.leaflet-popup.point-raw-tooltip{max-width:min(720px,92vw);min-width:min(320px,92vw);white-space:normal}.point-tooltip{max-width:min(700px,92vw)}.point-tooltip pre{margin:6px 0 0;max-height:180px;overflow:auto;white-space:pre-wrap;word-break:break-word;background:#f8fafc;border:1px solid #e5e7eb;border-radius:8px;padding:8px;font-size:11px}.obs-table td,.obs-table th{vertical-align:top}.obs-table tr.obs-ignored{background:#f8fafc}.obs-table tr.obs-bad{background:#fff7ed}
+    .area-legend{background:#fffffff2;border:1px solid #cbd5e1;border-radius:10px;box-shadow:0 2px 12px #0002;padding:9px 10px;min-width:130px;max-width:220px}.area-legend-title{display:flex;align-items:center;justify-content:space-between;gap:10px;font-size:12px;font-weight:800;margin-bottom:6px}.area-legend-close{border:0;background:transparent;color:#64748b;cursor:pointer;font-size:18px;line-height:14px;padding:0 1px}.area-legend-close:hover{color:#0f172a}.area-legend-items{display:flex;flex-direction:column;gap:4px;max-height:240px;overflow:auto}.area-legend-row{display:flex;align-items:center;gap:7px;font-size:12px;white-space:nowrap}.area-legend-swatch{width:12px;height:12px;border:1px solid #fff;border-radius:50%;box-shadow:0 0 0 1px #0003;flex:0 0 auto}.area-legend-count{color:#64748b;margin-left:auto;padding-left:8px}
     @media (max-width: 1180px){.imports-grid{grid-template-columns:1fr 1fr}.imports-grid .stats-card-col,.imports-grid .span-all{grid-column:1/-1}}
     @media (max-width: 860px){.imports-grid{grid-template-columns:1fr}.imports-grid > *{grid-column:1/-1}.toolbar-note{margin-left:0}}
   </style>
@@ -4232,6 +4233,7 @@ def index_html() -> str:
         <label><input id="showAnom" type="checkbox" checked onchange="renderMapTowers(false)"> anomalous</label>
         <label><input id="showKnown" type="checkbox" checked onchange="renderMapTowers(false)"> known</label>
         <label><input id="showIgnored" type="checkbox" onchange="renderMapTowers(false)"> ignored</label>
+        <label><input id="showAreaLegend" type="checkbox" checked onchange="toggleAreaLegend()"> TAC/LAC legend</label>
         <button class="ghost" onclick="loadTowers()">Refresh</button>
         <span id="mapStatus" class="small"></span>
       </div>
@@ -4247,7 +4249,7 @@ def index_html() -> str:
   </main>
 </div>
 <script>
-let map, towerLayer, estimateLayer, pointLayer, clusterLayer, badLayer, placeLayer, centerLayer;
+let map, towerLayer, estimateLayer, pointLayer, clusterLayer, badLayer, placeLayer, centerLayer, areaLegend;
 let allTowers=[];
 let towerTableItems=[], anomalyTableItems=[], adminTableItems=[];
 let tableSort={towerTable:{key:'bayes_post_p',dir:-1},anomalyTable:{key:'bayes_post_p',dir:-1},adminTable:{key:'bayes_post_p',dir:-1}};
@@ -4263,6 +4265,17 @@ function initMap(){
   L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:22,attribution:'© OpenStreetMap'}).addTo(map);
   estimateLayer=L.layerGroup().addTo(map); towerLayer=L.layerGroup().addTo(map); pointLayer=L.layerGroup().addTo(map); clusterLayer=L.layerGroup().addTo(map); badLayer=L.layerGroup().addTo(map); placeLayer=L.layerGroup().addTo(map); centerLayer=L.layerGroup().addTo(map);
   L.control.layers(null,{"Tower estimate circles":estimateLayer,"Tower points":pointLayer,"Clusters":clusterLayer,"Bad GPS":badLayer,"Place buckets":placeLayer,"Center":centerLayer}).addTo(map);
+  areaLegend=L.control({position:'bottomright'});
+  areaLegend.onAdd=()=>{
+    const div=L.DomUtil.create('div','area-legend');
+    div.innerHTML='<div class="area-legend-title"><span>TAC/LAC colors</span><button class="area-legend-close" type="button" title="Hide legend" aria-label="Hide TAC/LAC legend" onclick="setAreaLegendVisible(false)">×</button></div><div id="areaLegendItems" class="area-legend-items"><span class="small">No towers shown</span></div>';
+    L.DomEvent.disableClickPropagation(div); L.DomEvent.disableScrollPropagation(div);
+    return div;
+  };
+  areaLegend.addTo(map);
+  let showLegend=true;
+  try{showLegend=localStorage.getItem('towerShowAreaLegend')!=='false';}catch(_e){}
+  setAreaLegendVisible(showLegend,false);
 }
 async function api(url, opts={}){const r=await fetch(url, opts); if(!r.ok) throw new Error(await r.text()); const ct=r.headers.get('content-type')||''; return ct.includes('json')?r.json():r.text();}
 function pct(x){return ((x||0)*100).toFixed(3)+'%'} function esc(s){return String(s??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}
@@ -4495,28 +4508,47 @@ function initDrawerUX(){
   handle.addEventListener('pointerup', stop);
   handle.addEventListener('pointercancel', stop);
 }
-function lerp(a,b,t){return Math.round(a+(b-a)*t)}
-function hexToRgb(hex){const h=hex.replace('#','');return [parseInt(h.slice(0,2),16),parseInt(h.slice(2,4),16),parseInt(h.slice(4,6),16)]}
-function rgbToHex(rgb){return '#'+rgb.map(x=>x.toString(16).padStart(2,'0')).join('')}
-function interpColor(a,b,t){const ra=hexToRgb(a), rb=hexToRgb(b); return rgbToHex([lerp(ra[0],rb[0],t),lerp(ra[1],rb[1],t),lerp(ra[2],rb[2],t)])}
-function scoreColor(p){
-  p=Math.max(0,Math.min(1,Number(p)||0));
-  const stops=[
-    [0.0000,'#22c55e'],  // green: no evidence
-    [0.0010,'#84cc16'],  // lime: tiny but non-zero
-    [0.0100,'#eab308'],  // yellow: visible low anomaly
-    [0.0500,'#f97316'],  // orange
-    [0.2000,'#dc2626'],  // red
-    [1.0000,'#7f1d1d']   // dark red
-  ];
-  for(let i=1;i<stops.length;i++){
-    if(p<=stops[i][0]){
-      const lo=stops[i-1], hi=stops[i];
-      const t=(p-lo[0])/(hi[0]-lo[0]);
-      return interpColor(lo[1],hi[1],Math.max(0,Math.min(1,t)));
-    }
-  }
-  return stops[stops.length-1][1];
+function tacLacKey(value){
+  if(value===null||value===undefined) return null;
+  const key=String(value).trim();
+  return key===''?null:key;
+}
+function stringHash(value){
+  let hash=2166136261;
+  for(let i=0;i<value.length;i++){hash^=value.charCodeAt(i); hash=Math.imul(hash,16777619);}
+  return hash>>>0;
+}
+function tacLacColor(value){
+  const key=tacLacKey(value);
+  if(key===null) return '#64748b';
+  const numeric=Number(key);
+  const seed=Number.isFinite(numeric)?Math.trunc(numeric):stringHash(key);
+  const hue=((seed*137.508)%360+360)%360;
+  return `hsl(${hue.toFixed(1)} 72% 42%)`;
+}
+function setAreaLegendVisible(show,persist=true){
+  const visible=Boolean(show);
+  const legend=document.querySelector('.area-legend');
+  const checkbox=document.getElementById('showAreaLegend');
+  if(legend) legend.style.display=visible?'':'none';
+  if(checkbox) checkbox.checked=visible;
+  if(persist){try{localStorage.setItem('towerShowAreaLegend',String(visible));}catch(_e){}}
+}
+function toggleAreaLegend(){
+  setAreaLegendVisible(document.getElementById('showAreaLegend').checked);
+}
+function updateAreaLegend(groups){
+  const el=document.getElementById('areaLegendItems');
+  if(!el) return;
+  const entries=[...groups.entries()].sort((a,b)=>{
+    if(a[0]===null) return 1;
+    if(b[0]===null) return -1;
+    return String(a[0]).localeCompare(String(b[0]),undefined,{numeric:true});
+  });
+  el.innerHTML=entries.length?entries.map(([key,count])=>{
+    const label=key===null?'Unknown':key;
+    return `<div class="area-legend-row"><span class="area-legend-swatch" style="background:${tacLacColor(key)}"></span><span>${esc(label)}</span><span class="area-legend-count">${count}</span></div>`;
+  }).join(''):'<span class="small">No towers shown</span>';
 }
 function minScore(){return Math.max(0,Math.min(1,(Number(document.getElementById('scoreMin').value)||0)/100))}
 function syncScoreFilter(source){
@@ -4560,20 +4592,23 @@ function categoryVisible(cat){
 function renderMapTowers(fit){
   towerLayer.clearLayers(); estimateLayer.clearLayers();
   const threshold=minScore();
-  let bounds=[]; let shown=0; let counts={normal:0,anom:0,known:0,ignored:0};
+  let bounds=[]; let shown=0; let counts={normal:0,anom:0,known:0,ignored:0}; let areaGroups=new Map();
   for(const t of allTowers){
     const cat=towerCategory(t); counts[cat]++;
     if(!categoryVisible(cat)) continue;
     if((Number(t.bayes_post_p)||0)<threshold) continue;
     if(t.center_lat==null||t.center_lon==null) continue;
     shown++;
-    const color=scoreColor(t.bayes_post_p);
+    const areaKey=tacLacKey(t.tac_lac);
+    const color=tacLacColor(areaKey);
+    areaGroups.set(areaKey,(areaGroups.get(areaKey)||0)+1);
     const spread=(t.features&&typeof t.features.gps_spread_m==='number')?t.features.gps_spread_m:null;
     if(spread!==null){const radius=Math.max(5,Math.min(500,spread)); L.circle([t.center_lat,t.center_lon],{radius,color:'#94a3b8',weight:1,fillColor:'#94a3b8',fillOpacity:0.06,interactive:false,bubblingMouseEvents:false}).addTo(estimateLayer);}
-    const m=L.circleMarker([t.center_lat,t.center_lon],{radius:7+Math.min(12,(t.count||1)**0.35),color,fillColor:color,fillOpacity:.78,weight:2,interactive:true}).addTo(towerLayer);
-    m.bindTooltip(`${esc(t.label)}<br>Bayes ${pct(t.bayes_post_p)} / seen ${t.count}${spread!==null?`<br>GPS spread ${Math.round(spread)} m`:''}`);
+    const m=L.circleMarker([t.center_lat,t.center_lon],{radius:7+Math.min(12,(t.count||1)**0.35),color,fillColor:color,fillOpacity:.82,weight:2,interactive:true}).addTo(towerLayer);
+    m.bindTooltip(`${esc(t.label)}<br>TAC/LAC ${esc(areaKey===null?'unknown':areaKey)}<br>Bayes ${pct(t.bayes_post_p)} / seen ${t.count}${spread!==null?`<br>GPS spread ${Math.round(spread)} m`:''}`);
     m.on('click',()=>openTower(t.id)); bounds.push([t.center_lat,t.center_lon]);
   }
+  updateAreaLegend(areaGroups);
   const from=document.getElementById('lastSeenFrom').value, to=document.getElementById('lastSeenTo').value;
   const dateStatus=(from||to)?` · last seen ${from||'any date'} to ${to||'any date'} UTC`:'';
   document.getElementById('mapStatus').textContent=`${shown}/${allTowers.length} shown · normal ${counts.normal} · anomalous ${counts.anom} · known ${counts.known} · ignored ${counts.ignored} · min Bayes ${pct(threshold)}${dateStatus}`;
