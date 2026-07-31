@@ -56,6 +56,17 @@ class TowerIntelTests(unittest.TestCase):
             })
         return rows
 
+    def test_map_groups_marker_colors_by_tac_lac(self):
+        page = intel.index_html()
+        self.assertIn("function tacLacColor(value)", page)
+        self.assertIn("const color=tacLacColor(areaKey)", page)
+        self.assertIn("areaGroups.set(areaKey", page)
+        self.assertIn("TAC/LAC colors", page)
+        self.assertIn("TAC/LAC ${esc(areaKey===null?'unknown':areaKey)}", page)
+        self.assertIn('id="showAreaLegend"', page)
+        self.assertIn("function setAreaLegendVisible(show,persist=true)", page)
+        self.assertIn("towerShowAreaLegend", page)
+
     def test_identity_and_jsonl_import_are_idempotent(self):
         write_jsonl(self.log, self.make_rows())
         first = intel.ingest_files(self.db, [str(self.log)])
