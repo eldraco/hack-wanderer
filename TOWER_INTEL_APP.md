@@ -102,11 +102,7 @@ Imports are idempotent:
 
 ### Map
 
-Shows towers as Leaflet markers. Marker color follows Bayes posterior:
-
-- green: low suspicion,
-- orange: review-worthy,
-- red: higher anomaly probability.
+Shows towers as Leaflet markers. Marker color groups cells by their reported TAC/LAC: every marker with the same TAC/LAC uses the same deterministic color, and missing TAC/LAC values are gray. The map legend lists the colors and the number of currently visible towers in each group. Hide it with its × button or the **TAC/LAC legend** toolbar checkbox; the choice is remembered across reloads. This makes a cell using one area's code from a geographically separate location easier to spot. Bayes posterior remains visible in each marker tooltip and in the tower drawer.
 
 Use the toolbar to search identifiers, filter towers by an inclusive UTC last-seen date range, hide known towers, include ignored towers, or show anomaly-only towers.
 
