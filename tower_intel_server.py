@@ -683,6 +683,8 @@ WITH observation_quality AS (
     SUM(CASE WHEN bad_gps=0 AND lat IS NOT NULL AND lon IS NOT NULL THEN 1 ELSE 0 END) AS valid_gps_count,
     SUM(CASE WHEN bad_gps=1 AND lat IS NOT NULL AND lon IS NOT NULL THEN 1 ELSE 0 END) AS weird_gps_count,
     SUM(CASE WHEN lat IS NULL OR lon IS NULL THEN 1 ELSE 0 END) AS unlocated_count,
+    MIN(ts) AS first_observation_ts,
+    MAX(ts) AS last_observation_ts,
     AVG(CASE WHEN bad_gps=1 AND lat IS NOT NULL AND lon IS NOT NULL THEN lat END) AS weird_center_lat,
     AVG(CASE WHEN bad_gps=1 AND lat IS NOT NULL AND lon IS NOT NULL THEN lon END) AS weird_center_lon
   FROM tower_observations
@@ -700,6 +702,8 @@ SELECT
   COALESCE(q.valid_gps_count,0) AS valid_gps_count,
   COALESCE(q.weird_gps_count,0) AS weird_gps_count,
   COALESCE(q.unlocated_count,0) AS unlocated_count,
+  q.first_observation_ts,
+  q.last_observation_ts,
   q.weird_center_lat,
   q.weird_center_lon
 FROM towers t
@@ -713,6 +717,8 @@ LOCATION_QUALITY_SELECT_SQL = """
   lq.valid_gps_count,
   lq.weird_gps_count,
   lq.unlocated_count,
+  lq.first_observation_ts,
+  lq.last_observation_ts,
   lq.weird_center_lat,
   lq.weird_center_lon
 """.strip()
@@ -1548,6 +1554,12 @@ def migrate_db(con: sqlite3.Connection) -> None:
     ensure_column(con, "import_files", "observation_rows", "INTEGER NOT NULL DEFAULT 0")
     ensure_column(con, "import_files", "new_observations", "INTEGER NOT NULL DEFAULT 0")
     ensure_column(con, "towers", "analysis_status", "TEXT NOT NULL DEFAULT ''")
+    location_view_columns = {
+        str(row["name"])
+        for row in con.execute("PRAGMA table_info(tower_location_quality)").fetchall()
+    }
+    if location_view_columns and "first_observation_ts" not in location_view_columns:
+        con.execute("DROP VIEW tower_location_quality")
     con.executescript(LOCATION_QUALITY_VIEW_SQL)
     place_cleanup_key = "migration_clear_bad_gps_place_ids_v1"
     if not get_app_setting(con, place_cleanup_key, False):
@@ -3842,6 +3854,10 @@ def tower_payload(row: sqlite3.Row, *, enrich_methods: bool = False) -> Dict[str
     location_quality = row["location_quality"] if "location_quality" in row.keys() else None
     if not location_quality:
         location_quality = "valid_gps" if center_lat is not None and center_lon is not None else "unlocated"
+    feature_first_seen = row["first_seen_ts"] if "first_seen_ts" in row.keys() else None
+    feature_last_seen = row["last_seen_ts"] if "last_seen_ts" in row.keys() else None
+    first_seen_ts = row["first_observation_ts"] if "first_observation_ts" in row.keys() else feature_first_seen
+    last_seen_ts = row["last_observation_ts"] if "last_observation_ts" in row.keys() else feature_last_seen
     return {
         "id": row["id"],
         "label": label,
@@ -3866,8 +3882,8 @@ def tower_payload(row: sqlite3.Row, *, enrich_methods: bool = False) -> Dict[str
         "unlocated_count": int(row["unlocated_count"] or 0) if "unlocated_count" in row.keys() else 0,
         "weird_center_lat": row["weird_center_lat"] if "weird_center_lat" in row.keys() else None,
         "weird_center_lon": row["weird_center_lon"] if "weird_center_lon" in row.keys() else None,
-        "first_seen_ts": row["first_seen_ts"] if "first_seen_ts" in row.keys() else None,
-        "last_seen_ts": row["last_seen_ts"] if "last_seen_ts" in row.keys() else None,
+        "first_seen_ts": first_seen_ts if first_seen_ts is not None else feature_first_seen,
+        "last_seen_ts": last_seen_ts if last_seen_ts is not None else feature_last_seen,
         "rule_score": row["rule_score"] if "rule_score" in row.keys() else 0,
         "bayes_post_p": row["bayes_post_p"] if "bayes_post_p" in row.keys() else 0,
         "features": features,
