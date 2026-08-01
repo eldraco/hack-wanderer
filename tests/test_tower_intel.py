@@ -67,6 +67,13 @@ class TowerIntelTests(unittest.TestCase):
         self.assertIn("function setAreaLegendVisible(show,persist=true)", page)
         self.assertIn("towerShowAreaLegend", page)
 
+    def test_map_has_explicit_weird_gps_tower_layer_and_warning(self):
+        page = intel.index_html()
+        self.assertIn("weirdTowerLayer", page)
+        self.assertIn("Weird GPS tower locations (unreliable)", page)
+        self.assertIn("WEIRD GPS — UNRELIABLE LOCATION", page)
+        self.assertIn("fallback observation centroid, not a base-station position", page)
+
     def test_identity_and_jsonl_import_are_idempotent(self):
         write_jsonl(self.log, self.make_rows())
         first = intel.ingest_files(self.db, [str(self.log)])
@@ -119,6 +126,60 @@ class TowerIntelTests(unittest.TestCase):
             self.assertEqual(imports[0]["new_towers"], 1)
             self.assertEqual(imports[0]["observation_rows"], 21)
             self.assertEqual(imports[0]["new_observations"], 21)
+
+    def test_weird_gps_only_tower_is_retained_but_not_used_as_valid_center(self):
+        rows = [{
+            "timestamp_utc": "2027-01-01T00:00:00Z",
+            "location": {"lat": 50.1001, "lon": 14.2002, "source": "gps_device"},
+            "gps_device": {
+                "location": {"lat": 50.1001, "lon": 14.2002},
+                "status": "V",
+                "fix_quality": 0,
+                "fix_type": 1,
+                "satellites": {"in_use": 0},
+            },
+            "network": {"cops_current": {"operator": "IndoorNet"}, "csq": {"rssi_dbm": -73}},
+            "towers": [{
+                "rat": "LTE",
+                "tac_lac": 777,
+                "cell_id": 999,
+                "pci": 12,
+                "earfcn": 1650,
+                "rsrp": -95,
+            }],
+        }]
+        write_jsonl(self.log, rows)
+        intel.ingest_files(self.db, [str(self.log)])
+        intel.recompute(self.db, sample_size=100)
+
+        with intel.connect_db(self.db) as con:
+            observation = con.execute(
+                "SELECT bad_gps, lat, lon FROM tower_observations"
+            ).fetchone()
+            quality = con.execute("SELECT * FROM tower_location_quality").fetchone()
+            feature = con.execute("SELECT center_lat, center_lon FROM tower_features").fetchone()
+            tower_row = con.execute(
+                f"""SELECT t.*, f.*, {intel.LOCATION_QUALITY_SELECT_SQL}
+                FROM towers t
+                LEFT JOIN tower_features f ON f.tower_id=t.id
+                LEFT JOIN tower_location_quality lq ON lq.tower_id=t.id"""
+            ).fetchone()
+            payload = intel.tower_payload(tower_row)
+            report = intel.export_markdown(con, tower_row["id"])
+
+        self.assertEqual(observation["bad_gps"], 1)
+        self.assertAlmostEqual(observation["lat"], 50.1001)
+        self.assertIsNone(feature["center_lat"])
+        self.assertIsNone(feature["center_lon"])
+        self.assertEqual(quality["location_quality"], "weird_gps")
+        self.assertEqual(quality["valid_gps_count"], 0)
+        self.assertEqual(quality["weird_gps_count"], 1)
+        self.assertAlmostEqual(quality["weird_center_lat"], 50.1001)
+        self.assertAlmostEqual(quality["weird_center_lon"], 14.2002)
+        self.assertEqual(payload["location_quality"], "weird_gps")
+        self.assertEqual(payload["total_observation_count"], 1)
+        self.assertIn("Weird-GPS fallback centroid (unreliable)", report)
+        self.assertIn("excluded from geographic scoring", report)
 
     def test_recompute_skips_stationary_refresh_by_default(self):
         write_jsonl(self.log, self.make_rows())
