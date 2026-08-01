@@ -154,8 +154,9 @@ class TowerIntelTests(unittest.TestCase):
 
         with intel.connect_db(self.db) as con:
             observation = con.execute(
-                "SELECT bad_gps, lat, lon FROM tower_observations"
+                "SELECT bad_gps, lat, lon, place_id FROM tower_observations"
             ).fetchone()
+            raw_sample = con.execute("SELECT bad_gps, place_id FROM raw_samples").fetchone()
             quality = con.execute("SELECT * FROM tower_location_quality").fetchone()
             feature = con.execute("SELECT center_lat, center_lon FROM tower_features").fetchone()
             tower_row = con.execute(
@@ -169,6 +170,9 @@ class TowerIntelTests(unittest.TestCase):
 
         self.assertEqual(observation["bad_gps"], 1)
         self.assertAlmostEqual(observation["lat"], 50.1001)
+        self.assertIsNone(observation["place_id"])
+        self.assertEqual(raw_sample["bad_gps"], 1)
+        self.assertIsNone(raw_sample["place_id"])
         self.assertIsNone(feature["center_lat"])
         self.assertIsNone(feature["center_lon"])
         self.assertEqual(quality["location_quality"], "weird_gps")
@@ -180,6 +184,31 @@ class TowerIntelTests(unittest.TestCase):
         self.assertEqual(payload["total_observation_count"], 1)
         self.assertIn("Weird-GPS fallback centroid (unreliable)", report)
         self.assertIn("excluded from geographic scoring", report)
+
+    def test_migration_removes_legacy_place_ids_from_bad_gps_rows(self):
+        rows = [{
+            "timestamp_utc": "2027-01-01T00:00:00Z",
+            "location": {"lat": 50.1, "lon": 14.2, "source": "gps_device"},
+            "gps_device": {"status": "V", "fix_quality": 0, "fix_type": 1},
+            "network": {"cops_current": {"operator": "IndoorNet"}},
+            "towers": [{"rat": "LTE", "tac_lac": 777, "cell_id": 999}],
+        }]
+        write_jsonl(self.log, rows)
+        intel.ingest_files(self.db, [str(self.log)])
+        with intel.connect_db(self.db) as con:
+            con.execute("UPDATE raw_samples SET place_id='z17/1/2' WHERE bad_gps=1")
+            con.execute("UPDATE tower_observations SET place_id='z17/1/2' WHERE bad_gps=1")
+            con.execute("DELETE FROM app_settings WHERE key='migration_clear_bad_gps_place_ids_v1'")
+            con.commit()
+            intel.migrate_db(con)
+            self.assertEqual(
+                con.execute("SELECT COUNT(*) FROM raw_samples WHERE bad_gps=1 AND place_id IS NOT NULL").fetchone()[0],
+                0,
+            )
+            self.assertEqual(
+                con.execute("SELECT COUNT(*) FROM tower_observations WHERE bad_gps=1 AND place_id IS NOT NULL").fetchone()[0],
+                0,
+            )
 
     def test_recompute_skips_stationary_refresh_by_default(self):
         write_jsonl(self.log, self.make_rows())
