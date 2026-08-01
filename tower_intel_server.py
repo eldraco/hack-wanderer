@@ -668,9 +668,54 @@ CREATE TABLE IF NOT EXISTS app_settings (
 CREATE INDEX IF NOT EXISTS idx_raw_samples_ts ON raw_samples(ts);
 CREATE INDEX IF NOT EXISTS idx_obs_tower_ts ON tower_observations(tower_id, ts);
 CREATE INDEX IF NOT EXISTS idx_obs_place ON tower_observations(place_id);
+CREATE INDEX IF NOT EXISTS idx_obs_tower_location_quality ON tower_observations(tower_id, ignored, bad_gps, lat, lon);
 CREATE INDEX IF NOT EXISTS idx_towers_cell ON towers(cell_id, tac_lac, pci, earfcn);
 CREATE INDEX IF NOT EXISTS idx_features_score ON tower_features(bayes_post_p DESC, rule_score DESC);
+
 """
+
+LOCATION_QUALITY_VIEW_SQL = """
+CREATE VIEW IF NOT EXISTS tower_location_quality AS
+WITH observation_quality AS (
+  SELECT
+    tower_id,
+    COUNT(*) AS total_observation_count,
+    SUM(CASE WHEN bad_gps=0 AND lat IS NOT NULL AND lon IS NOT NULL THEN 1 ELSE 0 END) AS valid_gps_count,
+    SUM(CASE WHEN bad_gps=1 AND lat IS NOT NULL AND lon IS NOT NULL THEN 1 ELSE 0 END) AS weird_gps_count,
+    SUM(CASE WHEN lat IS NULL OR lon IS NULL THEN 1 ELSE 0 END) AS unlocated_count,
+    AVG(CASE WHEN bad_gps=1 AND lat IS NOT NULL AND lon IS NOT NULL THEN lat END) AS weird_center_lat,
+    AVG(CASE WHEN bad_gps=1 AND lat IS NOT NULL AND lon IS NOT NULL THEN lon END) AS weird_center_lon
+  FROM tower_observations
+  WHERE COALESCE(ignored,0)=0
+  GROUP BY tower_id
+)
+SELECT
+  t.id AS tower_id,
+  CASE
+    WHEN f.center_lat IS NOT NULL AND f.center_lon IS NOT NULL THEN 'valid_gps'
+    WHEN COALESCE(q.weird_gps_count,0) > 0 THEN 'weird_gps'
+    ELSE 'unlocated'
+  END AS location_quality,
+  COALESCE(q.total_observation_count,0) AS total_observation_count,
+  COALESCE(q.valid_gps_count,0) AS valid_gps_count,
+  COALESCE(q.weird_gps_count,0) AS weird_gps_count,
+  COALESCE(q.unlocated_count,0) AS unlocated_count,
+  q.weird_center_lat,
+  q.weird_center_lon
+FROM towers t
+LEFT JOIN tower_features f ON f.tower_id=t.id
+LEFT JOIN observation_quality q ON q.tower_id=t.id;
+"""
+
+LOCATION_QUALITY_SELECT_SQL = """
+  lq.location_quality,
+  lq.total_observation_count,
+  lq.valid_gps_count,
+  lq.weird_gps_count,
+  lq.unlocated_count,
+  lq.weird_center_lat,
+  lq.weird_center_lon
+""".strip()
 
 
 VARIABLE_GLOSSARY: Dict[str, str] = {
@@ -689,6 +734,8 @@ VARIABLE_GLOSSARY: Dict[str, str] = {
     "earfcn": "LTE frequency channel number. It helps distinguish frequency layers/sectors.",
     "signal": "Best available signal proxy from the log: per-cell RSRP/RSSI/RSRQ/RSSNR when present, otherwise CSQ RSSI dBm.",
     "bad_gps": "A GPS fix excluded from anomaly calculations because the source reports an invalid/no-fix state (e.g. gps_device fix_quality==0/status!=A, or modem fix_status==0) or because consecutive fixes imply an impossible speed jump.",
+    "location_quality": "Map-location confidence for a tower fingerprint: valid_gps uses only accepted fixes, weird_gps is an explicitly unreliable fallback made only from rejected fixes, and unlocated has no coordinates to display.",
+    "weird_gps_count": "Number of non-ignored observations for this tower whose GPS coordinates were rejected. These observations remain available for cellular/temporal review but never enter geographic anomaly scoring.",
     "stationary": "A sample marked stationary because the device stayed within a small radius long enough, with low implied speed between fixes and low GPS-reported speed when that direct speed was available from the log.",
     "alt_m": "Altitude in meters attached to the sample when available from GPS. For external NMEA GPS this often comes from the GGA sentence.",
     "place_id": "A Web-Mercator map-tile bucket at zoom 17. It groups nearby samples into a local place without needing external geocoding.",
@@ -1501,6 +1548,7 @@ def migrate_db(con: sqlite3.Connection) -> None:
     ensure_column(con, "import_files", "observation_rows", "INTEGER NOT NULL DEFAULT 0")
     ensure_column(con, "import_files", "new_observations", "INTEGER NOT NULL DEFAULT 0")
     ensure_column(con, "towers", "analysis_status", "TEXT NOT NULL DEFAULT ''")
+    con.executescript(LOCATION_QUALITY_VIEW_SQL)
     con.commit()
 
 
@@ -3739,6 +3787,15 @@ def db_stats(db_path: str) -> Dict[str, Any]:
     init_db(db_path)
     with connect_db(db_path) as con:
         stats = _count_db_entities(con)
+        quality_counts = {
+            str(row["location_quality"]): int(row["count"])
+            for row in con.execute(
+                "SELECT location_quality, COUNT(*) AS count FROM tower_location_quality GROUP BY location_quality"
+            ).fetchall()
+        }
+    stats["tower_locations_valid_gps"] = quality_counts.get("valid_gps", 0)
+    stats["tower_locations_weird_gps"] = quality_counts.get("weird_gps", 0)
+    stats["tower_locations_unlocated"] = quality_counts.get("unlocated", 0)
     stats["db"] = str(Path(db_path).resolve())
     return stats
 
@@ -3759,6 +3816,11 @@ def tower_payload(row: sqlite3.Row, *, enrich_methods: bool = False) -> Dict[str
     label = row["label"] or tower_label(row)
     notes = row["notes"] or ""
     analysis_status = normalize_analysis_status(row["analysis_status"] if "analysis_status" in row.keys() else "")
+    center_lat = row["center_lat"] if "center_lat" in row.keys() else None
+    center_lon = row["center_lon"] if "center_lon" in row.keys() else None
+    location_quality = row["location_quality"] if "location_quality" in row.keys() else None
+    if not location_quality:
+        location_quality = "valid_gps" if center_lat is not None and center_lon is not None else "unlocated"
     return {
         "id": row["id"],
         "label": label,
@@ -3774,8 +3836,15 @@ def tower_payload(row: sqlite3.Row, *, enrich_methods: bool = False) -> Dict[str
         "pci": row["pci"],
         "earfcn": row["earfcn"],
         "count": row["count"] if "count" in row.keys() else 0,
-        "center_lat": row["center_lat"] if "center_lat" in row.keys() else None,
-        "center_lon": row["center_lon"] if "center_lon" in row.keys() else None,
+        "center_lat": center_lat,
+        "center_lon": center_lon,
+        "location_quality": location_quality,
+        "total_observation_count": int(row["total_observation_count"] or 0) if "total_observation_count" in row.keys() else int(row["count"] or 0) if "count" in row.keys() else 0,
+        "valid_gps_count": int(row["valid_gps_count"] or 0) if "valid_gps_count" in row.keys() else int(row["count"] or 0) if "count" in row.keys() else 0,
+        "weird_gps_count": int(row["weird_gps_count"] or 0) if "weird_gps_count" in row.keys() else int(features.get("bad_gps_skipped") or 0),
+        "unlocated_count": int(row["unlocated_count"] or 0) if "unlocated_count" in row.keys() else 0,
+        "weird_center_lat": row["weird_center_lat"] if "weird_center_lat" in row.keys() else None,
+        "weird_center_lon": row["weird_center_lon"] if "weird_center_lon" in row.keys() else None,
         "first_seen_ts": row["first_seen_ts"] if "first_seen_ts" in row.keys() else None,
         "last_seen_ts": row["last_seen_ts"] if "last_seen_ts" in row.keys() else None,
         "rule_score": row["rule_score"] if "rule_score" in row.keys() else 0,
@@ -3829,9 +3898,10 @@ def altitude_view_payload(methods: Sequence[Dict[str, Any]], features: Dict[str,
 
 def export_markdown(con: sqlite3.Connection, tower_id: int) -> str:
     row = con.execute(
-        """
-        SELECT t.*, f.* FROM towers t
+        f"""
+        SELECT t.*, f.*, {LOCATION_QUALITY_SELECT_SQL} FROM towers t
         LEFT JOIN tower_features f ON f.tower_id=t.id
+        LEFT JOIN tower_location_quality lq ON lq.tower_id=t.id
         WHERE t.id=?
         """,
         (tower_id,),
@@ -3855,6 +3925,7 @@ def export_markdown(con: sqlite3.Connection, tower_id: int) -> str:
         f"- PCI: `{payload['pci']}`",
         f"- EARFCN: `{payload['earfcn']}`",
         f"- Analysis status: `{payload['analysis_status'] or ''}`",
+        f"- Location quality: `{payload['location_quality']}`",
         f"- Known: `{payload['known']}`",
         f"- Ignored: `{payload['ignored']}`",
         f"- Notes: `{payload['notes'] or ''}`",
@@ -3868,9 +3939,14 @@ def export_markdown(con: sqlite3.Connection, tower_id: int) -> str:
         f"- Observations: `{pts['c'] or 0}`",
         f"- Stationary observations: `{pts['stat'] or 0}`",
         f"- Bad GPS observations (excluded from features): `{pts['bad'] or 0}`",
+        f"- Accepted GPS observations: `{payload['valid_gps_count']}`",
+        f"- Weird/rejected GPS observations: `{payload['weird_gps_count']}`",
+        f"- Observations without coordinates: `{payload['unlocated_count']}`",
         f"- First timestamp: `{pts['first_ts']}`",
         f"- Last timestamp: `{pts['last_ts']}`",
-        f"- Robust center: `{payload['center_lat']}, {payload['center_lon']}`",
+        f"- Valid-GPS robust center: `{payload['center_lat']}, {payload['center_lon']}`",
+        f"- Weird-GPS fallback centroid (unreliable): `{payload['weird_center_lat']}, {payload['weird_center_lon']}`",
+        "- Location warning: Weird-GPS coordinates are retained only for coarse visual review. They are not a base-station estimate and are excluded from geographic scoring.",
         "",
         "## Evidence terms",
     ]
@@ -3978,9 +4054,10 @@ def _score_fill(probability: float) -> str:
 
 def export_docx(con: sqlite3.Connection, tower_id: int) -> bytes:
     row = con.execute(
-        """
-        SELECT t.*, f.* FROM towers t
+        f"""
+        SELECT t.*, f.*, {LOCATION_QUALITY_SELECT_SQL} FROM towers t
         LEFT JOIN tower_features f ON f.tower_id=t.id
+        LEFT JOIN tower_location_quality lq ON lq.tower_id=t.id
         WHERE t.id=?
         """,
         (tower_id,),
@@ -4008,7 +4085,7 @@ def export_docx(con: sqlite3.Connection, tower_id: int) -> bytes:
     children.append(_w_table(
         [
             ["Bayes posterior", "Rule score", "Observation count"],
-            [f"{score * 100:.4f}%", _fmt_num(payload.get("rule_score"), 2), str(payload.get("count") or 0)],
+            [f"{score * 100:.4f}%", _fmt_num(payload.get("rule_score"), 2), str(payload.get("total_observation_count") or 0)],
         ],
         [3120, 3120, 3120],
         fills=["E0F2FE", _score_fill(score)],
@@ -4024,6 +4101,7 @@ def export_docx(con: sqlite3.Connection, tower_id: int) -> bytes:
             ["Cell ID", payload.get("cell_id"), VARIABLE_GLOSSARY["cell_id"]],
             ["PCI", payload.get("pci"), VARIABLE_GLOSSARY["pci"]],
             ["EARFCN", payload.get("earfcn"), VARIABLE_GLOSSARY["earfcn"]],
+            ["Location quality", payload.get("location_quality"), VARIABLE_GLOSSARY["location_quality"]],
             ["Analysis status", payload.get("analysis_status") or "", "Manual review tag stored in the DB."],
             ["Known / ignored", f"{payload.get('known')} / {payload.get('ignored')}", "Manual DB flags that affect ranking/visibility."],
             ["Notes", payload.get("notes") or "", "Manual note stored in the DB for this tower."],
@@ -4032,15 +4110,32 @@ def export_docx(con: sqlite3.Connection, tower_id: int) -> bytes:
     ))
 
     children.append(_w_heading("Observation Summary", 1))
+    if payload.get("location_quality") == "weird_gps":
+        children.append(_w_para(
+            _w_run("WARNING — WEIRD GPS: ", bold=True, color="B45309", size=22),
+            _w_run(
+                "The fallback coordinates below are retained for coarse visual review only. They are not a base-station estimate and are excluded from geographic scoring.",
+                color="78350F",
+                size=20,
+            ),
+            before=40,
+            after=100,
+            shading="FEF3C7",
+            border_color="F59E0B",
+        ))
     children.append(_w_table(
         [
             ["Metric", "Value"],
             ["Raw tower observations", pts["c"] or 0],
             ["Stationary observations", pts["stat"] or 0],
             ["Bad GPS observations excluded from features", pts["bad"] or 0],
+            ["Accepted GPS observations", payload.get("valid_gps_count") or 0],
+            ["Weird/rejected GPS observations", payload.get("weird_gps_count") or 0],
+            ["Observations without coordinates", payload.get("unlocated_count") or 0],
             ["First timestamp", pts["first_ts"]],
             ["Last timestamp", pts["last_ts"]],
-            ["Robust center", f"{payload.get('center_lat')}, {payload.get('center_lon')}"],
+            ["Valid-GPS robust center", f"{payload.get('center_lat')}, {payload.get('center_lon')}"],
+            ["Weird-GPS fallback centroid (unreliable)", f"{payload.get('weird_center_lat')}, {payload.get('weird_center_lon')}"],
             ["GPS spread (m)", _fmt_num(features.get("gps_spread_m"), 1)],
             ["All clusters / top separation", f"{features.get('clusters')} / {_fmt_num(features.get('cluster_top2_sep_m'), 1)} m"],
             ["Stationary clusters / top separation", f"{features.get('stationary_clusters')} / {_fmt_num(features.get('stationary_cluster_top2_sep_m'), 1)} m"],
@@ -4249,7 +4344,7 @@ def index_html() -> str:
   </main>
 </div>
 <script>
-let map, towerLayer, estimateLayer, pointLayer, clusterLayer, badLayer, placeLayer, centerLayer, areaLegend;
+let map, towerLayer, weirdTowerLayer, estimateLayer, pointLayer, clusterLayer, badLayer, placeLayer, centerLayer, areaLegend;
 let allTowers=[];
 let towerTableItems=[], anomalyTableItems=[], adminTableItems=[];
 let tableSort={towerTable:{key:'bayes_post_p',dir:-1},anomalyTable:{key:'bayes_post_p',dir:-1},adminTable:{key:'bayes_post_p',dir:-1}};
@@ -4263,8 +4358,8 @@ const ANALYSIS_STATUS_VALUES=['','under analysis','analyzed','benign','suspiciou
 function initMap(){
   map=L.map('map',{minZoom:1,maxZoom:22}).setView([50.061,14.40],15);
   L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:22,attribution:'© OpenStreetMap'}).addTo(map);
-  estimateLayer=L.layerGroup().addTo(map); towerLayer=L.layerGroup().addTo(map); pointLayer=L.layerGroup().addTo(map); clusterLayer=L.layerGroup().addTo(map); badLayer=L.layerGroup().addTo(map); placeLayer=L.layerGroup().addTo(map); centerLayer=L.layerGroup().addTo(map);
-  L.control.layers(null,{"Tower estimate circles":estimateLayer,"Tower points":pointLayer,"Clusters":clusterLayer,"Bad GPS":badLayer,"Place buckets":placeLayer,"Center":centerLayer}).addTo(map);
+  estimateLayer=L.layerGroup().addTo(map); towerLayer=L.layerGroup().addTo(map); weirdTowerLayer=L.layerGroup().addTo(map); pointLayer=L.layerGroup().addTo(map); clusterLayer=L.layerGroup().addTo(map); badLayer=L.layerGroup().addTo(map); placeLayer=L.layerGroup().addTo(map); centerLayer=L.layerGroup().addTo(map);
+  L.control.layers(null,{"Valid-GPS tower centers":towerLayer,"⚠ Weird GPS tower locations (unreliable)":weirdTowerLayer,"Tower estimate circles":estimateLayer,"Tower points":pointLayer,"Clusters":clusterLayer,"Bad GPS observations":badLayer,"Place buckets":placeLayer,"Center":centerLayer}).addTo(map);
   areaLegend=L.control({position:'bottomright'});
   areaLegend.onAdd=()=>{
     const div=L.DomUtil.create('div','area-legend');
@@ -4287,6 +4382,12 @@ function noteIndicatorHtml(text){
 function analysisTagHtml(value){
   const text=String(value??'').trim();
   return text?`<span class="tag-badge">${esc(text)}</span>`:'—';
+}
+function locationQualityHtml(t){
+  const quality=String((t&&t.location_quality)||'unlocated');
+  if(quality==='valid_gps') return `<span class="status-tag imported" title="${Number(t.valid_gps_count||0)} accepted; ${Number(t.weird_gps_count||0)} weird GPS excluded">valid GPS</span>`;
+  if(quality==='weird_gps') return `<span class="status-tag error" title="Unreliable fallback from ${Number(t.weird_gps_count||0)} rejected GPS observation(s); excluded from geo scoring">⚠ weird GPS</span>`;
+  return `<span class="status-tag skipped" title="No coordinates available">unlocated</span>`;
 }
 function pointTooltipHtml(point, mode){
   const canToggle = Boolean(point && point.obs_uid);
@@ -4590,36 +4691,51 @@ function categoryVisible(cat){
   return document.getElementById('showNormal').checked;
 }
 function renderMapTowers(fit){
-  towerLayer.clearLayers(); estimateLayer.clearLayers();
+  towerLayer.clearLayers(); weirdTowerLayer.clearLayers(); estimateLayer.clearLayers();
   const threshold=minScore();
-  let bounds=[]; let shown=0; let counts={normal:0,anom:0,known:0,ignored:0}; let areaGroups=new Map();
+  let bounds=[]; let weirdBounds=[]; let shown=0; let exactShown=0; let weirdShown=0; let unlocated=0;
+  let counts={normal:0,anom:0,known:0,ignored:0}; let areaGroups=new Map();
   for(const t of allTowers){
     const cat=towerCategory(t); counts[cat]++;
     if(!categoryVisible(cat)) continue;
     if((Number(t.bayes_post_p)||0)<threshold) continue;
-    if(t.center_lat==null||t.center_lon==null) continue;
+    const hasExact=t.center_lat!=null&&t.center_lon!=null;
+    const hasWeird=!hasExact&&t.weird_center_lat!=null&&t.weird_center_lon!=null;
+    if(!hasExact&&!hasWeird){unlocated++; continue;}
     shown++;
     const areaKey=tacLacKey(t.tac_lac);
     const color=tacLacColor(areaKey);
     areaGroups.set(areaKey,(areaGroups.get(areaKey)||0)+1);
-    const spread=(t.features&&typeof t.features.gps_spread_m==='number')?t.features.gps_spread_m:null;
-    if(spread!==null){const radius=Math.max(5,Math.min(500,spread)); L.circle([t.center_lat,t.center_lon],{radius,color:'#94a3b8',weight:1,fillColor:'#94a3b8',fillOpacity:0.06,interactive:false,bubblingMouseEvents:false}).addTo(estimateLayer);}
-    const m=L.circleMarker([t.center_lat,t.center_lon],{radius:7+Math.min(12,(t.count||1)**0.35),color,fillColor:color,fillOpacity:.82,weight:2,interactive:true}).addTo(towerLayer);
-    m.bindTooltip(`${esc(t.label)}<br>TAC/LAC ${esc(areaKey===null?'unknown':areaKey)}<br>Bayes ${pct(t.bayes_post_p)} / seen ${t.count}${spread!==null?`<br>GPS spread ${Math.round(spread)} m`:''}`);
-    m.on('click',()=>openTower(t.id)); bounds.push([t.center_lat,t.center_lon]);
+    const obsCount=Number(t.total_observation_count||t.count||1);
+    const markerRadius=7+Math.min(12,obsCount**0.35);
+    if(hasExact){
+      exactShown++;
+      const spread=(t.features&&typeof t.features.gps_spread_m==='number')?t.features.gps_spread_m:null;
+      if(spread!==null){const radius=Math.max(5,Math.min(500,spread)); L.circle([t.center_lat,t.center_lon],{radius,color:'#94a3b8',weight:1,fillColor:'#94a3b8',fillOpacity:0.06,interactive:false,bubblingMouseEvents:false}).addTo(estimateLayer);}
+      const m=L.circleMarker([t.center_lat,t.center_lon],{radius:markerRadius,color,fillColor:color,fillOpacity:.82,weight:2,interactive:true}).addTo(towerLayer);
+      m.bindTooltip(`${esc(t.label)}<br><b>VALID GPS CENTER</b><br>TAC/LAC ${esc(areaKey===null?'unknown':areaKey)}<br>Bayes ${pct(t.bayes_post_p)} / observations ${obsCount}${Number(t.weird_gps_count||0)>0?`<br>Excluded weird GPS ${t.weird_gps_count}`:''}${spread!==null?`<br>GPS spread ${Math.round(spread)} m`:''}`);
+      m.on('click',()=>openTower(t.id)); bounds.push([t.center_lat,t.center_lon]);
+    }else{
+      weirdShown++;
+      const m=L.circleMarker([t.weird_center_lat,t.weird_center_lon],{radius:markerRadius,color:'#f59e0b',fillColor:color,fillOpacity:.42,weight:4,dashArray:'5 4',interactive:true}).addTo(weirdTowerLayer);
+      m.bindTooltip(`<b>⚠ WEIRD GPS — UNRELIABLE LOCATION</b><br>${esc(t.label)}<br>TAC/LAC ${esc(areaKey===null?'unknown':areaKey)}<br>Rejected GPS observations ${Number(t.weird_gps_count||0)}<br>This is a fallback observation centroid, not a base-station position.<br>Excluded from geographic scoring.`);
+      m.on('click',()=>openTower(t.id)); weirdBounds.push([t.weird_center_lat,t.weird_center_lon]);
+    }
   }
   updateAreaLegend(areaGroups);
   const from=document.getElementById('lastSeenFrom').value, to=document.getElementById('lastSeenTo').value;
   const dateStatus=(from||to)?` · last seen ${from||'any date'} to ${to||'any date'} UTC`:'';
-  document.getElementById('mapStatus').textContent=`${shown}/${allTowers.length} shown · normal ${counts.normal} · anomalous ${counts.anom} · known ${counts.known} · ignored ${counts.ignored} · min Bayes ${pct(threshold)}${dateStatus}`;
-  if(fit&&bounds.length) map.fitBounds(bounds,{padding:[30,30],maxZoom:17});
+  document.getElementById('mapStatus').textContent=`${shown}/${allTowers.length} mapped · valid GPS ${exactShown} · weird GPS ${weirdShown} · unlocated ${unlocated} · normal ${counts.normal} · anomalous ${counts.anom} · known ${counts.known} · ignored ${counts.ignored} · min Bayes ${pct(threshold)}${dateStatus}`;
+  const fitBounds=bounds.length?bounds:weirdBounds;
+  if(fit&&fitBounds.length) map.fitBounds(fitBounds,{padding:[30,30],maxZoom:17});
 }
     // Put these on `window` so inline onclick handlers can see them reliably.
     // Used only when the user explicitly clicks "Load table".
     window.AUTO_OBS_TABLE_LIMIT = 2000; // keep drawer snappy; user can "Load all" if needed
     async function openTower(id, opts={}){
       const t=await api('/api/towers/'+id); currentTowerData=t; drawerShowAllMethods=false; renderDrawer(t);
-      if(opts.recenter && t.center_lat!=null) map.setView([t.center_lat,t.center_lon], Math.max(map.getZoom(),17));
+      const lat=t.center_lat??t.weird_center_lat, lon=t.center_lon??t.weird_center_lon;
+      if(opts.recenter && lat!=null&&lon!=null) map.setView([lat,lon], Math.max(map.getZoom(),t.location_quality==='weird_gps'?15:17));
     }
 	function pickFeatures(f){const keys=['count','days_seen','stationary_count','gps_spread_m','clusters','cluster_top2_sep_m','stationary_clusters','stationary_cluster_top2_sep_m','signal_dist_model','stationary_signal_mad','stationary_signal_mad_z','stationary_jump_rate_8db','stationary_jump_rate_z','stationary_param_obs','stationary_pci_change_rate_z','stationary_earfcn_change_rate_z','local_stationary_window_min','local_stationary_window_frac','change_places_frac_stationary','place_rat_surprise','new_place_id','new_place_count','new_place_first_seen_local','new_place_prior_range','new_place_prior_count','new_place_prior_days','new_place_prior_stationary_count','new_place_prior_stationary_days','new_area_code_prior_same_rat_count','new_area_code_prior_same_rat_days','new_area_code_prior_same_code_count','new_area_code_prior_distinct_codes','new_area_code_prior_dominant_code','new_area_code_prior_dominant_frac','new_area_code_prior_range','new_place_post_count','new_place_post_days','new_place_post_stationary_count','new_place_post_stationary_days','stability_bonus','bad_gps_skipped','altitude_samples','altitude_rel_median_m','altitude_rel_p90_m','high_altitude_obs_frac','geo_altitude_confidence','stationary_altitude_samples','stationary_altitude_rel_median_m','stationary_altitude_rel_p90_m','stationary_high_altitude_obs_frac','stationary_geo_altitude_confidence']; let o={}; keys.forEach(k=>{if(f&&f[k]!==undefined)o[k]=f[k]}); return o}
 	function bucketExplainerHtml(){
@@ -4634,14 +4750,23 @@ function renderMapTowers(fit){
 	function renderDrawer(t){
 	  document.getElementById('drawer').classList.add('open');
 	  document.getElementById('drawerTitle').textContent=t.label;
-	  document.getElementById('drawerSub').textContent=`Bayes ${pct(t.bayes_post_p)} · rules ${Number(t.rule_score||0).toFixed(2)} · seen ${t.count}`;
+	  const totalObs=Number(t.total_observation_count||t.count||0);
+	  document.getElementById('drawerSub').textContent=`Bayes ${pct(t.bayes_post_p)} · rules ${Number(t.rule_score||0).toFixed(2)} · observations ${totalObs} · location ${t.location_quality||'unlocated'}`;
   const allMethods=(t.methods||[]).slice().sort((a,b)=>Math.abs(b.delta_logodds||0)-Math.abs(a.delta_logodds||0));
   const shownMethods=drawerShowAllMethods ? allMethods : allMethods.filter(m=>m.triggered);
   const hiddenCount=Math.max(0, allMethods.length - shownMethods.length);
   const toggleLabel=drawerShowAllMethods ? 'Hide inactive methods' : `Show all methods${hiddenCount?` (${hiddenCount} hidden)`:''}`;
+	  const locationQuality=t.location_quality||'unlocated';
+	  const weirdCount=Number(t.weird_gps_count||0), validCount=Number(t.valid_gps_count||0), unlocatedCount=Number(t.unlocated_count||0);
+	  const locationNotice=locationQuality==='weird_gps'
+	    ? `<div class="status-line warn"><b>⚠ WEIRD GPS — UNRELIABLE MAP LOCATION</b><br>This marker is the average of ${weirdCount} rejected GPS observation(s) at <code>${esc(t.weird_center_lat)}, ${esc(t.weird_center_lon)}</code>. It is not a base-station estimate and is excluded from every geographic anomaly method. Cellular and temporal evidence remain available below.</div>`
+	    : locationQuality==='valid_gps'
+	      ? `<div class="status-line success"><b>Valid-GPS tower center</b><br>${validCount} accepted GPS observation(s) determine the center.${weirdCount?` ${weirdCount} weird-GPS observation(s) were retained in the database but excluded from the center and geographic scoring.`:''}</div>`
+	      : `<div class="status-line warn"><b>Unlocated tower</b><br>No usable or fallback coordinates exist. ${unlocatedCount} observation(s) had no coordinates. Cellular and temporal evidence remain available, but this tower cannot be placed on the map.</div>`;
 	  document.getElementById('drawerBody').innerHTML=`
 	    <div class="pillbar"><button class="ghost" onclick="showPoints(${t.id},'all')" title="Overlay all good-GPS observation points for this tower (blue).">Obs points</button><button class="ghost" onclick="showPoints(${t.id},'raw')" title="Overlay all good-GPS observation points for this tower as small green dots.">Raw obs</button><button class="ghost" onclick="showPoints(${t.id},'stationary')" title="Overlay only stationary observations for this tower (green).">Stationary</button><button class="ghost" onclick="showPoints(${t.id},'bad')" title="Overlay excluded bad-GPS observations (orange).">Bad GPS</button><button class="ghost" onclick="showPoints(${t.id},'clusters')" title="Show cluster centers/radii used by multi-location methods.">Clusters</button><button class="ghost" onclick="showPoints(${t.id},'places')" title="Show place buckets (z17 tiles) where this tower was seen.">Place buckets</button><button class="ghost" onclick="clearOverlays()" title="Clear overlay layers.">Clear overlays</button></div>
 	    ${bucketExplainerHtml()}
+	    ${locationNotice}
 	    <div class="pillbar"><a class="badge" href="/api/towers/${t.id}/export.md">Export MD</a><a class="badge" href="/api/towers/${t.id}/export.docx">Export DOCX</a><button class="ghost" onclick="recomputeOneTower(${t.id})">Recompute this tower</button><button id="wigleEnrichButton" class="ghost" onclick="enrichTowerWithWigle(${t.id},${Boolean(t.wigle_enrichment)})">${t.wigle_enrichment?'Refresh WiGLE':'Check WiGLE'}</button><span id="towerRecomputeStatus" class="small"></span></div>
       <div id="wigleEnrichmentBox"></div>
 	    <div class="meta-editor">
@@ -4660,7 +4785,7 @@ function renderMapTowers(fit){
         <span id="towerMetaStatus" class="small">${t.has_note?'Stored note present.':'No note stored.'}</span>
       </div>
     </div>
-    <h3>Identity</h3><div class="grid2">${['operator','rat','tac_lac','cell_id','pci','earfcn'].map(k=>`<div><b>${k}</b><br><code>${esc(t[k])}</code></div>`).join('')}</div>
+    <h3>Identity and location quality</h3><div class="grid2">${['operator','rat','tac_lac','cell_id','pci','earfcn','location_quality','total_observation_count','valid_gps_count','weird_gps_count','unlocated_count'].map(k=>`<div><b>${k}</b><br><code>${esc(t[k])}</code></div>`).join('')}</div>
     <h3>Important feature values</h3>${renderFeatureTable(t.features)}
     ${renderAltitudeView(t.altitude_view)}
       <h3>Observations</h3>
@@ -4883,7 +5008,8 @@ async function loadAnomalyTable(){
 }
 async function loadAdmin(){const q=document.getElementById('adminSearch').value.trim(); const data=await api('/api/towers?limit=5000&q='+encodeURIComponent(q)+'&include_ignored=1'); adminTableItems=data.items; renderTowerTable('adminTable',adminTableItems,true)}
 function sortValue(t,key){
-  if(key==='bayes_post_p'||key==='rule_score'||key==='count'||key==='tac_lac'||key==='cell_id'||key==='pci'||key==='earfcn') return Number(t[key]??-Infinity);
+  if(key==='count') return Number(t.total_observation_count??t.count??-Infinity);
+  if(key==='bayes_post_p'||key==='rule_score'||key==='tac_lac'||key==='cell_id'||key==='pci'||key==='earfcn') return Number(t[key]??-Infinity);
   if(key==='has_note') return t[key]?1:0;
   if(key==='known'||key==='ignored') return t[key]?1:0;
   return String(t[key]??'').toLowerCase();
@@ -4927,6 +5053,7 @@ function renderTowerTable(id,items,admin){
     sortHeader(id,'bayes_post_p','Bayes'),
     sortHeader(id,'rule_score','Rules'),
     sortHeader(id,'count','Seen'),
+    sortHeader(id,'location_quality','Location'),
     sortHeader(id,'operator','Operator'),
     sortHeader(id,'rat','RAT'),
     sortHeader(id,'tac_lac','TAC/LAC'),
@@ -4939,7 +5066,7 @@ function renderTowerTable(id,items,admin){
     sortHeader(id,'ignored','Ignored'),
     admin?'<th>Delete</th>':''
   ].join('');
-  document.getElementById(id).innerHTML=`<tr>${headers}</tr>`+sorted.map(t=>`<tr><td><button class="ghost" onclick="showTowerOnMap(${t.id},event)">Show</button></td><td class="score">${pct(t.bayes_post_p)}</td><td class="score">${Number(t.rule_score||0).toFixed(2)}</td><td>${t.count}</td><td>${esc(t.operator)}</td><td>${esc(t.rat)}</td><td><code>${esc(t.tac_lac)}</code></td><td><code>${esc(t.cell_id)}</code></td><td><code>${esc(t.pci)}</code></td><td><code>${esc(t.earfcn)}</code></td><td>${analysisTagHtml(t.analysis_status)}</td><td>${noteIndicatorHtml(t.notes)}</td><td onclick="event.stopPropagation()"><input type="checkbox" ${t.known?'checked':''} onchange="patchTower(${t.id},{known:this.checked})" title="Known tower"></td><td onclick="event.stopPropagation()"><input type="checkbox" ${t.ignored?'checked':''} onchange="patchTower(${t.id},{ignored:this.checked})" title="Ignored tower"></td>${admin?`<td onclick="event.stopPropagation()"><button class="ghost" onclick="deleteTower(${t.id})">Delete</button></td>`:''}</tr>`).join('');
+  document.getElementById(id).innerHTML=`<tr>${headers}</tr>`+sorted.map(t=>`<tr><td><button class="ghost" onclick="showTowerOnMap(${t.id},event)">Show</button></td><td class="score">${pct(t.bayes_post_p)}</td><td class="score">${Number(t.rule_score||0).toFixed(2)}</td><td>${t.total_observation_count??t.count}</td><td>${locationQualityHtml(t)}</td><td>${esc(t.operator)}</td><td>${esc(t.rat)}</td><td><code>${esc(t.tac_lac)}</code></td><td><code>${esc(t.cell_id)}</code></td><td><code>${esc(t.pci)}</code></td><td><code>${esc(t.earfcn)}</code></td><td>${analysisTagHtml(t.analysis_status)}</td><td>${noteIndicatorHtml(t.notes)}</td><td onclick="event.stopPropagation()"><input type="checkbox" ${t.known?'checked':''} onchange="patchTower(${t.id},{known:this.checked})" title="Known tower"></td><td onclick="event.stopPropagation()"><input type="checkbox" ${t.ignored?'checked':''} onchange="patchTower(${t.id},{ignored:this.checked})" title="Ignored tower"></td>${admin?`<td onclick="event.stopPropagation()"><button class="ghost" onclick="deleteTower(${t.id})">Delete</button></td>`:''}</tr>`).join('');
 }
 function renderAnomalyTable(){
   const id='anomalyTable', sorted=sortTowerItems(anomalyTableItems,id);
@@ -4948,13 +5075,14 @@ function renderAnomalyTable(){
     sortHeader(id,'bayes_post_p','Bayes'),
     sortHeader(id,'rule_score','Rules'),
     sortHeader(id,'count','Seen'),
+    sortHeader(id,'location_quality','Location'),
     sortHeader(id,'operator','Operator'),
     sortHeader(id,'rat','RAT'),
     sortHeader(id,'tac_lac','TAC/LAC'),
     sortHeader(id,'cell_id','Cell ID'),
     '<th>Triggered anomalies</th>'
   ].join('');
-  document.getElementById(id).innerHTML=`<tr>${headers}</tr>`+sorted.map(t=>`<tr><td><button class="ghost" onclick="showTowerOnMap(${t.id},event)">Show</button></td><td class="score">${pct(t.bayes_post_p)}</td><td class="score">${Number(t.rule_score||0).toFixed(2)}</td><td>${t.count}</td><td>${esc(t.operator)}</td><td>${esc(t.rat)}</td><td><code>${esc(t.tac_lac)}</code></td><td><code>${esc(t.cell_id)}</code></td><td><div class="pillbar">${(t.triggered_anomalies||[]).map(m=>`<span class="tag-badge" title="${esc(m.why||'')}">${esc(m.label)} <code>+${Number(m.delta_logodds||0).toFixed(2)}</code></span>`).join('')}</div></td></tr>`).join('');
+  document.getElementById(id).innerHTML=`<tr>${headers}</tr>`+sorted.map(t=>`<tr><td><button class="ghost" onclick="showTowerOnMap(${t.id},event)">Show</button></td><td class="score">${pct(t.bayes_post_p)}</td><td class="score">${Number(t.rule_score||0).toFixed(2)}</td><td>${t.total_observation_count??t.count}</td><td>${locationQualityHtml(t)}</td><td>${esc(t.operator)}</td><td>${esc(t.rat)}</td><td><code>${esc(t.tac_lac)}</code></td><td><code>${esc(t.cell_id)}</code></td><td><div class="pillbar">${(t.triggered_anomalies||[]).map(m=>`<span class="tag-badge" title="${esc(m.why||'')}">${esc(m.label)} <code>+${Number(m.delta_logodds||0).toFixed(2)}</code></span>`).join('')}</div></td></tr>`).join('');
 }
 function setTowerMetaStatus(kind,text){
   const el=document.getElementById('towerMetaStatus'); if(!el) return;
@@ -5323,8 +5451,9 @@ def create_app(db_path: str):
         if sort == "count":
             order = "COALESCE(f.count,0) DESC"
         sql = f"""
-          SELECT t.*, f.* FROM towers t
+          SELECT t.*, f.*, {LOCATION_QUALITY_SELECT_SQL} FROM towers t
           LEFT JOIN tower_features f ON f.tower_id=t.id
+          LEFT JOIN tower_location_quality lq ON lq.tower_id=t.id
           WHERE {' AND '.join(clauses)}
           ORDER BY {order}
           LIMIT ? OFFSET ?
@@ -5343,8 +5472,9 @@ def create_app(db_path: str):
         if not include_ignored:
             clauses.append("t.ignored=0")
         sql = f"""
-          SELECT t.*, f.* FROM towers t
+          SELECT t.*, f.*, {LOCATION_QUALITY_SELECT_SQL} FROM towers t
           LEFT JOIN tower_features f ON f.tower_id=t.id
+          LEFT JOIN tower_location_quality lq ON lq.tower_id=t.id
           WHERE {' AND '.join(clauses)}
           ORDER BY COALESCE(f.bayes_post_p,0) DESC, COALESCE(f.rule_score,0) DESC
         """
@@ -5403,7 +5533,13 @@ def create_app(db_path: str):
     def api_tower(tower_id: int) -> Dict[str, Any]:
         with connect_db(db_path) as con:
             app_config = get_app_config(con)
-            row = con.execute("SELECT t.*, f.* FROM towers t LEFT JOIN tower_features f ON f.tower_id=t.id WHERE t.id=?", (tower_id,)).fetchone()
+            row = con.execute(
+                f"""SELECT t.*, f.*, {LOCATION_QUALITY_SELECT_SQL} FROM towers t
+                LEFT JOIN tower_features f ON f.tower_id=t.id
+                LEFT JOIN tower_location_quality lq ON lq.tower_id=t.id
+                WHERE t.id=?""",
+                (tower_id,),
+            ).fetchone()
             if not row:
                 return JSONResponse({"error": "not found"}, status_code=404)
             payload = tower_payload(row, enrich_methods=True)
