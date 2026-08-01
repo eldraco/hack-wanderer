@@ -89,6 +89,7 @@ Main tables:
 - `tower_observations`: one row per tower/cell observation inside a log sample.
 - `towers`: stable tower fingerprint plus editable label, notes, known flag, and ignored flag.
 - `tower_features`: latest derived values, method evidence, Bayes score, rule score, and robust center.
+- `tower_location_quality`: a live SQLite view that labels each tower `valid_gps`, `weird_gps`, or `unlocated`, includes accepted/rejected coordinate counts, and exposes an explicitly unreliable fallback centroid for towers seen only with rejected GPS.
 - `anomaly_methods`: built-in method registry with help text, equations, variables, default thresholds, and map-layer hints.
 - `method_settings`: your edited enabled/weight/threshold settings.
 
@@ -103,6 +104,14 @@ Imports are idempotent:
 ### Map
 
 Shows towers as Leaflet markers. Marker color groups cells by their reported TAC/LAC: every marker with the same TAC/LAC uses the same deterministic color, and missing TAC/LAC values are gray. The map legend lists the colors and the number of currently visible towers in each group. Hide it with its × button or the **TAC/LAC legend** toolbar checkbox; the choice is remembered across reloads. This makes a cell using one area's code from a geographically separate location easier to spot. Bayes posterior remains visible in each marker tooltip and in the tower drawer.
+
+Location quality is deliberately separate from TAC/LAC color:
+
+- normal markers are robust centers made only from accepted GPS fixes,
+- orange, thick, dashed markers with a warning tooltip are coarse centroids made only from rejected/weird GPS fixes,
+- the Leaflet layer control can independently hide **Weird GPS tower locations (unreliable)**,
+- weird-GPS centroids are never treated as base-station positions and never enter geographic anomaly scoring,
+- when valid centers exist, weird-GPS points do not expand the initial map bounds.
 
 Use the toolbar to search identifiers, filter towers by an inclusive UTC last-seen date range, hide known towers, include ignored towers, or show anomaly-only towers.
 
@@ -219,6 +228,22 @@ Bad GPS means either:
 - consecutive valid fixes imply an impossible speed jump.
 
 These points remain visible in the UI, but they do not create false anomaly evidence.
+
+For indoor/airport logs where every coordinate is rejected, the app still permits coarse cellular and temporal review. It stores the individual observations with `bad_gps=1`, labels the tower `weird_gps` in the `tower_location_quality` view, and draws its rejected-coordinate centroid in the warning layer. This is intentionally marked unreliable everywhere: map tooltip, tower drawer, Towers/Anomalies tables, Markdown export, and DOCX export.
+
+You can inspect the distinction directly in SQLite:
+
+```sql
+SELECT tower_id, location_quality,
+       valid_gps_count, weird_gps_count, unlocated_count,
+       weird_center_lat, weird_center_lon
+FROM tower_location_quality
+ORDER BY weird_gps_count DESC;
+
+SELECT tower_id, ts, lat, lon, bad_gps, ignored
+FROM tower_observations
+WHERE bad_gps = 1;
+```
 
 Altitude is also stored when the fix looks valid:
 
