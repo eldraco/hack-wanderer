@@ -738,7 +738,7 @@ VARIABLE_GLOSSARY: Dict[str, str] = {
     "weird_gps_count": "Number of non-ignored observations for this tower whose GPS coordinates were rejected. These observations remain available for cellular/temporal review but never enter geographic anomaly scoring.",
     "stationary": "A sample marked stationary because the device stayed within a small radius long enough, with low implied speed between fixes and low GPS-reported speed when that direct speed was available from the log.",
     "alt_m": "Altitude in meters attached to the sample when available from GPS. For external NMEA GPS this often comes from the GGA sentence.",
-    "place_id": "A Web-Mercator map-tile bucket at zoom 17. It groups nearby samples into a local place without needing external geocoding.",
+    "place_id": "A Web-Mercator map-tile bucket at zoom 17, assigned only to accepted GPS fixes. Rejected bad-GPS and ignored observations never contribute to place-bucket analysis or overlays.",
     "gps_spread_m": "Median distance in meters from this tower's points to its robust inferred center after bad GPS exclusion.",
     "clusters": "Greedy spatial clusters made from all valid GPS points for the same tower fingerprint.",
     "cluster_top2_sep_m": "Distance between the two largest all-point cluster centers.",
@@ -1549,6 +1549,26 @@ def migrate_db(con: sqlite3.Connection) -> None:
     ensure_column(con, "import_files", "new_observations", "INTEGER NOT NULL DEFAULT 0")
     ensure_column(con, "towers", "analysis_status", "TEXT NOT NULL DEFAULT ''")
     con.executescript(LOCATION_QUALITY_VIEW_SQL)
+    place_cleanup_key = "migration_clear_bad_gps_place_ids_v1"
+    if not get_app_setting(con, place_cleanup_key, False):
+        # place_id is derived from coordinates. Keeping it on a rejected fix is
+        # misleading even when downstream scoring correctly filters bad_gps.
+        # Drive the raw-sample update from the much smaller observation table;
+        # scanning raw_samples itself is expensive because it contains raw JSON.
+        con.execute(
+            """
+            UPDATE raw_samples
+            SET place_id=NULL
+            WHERE bad_gps=1
+              AND sample_uid IN (
+                SELECT DISTINCT sample_uid
+                FROM tower_observations
+                WHERE bad_gps=1 AND place_id IS NOT NULL
+              )
+            """
+        )
+        con.execute("UPDATE tower_observations SET place_id=NULL WHERE bad_gps=1 AND place_id IS NOT NULL")
+        set_app_setting(con, place_cleanup_key, True)
     con.commit()
 
 
@@ -2530,13 +2550,14 @@ def ingest_files(
                             speed = implied_speed_mps(prev_fix[0], prev_fix[1], prev_fix[2], lat, lon, ts)
                             if speed is not None and speed > BAD_GPS_SPEED_MPS:
                                 bad_gps = 1
-                        if ts is not None and not bad_gps:
-                            prev_fix = (lat, lon, ts)
-                        try:
-                            x, y = latlon_to_tile(lat, lon, PLACE_ZOOM)
-                            place_id = f"z{PLACE_ZOOM}/{x}/{y}"
-                        except Exception:
-                            place_id = None
+                        if not bad_gps:
+                            if ts is not None:
+                                prev_fix = (lat, lon, ts)
+                            try:
+                                x, y = latlon_to_tile(lat, lon, PLACE_ZOOM)
+                                place_id = f"z{PLACE_ZOOM}/{x}/{y}"
+                            except Exception:
+                                place_id = None
                     content_hash = stable_uid(ts_iso or "", line)
                     sample_uid = stable_uid(digest, line_no, ts_iso or "", content_hash)
                     gps_source, gps_status, hdop = gps_meta(obj)
@@ -5599,7 +5620,11 @@ def create_app(db_path: str):
                 "raw_sample": json_loads(r["raw_json"], {}) if (include_raw and r["raw_json"]) else {},
             }
         places = []
-        place_counts = Counter(r["place_id"] for r in rows if r["place_id"])
+        place_counts = Counter(
+            r["place_id"]
+            for r in rows
+            if r["place_id"] and not r["bad_gps"] and not r["ignored"]
+        )
         for pid, count in place_counts.items():
             places.append({"place_id": pid, "count": count, "bounds": _place_bounds(pid)})
         all_points = [point(r) for r in rows]
