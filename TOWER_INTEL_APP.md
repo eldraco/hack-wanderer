@@ -231,6 +231,8 @@ These points remain visible in the UI, but they do not create false anomaly evid
 
 For indoor/airport logs where every coordinate is rejected, the app still permits coarse cellular and temporal review. It stores the individual observations with `bad_gps=1`, labels the tower `weird_gps` in the `tower_location_quality` view, and draws its rejected-coordinate centroid in the warning layer. This is intentionally marked unreliable everywhere: map tooltip, tower drawer, Towers/Anomalies tables, Markdown export, and DOCX export.
 
+Rejected GPS coordinates never receive a `place_id` and never contribute to place-bucket counts, prior/post coverage, local altitude floors, or the **Place buckets** map overlay. Ignored observations are excluded from those bucket calculations and overlays as well.
+
 You can inspect the distinction directly in SQLite:
 
 ```sql
