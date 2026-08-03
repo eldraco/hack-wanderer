@@ -1,3 +1,4 @@
+import datetime as dt
 import json
 import os
 import sqlite3
@@ -74,6 +75,14 @@ class TowerIntelTests(unittest.TestCase):
         self.assertIn("WEIRD GPS — UNRELIABLE LOCATION", page)
         self.assertIn("fallback observation centroid, not a base-station position", page)
 
+    def test_towers_table_shows_location_and_seen_dates(self):
+        page = intel.index_html()
+        self.assertIn("function towerLocationHtml(t)", page)
+        self.assertIn("function seenDateHtml(ts)", page)
+        self.assertIn("sortHeader(id,'location','Location')", page)
+        self.assertIn("sortHeader(id,'first_seen_ts','First seen')", page)
+        self.assertIn("sortHeader(id,'last_seen_ts','Last seen')", page)
+
     def test_identity_and_jsonl_import_are_idempotent(self):
         write_jsonl(self.log, self.make_rows())
         first = intel.ingest_files(self.db, [str(self.log)])
@@ -110,12 +119,16 @@ class TowerIntelTests(unittest.TestCase):
             report = intel.export_markdown(con, con.execute("SELECT id FROM towers").fetchone()[0])
             self.assertIn("Tower report", report)
             self.assertIn("Evidence terms", report)
+            self.assertIn("Local visit baseline (dwell model v2)", report)
+            self.assertIn("Raw / family-capped", report)
             docx = intel.export_docx(con, con.execute("SELECT id FROM towers").fetchone()[0])
             docx_path = Path(self.tmp.name) / "tower.docx"
             docx_path.write_bytes(docx)
             with zipfile.ZipFile(docx_path) as z:
                 document_xml = z.read("word/document.xml").decode("utf-8")
             self.assertIn("Tower Intelligence Report", document_xml)
+            self.assertIn("Local Visit Baseline (Dwell Model v2)", document_xml)
+            self.assertIn("Raw / effective", document_xml)
             self.assertIn("<w:tbl>", document_xml)
             self.assertIn('w:fill="', document_xml)
             imports = con.execute("SELECT path, imported_rows, new_samples, tower_fingerprints, new_towers, observation_rows, new_observations FROM import_files").fetchall()
@@ -182,6 +195,8 @@ class TowerIntelTests(unittest.TestCase):
         self.assertAlmostEqual(quality["weird_center_lon"], 14.2002)
         self.assertEqual(payload["location_quality"], "weird_gps")
         self.assertEqual(payload["total_observation_count"], 1)
+        self.assertIsNotNone(payload["first_seen_ts"])
+        self.assertEqual(payload["first_seen_ts"], payload["last_seen_ts"])
         self.assertIn("Weird-GPS fallback centroid (unreliable)", report)
         self.assertIn("excluded from geographic scoring", report)
 
@@ -224,20 +239,30 @@ class TowerIntelTests(unittest.TestCase):
             intel.recompute(self.db, sample_size=100, refresh_stationary=True)
         self.assertGreaterEqual(refresh_mock.call_count, 1)
 
-    def test_method_setting_changes_score_after_recompute(self):
+    def test_method_setting_changes_raw_evidence_but_family_cap_limits_score(self):
         write_jsonl(self.log, self.make_rows())
         intel.ingest_files(self.db, [str(self.log)])
         intel.recompute(self.db, sample_size=100)
         with intel.connect_db(self.db) as con:
-            before = con.execute("SELECT bayes_post_p FROM tower_features").fetchone()[0]
+            before_row = con.execute("SELECT bayes_post_p,methods_json FROM tower_features").fetchone()
+            before_method = next(m for m in json.loads(before_row["methods_json"]) if m["id"] == "multi_location")
             con.execute("UPDATE method_settings SET weight=8 WHERE method_id='multi_location'")
             con.commit()
         intel.recompute(self.db, sample_size=100)
         with intel.connect_db(self.db) as con:
-            after = con.execute("SELECT bayes_post_p FROM tower_features").fetchone()[0]
-        self.assertGreater(after, before)
+            after_row = con.execute("SELECT bayes_post_p,methods_json FROM tower_features").fetchone()
+        after_methods = json.loads(after_row["methods_json"])
+        after_method = next(m for m in after_methods if m["id"] == "multi_location")
+        self.assertGreater(after_method["raw_delta_logodds"], before_method["raw_delta_logodds"])
+        location_total = sum(
+            float(m["delta_logodds"])
+            for m in after_methods
+            if m.get("family") == "location_gps" and float(m.get("delta_logodds") or 0) > 0
+        )
+        self.assertLessEqual(location_total, intel.EVIDENCE_FAMILY_CAPS[("location_gps", "up")] + 1e-9)
+        self.assertGreaterEqual(after_row["bayes_post_p"], before_row["bayes_post_p"])
 
-    def test_new_area_code_in_well_covered_place_triggers_for_locally_unseen_tac(self):
+    def test_legacy_raw_count_area_code_method_is_disabled(self):
         rows = []
         for i in range(50):
             day = 1 if i < 25 else 2
@@ -294,11 +319,111 @@ class TowerIntelTests(unittest.TestCase):
         methods = json.loads(row["methods_json"])
         method = next(m for m in methods if m["id"] == "new_area_code_in_well_covered_place")
 
-        self.assertTrue(method["triggered"])
+        self.assertFalse(method["enabled"])
+        self.assertFalse(method["triggered"])
         self.assertGreater(features["new_area_code_prior_same_rat_count"], 40)
         self.assertEqual(features["new_area_code_prior_same_code_count"], 0)
         self.assertEqual(features["new_area_code_prior_dominant_code"], 100)
         self.assertGreater(features["new_area_code_prior_dominant_frac"], 0.9)
+
+    def test_recompute_scores_repeated_cell_as_new_only_on_later_visit(self):
+        rows = []
+        for visit_day, windows in ((1, 6), (2, 4)):
+            for window in range(windows):
+                towers = [{
+                    "rat": "LTE", "tac_lac": 123, "cell_id": 100,
+                    "pci": 7, "earfcn": 1400, "rsrp": -92,
+                }]
+                if visit_day == 2:
+                    towers.append({
+                        "rat": "LTE", "tac_lac": 123, "cell_id": 999,
+                        "pci": 31, "earfcn": 1650, "rsrp": -75,
+                    })
+                rows.append({
+                    "timestamp_utc": f"2027-01-0{visit_day}T12:{window * 10:02d}:00Z",
+                    "location": {"lat": 50.0, "lon": 14.0},
+                    "network": {"cops_current": {"operator": "TestNet"}},
+                    "towers": towers,
+                })
+        write_jsonl(self.log, rows)
+        intel.ingest_files(self.db, [str(self.log)])
+        intel.recompute(self.db, sample_size=100)
+
+        with intel.connect_db(self.db) as con:
+            row = con.execute(
+                """
+                SELECT f.features_json,f.methods_json
+                FROM tower_features f JOIN towers t ON t.id=f.tower_id
+                WHERE t.operator='TestNet' AND t.rat='LTE' AND t.tac_lac=123 AND t.cell_id=999
+                """
+            ).fetchone()
+        features = json.loads(row["features_json"])
+        method = next(m for m in json.loads(row["methods_json"]) if m["id"] == "new_in_well_covered_place")
+        self.assertEqual(features["local_novelty_state"], "locally_new")
+        self.assertGreaterEqual(features["local_novelty_prior_windows"], 3)
+        self.assertEqual(features["local_novelty_current_windows"], 4)
+        self.assertTrue(features["coarse_identity_primary"])
+        self.assertTrue(method["triggered"])
+        self.assertGreater(method["delta_logodds"], 0.0)
+
+    def test_single_tower_recompute_rescores_every_shared_dwell_consumer(self):
+        rows = []
+        for visit_day, windows in ((1, 6), (2, 4)):
+            for window in range(windows):
+                towers = [{
+                    "rat": "LTE", "tac_lac": 123, "cell_id": 100,
+                    "pci": 7, "earfcn": 1400, "rsrp": -92,
+                }]
+                if visit_day == 2:
+                    towers.append({
+                        "rat": "LTE", "tac_lac": 123, "cell_id": 999,
+                        "pci": 31, "earfcn": 1650, "rsrp": -75,
+                    })
+                rows.append({
+                    "timestamp_utc": f"2027-01-0{visit_day}T12:{window * 10:02d}:00Z",
+                    "location": {"lat": 50.0, "lon": 14.0},
+                    "network": {"cops_current": {"operator": "TestNet"}},
+                    "towers": towers,
+                })
+        write_jsonl(self.log, rows)
+        intel.ingest_files(self.db, [str(self.log)])
+        intel.recompute(self.db, sample_size=100)
+
+        with intel.connect_db(self.db) as con:
+            ids = {
+                int(row["cell_id"]): int(row["id"])
+                for row in con.execute("SELECT id,cell_id FROM towers").fetchall()
+            }
+            before = json.loads(con.execute(
+                "SELECT features_json FROM tower_features WHERE tower_id=?",
+                (ids[999],),
+            ).fetchone()[0])
+            self.assertTrue(before["local_novelty_triggered"])
+            # Remove the only completed prior-visit opportunity. Recomputing
+            # the candidate must also refresh the baseline tower's shared
+            # window count rather than leave its old dwell score behind.
+            con.execute(
+                "UPDATE tower_observations SET ignored=1 WHERE tower_id=? AND ts<?",
+                (ids[100], dt.datetime(2027, 1, 2, tzinfo=dt.timezone.utc).timestamp()),
+            )
+            con.commit()
+
+        result = intel.recompute_one_tower(self.db, ids[999], sample_size=100)
+        self.assertEqual(result["updated_towers"], 1)
+        self.assertEqual(result["rescored_towers"], 2)
+
+        with intel.connect_db(self.db) as con:
+            candidate = json.loads(con.execute(
+                "SELECT features_json FROM tower_features WHERE tower_id=?",
+                (ids[999],),
+            ).fetchone()[0])
+            baseline = json.loads(con.execute(
+                "SELECT features_json FROM tower_features WHERE tower_id=?",
+                (ids[100],),
+            ).fetchone()[0])
+        self.assertEqual(candidate["local_novelty_state"], "baseline_building")
+        self.assertFalse(candidate["local_novelty_triggered"])
+        self.assertEqual(baseline["effective_observation_windows"], 4)
 
     def test_method_xai_rows_explain_equation_thresholds_and_effects(self):
         intel.init_db(self.db)
