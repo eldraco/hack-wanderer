@@ -86,9 +86,10 @@ Main tables:
 
 - `import_files`: imported file path, size, mtime, SHA-256, row/error counts, import time.
 - `raw_samples`: one row per JSONL log sample, including raw JSON, GPS position, `alt_m`, bad-GPS flag, stationary flag, and place bucket.
-- `tower_observations`: one row per tower/cell observation inside a log sample.
+- `tower_observations`: one row per tower/cell observation inside a log sample. `observation_source` and `signal_metric` preserve which modem path produced the observation and what its signal value means.
 - `towers`: stable tower fingerprint plus editable label, notes, known flag, and ignored flag.
 - `tower_features`: latest derived values, method evidence, Bayes score, rule score, and robust center.
+- `dwell_identity_features`: the latest dwell/local-novelty v2 context for each coarse identity (`operator + RAT + TAC/LAC + Cell ID`). It stores independent-window, visit, local-newness, detection-rate, and bounded-normality features as JSON, plus the representative fingerprint allowed to contribute coarse Cell-ID novelty to ranking.
 - `tower_location_quality`: a live SQLite view that labels each tower `valid_gps`, `weird_gps`, or `unlocated`, includes accepted/rejected coordinate counts, and exposes an explicitly unreliable fallback centroid for towers seen only with rejected GPS.
 - `anomaly_methods`: built-in method registry with help text, equations, variables, default thresholds, and map-layer hints.
 - `method_settings`: your edited enabled/weight/threshold settings.
@@ -118,6 +119,7 @@ Use the toolbar to search identifiers, filter towers by an inclusive UTC last-se
 Click a tower to open the side drawer. The drawer shows:
 
 - identity fields,
+- local Cell-ID status, independent-window/visit counts, and bounded dwell-normality credit,
 - Bayes and rule scores,
 - per-method XAI breakdown,
 - variables, values, equations, thresholds, and effect on score,
@@ -126,11 +128,13 @@ Click a tower to open the side drawer. The drawer shows:
 - per-observation **Ignore/Use** toggles. Ignored points stay visible but are excluded from recompute,
 - a **Recompute this tower** button to update scores/features for just the selected tower (faster than full recompute when you are iterating on one case).
 
-Terminology note: a **place bucket** is a small local area bucketed from GPS using a Web‑Mercator map tile at zoom 17 (shown like `z17/x/y`). It’s only used to group nearby points for local comparisons without addresses/geocoding.
+Terminology note: a **place bucket** is a small local area bucketed from GPS using a Web‑Mercator map tile at zoom 17 (shown like `z17/x/y`). It’s used for map overlays and fine local grouping without addresses/geocoding. Dwell/local-novelty v2 rolls these buckets up to coarser **zoom-16 dwell venues**. The larger venue reduces false changes caused by ordinary indoor GPS wander across adjacent zoom-17 buckets.
+
+A confirmed locally new Cell ID gets a red dashed outer ring on its valid-GPS map marker. A purple dotted outer ring means at least one experimental v2 replacement produced a **shadow candidate**. Purple candidates are visible in the tooltip, table, and drawer, but contribute zero to the live score. Neither ring replaces the TAC/LAC fill color or proves that the cell is rogue. Both ring meanings are shown in the hideable TAC/LAC legend.
 
 ### Towers
 
-Search and sort the tower list by operator, RAT, TAC/LAC, cell ID, PCI, EARFCN, count, and score. Click a row to open the same tower detail drawer.
+Search and sort the tower list by operator, RAT, TAC/LAC, cell ID, PCI, EARFCN, count, score, local evidence, location, and first/last-seen date. Click the **Local evidence** heading to sort that column. Its badges distinguish **NEW HERE**, **new, unconfirmed**, **first-visit baseline**, **stable dwell**, incomplete identities, and other insufficient-context states. Location shows the valid robust-center coordinates or, when no valid fix exists, the explicitly labeled weird-GPS fallback coordinates. First/last seen use all non-ignored observations, so indoor towers still retain their observation dates. Hover a displayed date to see its full UTC timestamp. Click **Show** to open the same tower detail drawer on the map.
 
 ### Anomalies
 
@@ -145,6 +149,17 @@ Each anomaly method is data-driven:
 - threshold JSON: editable method thresholds.
 
 After changes, click **Save settings**, then **Recompute scores**. Raw data is never mutated by threshold changes.
+
+Four legacy methods are disabled because their raw-count or wall-clock formulas could make a long stay look anomalous by itself:
+
+- `disappears_despite_coverage`
+- `new_area_code_in_well_covered_place`
+- `ephemeral_stationary_opportunity`
+- `place_change_correlation`
+
+Their visit/window replacements are implemented as `transient_activation_v2`, `visit_aware_disappearance_v2`, `local_tac_novelty_v2`, and `per_cell_visit_change_v2`. They currently run in shadow mode: `would_trigger`, `shadow_norm01`, and `shadow_delta_logodds` retain the full diagnostic result, while `triggered`, `norm01`, and `delta_logodds` remain false/zero. The drawer labels shadow hits explicitly.
+
+The core `new_in_well_covered_place` method now uses dwell/local-novelty v2 windows and completed visits instead of the old raw-observation-count definition.
 
 The same page also exposes the **altitude discount configuration**:
 
@@ -202,6 +217,55 @@ logit(P suspicious | evidence) = logit(prior) + Σ method Δlog-odds
 
 Positive evidence raises suspicion. Negative evidence lowers it. This is intentional: the whole point is to reduce false positives and rank towers for human review.
 
+### Dwell and local novelty v2
+
+Raw polling rows are not treated as independent evidence. Recompute builds the following hierarchy from accepted, non-ignored stationary observations:
+
+1. Fine zoom-17 place buckets are rolled up into zoom-16 dwell venues.
+2. Observations in a venue are grouped into epoch-aligned **10-minute independent windows**. A cell seen repeatedly inside one window still contributes only one presence window.
+3. A new visit requires more than **6 hours** of separation. Crossing midnight does not split a continuous visit.
+4. Opportunity is compared only in compatible `operator + RAT + observation source` context. A registration-only scan cannot prove that a CPSI cell was absent.
+
+The first visit to a venue builds its local Cell-ID baseline. A Cell ID appearing late during that same visit is ordinary baseline expansion and receives no local-newness evidence. The default confirmed local-new rule is:
+
+```text
+completed comparable prior visit exists
++ enough independent prior windows where the Cell ID was absent
++ the Cell ID appears in at least two independent windows now
+= locally new Cell ID
+```
+
+Insufficient prior coverage remains unknown rather than suspicious. A one-window appearance after an adequate baseline is shown as **new, unconfirmed**, but it contributes no local-newness score until repeated. Cell IDs that were first learned during the first visit remain marked as baseline discoveries, not anomalies.
+
+Long, unchanged observation contributes bounded negative evidence through `dwell_stability`. More independent windows, days, and revisits improve confidence, while diminishing returns prevent thousands of scans from producing unlimited normality credit. Repeated raw rows inside the same window add no credit. This means a long stable stay makes established cells less suspicious and simultaneously makes the local baseline more useful for detecting a later change.
+
+The dwell identity is coarse: `operator + RAT + TAC/LAC + Cell ID`. PCI/EARFCN variants share the same dwell diagnosis, so discovering more radio variants during a long stay does not multiply Cell-ID novelty candidates. A stable deterministic representative fingerprint is the only child allowed to add that coarse novelty contribution to ranking; the other variants retain the shared diagnostic fields. Sampling longer cannot move the contribution merely by changing which child has the largest raw row count. Missing, incomplete, or zero Cell IDs are retained for review but cannot trigger local-newness evidence.
+
+Registration, CPSI, and other modem sources are analyzed separately before their evidence is consolidated. TAC/LAC context remains source-specific because real modems can report incompatible encodings for the same network value. Signal changes are compared only within the same source, metric, and EARFCN; CPSI tenths are normalized first (for example, `-920` becomes `-92.0 dBm`). A later sighting of the same coarse identity from another source cancels or postpones a disappearance result.
+
+The four recovered analyses are deliberately conservative:
+
+- transient activation: two prior visits/12 windows, a dense fixed burst, then two later visits/12 windows and a conservative rate drop;
+- disappearance: a repeatable baseline, two later visits/12 windows with zero hits, and posterior-predictive `P(zero) <= 0.01`;
+- TAC/LAC novelty: two prior visits/12 windows, an 85% dominant prior code, and a candidate in at least three windows/60% of current opportunity;
+- per-cell visit change: fixed two-versus-two visit phases, at least three comparable peers, and like-for-like robust signal/detection change after common-mode subtraction.
+
+On the August 2, 2026 local database, the shadow backtest produced 3 transient candidates, 2 disappearance candidates, 1 TAC/LAC event, and 0 peer-corrected visit-change candidates. The sparse results are visible for review, but all four replacements remain disabled until those examples can be labeled; only seven towers currently have manual review labels, which is not enough to estimate a false-positive rate.
+
+Bad-GPS and ignored observations never create dwell venues, visits, windows, baselines, or local-newness evidence.
+
+You can inspect the materialized coarse-identity context directly:
+
+```sql
+SELECT coarse_identity_key, computed_at, model_version,
+       primary_tower_id, features_json
+FROM dwell_identity_features;
+```
+
+### Correlated evidence families
+
+Methods still show every diagnostic reason, but correlated methods no longer contribute as if each were independent. Effective log-odds are capped within the location/GPS, radio-stability, network-identity, cell-lifecycle, place-context, external, and normality families. Each method record preserves its raw delta, family, and applied family scale for explanation; Bayes posterior and rule score use the capped effective delta. Manual known/ignored handling remains separate.
+
 Examples of positive evidence:
 
 - same fingerprint forms far clusters,
@@ -209,10 +273,11 @@ Examples of positive evidence:
 - signal is inconsistent with distance,
 - signal jumps while stationary,
 - PCI/EARFCN churn while stationary,
-- bursty appearance despite stationary opportunity nearby.
+- a Cell ID confirmed locally new after a completed, comparable prior visit.
 
 Examples of negative evidence:
 
+- stable repeated presence across independent dwell windows and visits,
 - stable repeated observations across days,
 - known/verified tower flag,
 - many-day presence.
@@ -232,6 +297,8 @@ These points remain visible in the UI, but they do not create false anomaly evid
 For indoor/airport logs where every coordinate is rejected, the app still permits coarse cellular and temporal review. It stores the individual observations with `bad_gps=1`, labels the tower `weird_gps` in the `tower_location_quality` view, and draws its rejected-coordinate centroid in the warning layer. This is intentionally marked unreliable everywhere: map tooltip, tower drawer, Towers/Anomalies tables, Markdown export, and DOCX export.
 
 Rejected GPS coordinates never receive a `place_id` and never contribute to place-bucket counts, prior/post coverage, local altitude floors, or the **Place buckets** map overlay. Ignored observations are excluded from those bucket calculations and overlays as well.
+
+They are also excluded from dwell/local-novelty v2. Only accepted, stationary, non-ignored observations can establish a zoom-16 dwell venue, opportunity window, visit baseline, local-newness result, or dwell-stability credit.
 
 You can inspect the distinction directly in SQLite:
 
