@@ -79,6 +79,35 @@ DEFAULT_DB = "tower_intel.sqlite"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8890
 PLACE_ZOOM = 17
+DWELL_VENUE_ZOOM = 16
+DWELL_WINDOW_S = 10 * 60
+DWELL_VISIT_GAP_S = 6 * 3600
+DWELL_MIN_PRIOR_WINDOWS = 3
+DWELL_MIN_CURRENT_WINDOWS = 2
+TRANSIENT_MIN_PRIOR_VISITS = 2
+TRANSIENT_MIN_PRIOR_WINDOWS = 12
+TRANSIENT_MIN_BURST_WINDOWS = 4
+TRANSIENT_MIN_POST_VISITS = 2
+TRANSIENT_MIN_POST_WINDOWS = 12
+TRANSIENT_MIN_BURST_RATE = 0.75
+TRANSIENT_MIN_RATE_DROP = 0.25
+DISAPPEAR_MIN_BASELINE_VISITS = 2
+DISAPPEAR_MIN_LATER_VISITS = 2
+DISAPPEAR_MIN_BASELINE_WINDOWS = 12
+DISAPPEAR_MIN_BASELINE_HIT_WINDOWS = 6
+DISAPPEAR_MIN_LATER_WINDOWS = 12
+DISAPPEAR_MIN_BASELINE_RATE_LOW = 0.20
+DISAPPEAR_MAX_PREDICTIVE_ZERO_P = 0.01
+LOCAL_TAC_MIN_PRIOR_VISITS = 2
+LOCAL_TAC_MIN_PRIOR_WINDOWS = 12
+LOCAL_TAC_MIN_CURRENT_WINDOWS = 3
+LOCAL_TAC_MIN_DOMINANT_FRAC = 0.85
+LOCAL_TAC_MIN_CURRENT_FRACTION = 0.60
+VISIT_CHANGE_MIN_BASELINE_VISITS = 2
+VISIT_CHANGE_MIN_RECENT_VISITS = 2
+VISIT_CHANGE_MIN_PHASE_WINDOWS = 8
+VISIT_CHANGE_MIN_SIGNAL_SHIFT_DB = 8.0
+VISIT_CHANGE_MIN_SIGNAL_PEERS = 3
 BAD_GPS_SPEED_MPS = 60.0
 STATIONARY_RADIUS_M = 25.0
 STATIONARY_MAX_SPEED_MPS = 1.0
@@ -503,6 +532,1168 @@ def base_identity_key(key: BaseKey) -> str:
     })
 
 
+def observation_signal_metric(cell: Dict[str, Any], signal: Any = None) -> Optional[str]:
+    """Return the metric represented by observation_signal()."""
+
+    for name in ("rsrp", "rssi_dbm", "rssi", "rssnr", "rsrq"):
+        value = cell.get(name)
+        try:
+            if value is not None and math.isfinite(float(value)):
+                return name
+        except (TypeError, ValueError):
+            continue
+    # observation_signal() falls back to network.csq.rssi_dbm when no
+    # per-cell metric exists. A non-null signal therefore has a known RSSI
+    # ordering even though the value lives in the parent sample JSON.
+    return "csq_rssi_dbm" if isinstance(signal, (int, float)) and math.isfinite(float(signal)) else None
+
+
+def normalize_dwell_signal(value: Any, metric: Any, source: Any) -> Optional[float]:
+    """Normalize typed modem signal units before comparing visits."""
+
+    if not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+        return None
+    normalized = float(value)
+    metric_name = str(metric or "")
+    source_name = str(source or "").lower()
+    # Quectel CPSI reports RSRP/RSSI/RSRQ in tenths (for example -964 is
+    # -96.4 dBm). Registration fallback is already CSQ-derived dBm.
+    if source_name == "cpsi" and metric_name in {"rsrp", "rssi", "rsrq"} and abs(normalized) > 200.0:
+        normalized /= 10.0
+    return normalized
+
+
+def _sat(value: Any, scale: float) -> float:
+    if not isinstance(value, (int, float)) or float(value) <= 0:
+        return 0.0
+    return clamp01(1.0 - math.exp(-float(value) / max(1e-9, float(scale))))
+
+
+def _wilson_interval(hits: Any, total: Any, z: float = 1.64) -> Tuple[float, float]:
+    """One-sided-ish 90% Wilson interval used for bounded rate evidence."""
+
+    if not isinstance(hits, (int, float)) or not isinstance(total, (int, float)) or float(total) <= 0:
+        return 0.0, 1.0
+    n = float(total)
+    p = clamp01(float(hits) / n)
+    denom = 1.0 + (z * z) / n
+    center = (p + (z * z) / (2.0 * n)) / denom
+    margin = (z / denom) * math.sqrt(max(0.0, (p * (1.0 - p) / n) + (z * z) / (4.0 * n * n)))
+    return clamp01(center - margin), clamp01(center + margin)
+
+
+def _beta_predictive_zero_probability(hits: float, total: float, later_windows: float) -> float:
+    """P(zero later hits) under a Beta(1,1) posterior predictive model."""
+
+    n = max(0.0, float(total))
+    h = max(0.0, min(n, float(hits)))
+    m = max(0.0, float(later_windows))
+    alpha = 1.0 + h
+    beta = 1.0 + n - h
+    log_p = (
+        math.lgamma(alpha)
+        + math.lgamma(beta + m)
+        - math.lgamma(alpha + beta + m)
+        - math.lgamma(alpha)
+        - math.lgamma(beta)
+        + math.lgamma(alpha + beta)
+    )
+    return clamp01(math.exp(min(0.0, log_p)))
+
+
+def dwell_venue_id(place_id: Any, *, venue_zoom: int = DWELL_VENUE_ZOOM) -> Optional[str]:
+    """Return a coarser, boundary-tolerant venue key for dwell comparisons.
+
+    Existing synthetic/custom venue IDs are preserved. Web-Mercator place IDs
+    are rolled up from the display bucket zoom to a coarser venue zoom so small
+    indoor GPS wander is less likely to manufacture a new place.
+    """
+
+    if place_id is None:
+        return None
+    text = str(place_id).strip()
+    match = re.fullmatch(r"z(\d+)/(\d+)/(\d+)", text)
+    if not match:
+        return text or None
+    zoom, x, y = (int(match.group(1)), int(match.group(2)), int(match.group(3)))
+    target = min(int(venue_zoom), zoom)
+    shift = zoom - target
+    return f"z{target}/{x >> shift}/{y >> shift}"
+
+
+def _dwell_row_value(row: Any, name: str, default: Any = None) -> Any:
+    if isinstance(row, dict):
+        return row.get(name, default)
+    try:
+        return row[name]
+    except (KeyError, IndexError, TypeError):
+        return default
+
+
+def compute_dwell_evidence(
+    observations: Sequence[Any],
+    *,
+    window_s: int = DWELL_WINDOW_S,
+    visit_gap_s: int = DWELL_VISIT_GAP_S,
+    min_prior_windows: int = DWELL_MIN_PRIOR_WINDOWS,
+    min_current_windows: int = DWELL_MIN_CURRENT_WINDOWS,
+) -> Dict[str, Any]:
+    """Build source-aware, dwell-invariant evidence from reliable stationary scans.
+
+    Opportunities are binary, epoch-aligned windows for one operator/RAT/source.
+    Registration and CPSI are intentionally separate: they have different scan
+    semantics, signal units, and (in some modems) TAC encodings.  Evidence is
+    calculated per source and then consolidated onto one coarse Cell-ID identity.
+    """
+
+    window_s = max(60, int(window_s))
+    visit_gap_s = max(window_s, int(visit_gap_s))
+    min_prior_windows = max(1, int(min_prior_windows))
+    min_current_windows = max(1, int(min_current_windows))
+
+    usable: List[Dict[str, Any]] = []
+    raw_counts: Counter = Counter()
+    source_counts: Dict[str, Counter] = defaultdict(Counter)
+    tower_ids: Dict[str, set] = defaultdict(set)
+    identity_meta: Dict[str, Dict[str, Any]] = {}
+
+    for index, row in enumerate(observations):
+        if bool(_dwell_row_value(row, "bad_gps", False)) or bool(_dwell_row_value(row, "ignored", False)):
+            continue
+        if not bool(_dwell_row_value(row, "stationary", False)):
+            continue
+        ts = _dwell_row_value(row, "ts")
+        venue_id = dwell_venue_id(_dwell_row_value(row, "venue_id", _dwell_row_value(row, "place_id")))
+        if not isinstance(ts, (int, float)) or not math.isfinite(float(ts)) or not venue_id:
+            continue
+
+        operator = str(_dwell_row_value(row, "operator", "") or "")
+        rat = str(_dwell_row_value(row, "rat", "") or "")
+        tac_lac = safe_int(_dwell_row_value(row, "tac_lac"))
+        cell_id = safe_int(_dwell_row_value(row, "cell_id"))
+        identity = base_identity_key(BaseKey(operator, rat, tac_lac, cell_id))
+        identity_meta[identity] = {
+            "operator": operator,
+            "rat": rat,
+            "tac_lac": tac_lac,
+            "cell_id": cell_id,
+        }
+
+        source_value = _dwell_row_value(row, "observation_source", _dwell_row_value(row, "source"))
+        if not source_value:
+            raw_cell = _dwell_row_value(row, "raw_cell_json")
+            parsed_cell = raw_cell if isinstance(raw_cell, dict) else json_loads(str(raw_cell or ""), {})
+            if isinstance(parsed_cell, dict):
+                source_value = parsed_cell.get("source")
+        source = str(source_value or "synthetic").strip().lower() or "synthetic"
+
+        raw_signal = _dwell_row_value(row, "signal")
+        signal_metric = str(_dwell_row_value(row, "signal_metric", "") or "").strip().lower()
+        if not signal_metric and isinstance(raw_signal, (int, float)):
+            signal_metric = "synthetic"
+        signal = normalize_dwell_signal(raw_signal, signal_metric, source)
+        earfcn = safe_int(_dwell_row_value(row, "earfcn"))
+        sample_uid = str(_dwell_row_value(row, "sample_uid", "") or f"row-{float(ts):.6f}-{index}")
+        tower_id = safe_int(_dwell_row_value(row, "tower_id"))
+
+        usable.append({
+            "ts": float(ts),
+            "sample_uid": sample_uid,
+            "venue_id": str(venue_id),
+            "operator": operator,
+            "rat": rat,
+            "tac_lac": tac_lac,
+            "identity": identity,
+            "source": source,
+            "signal": signal,
+            "signal_metric": signal_metric,
+            "earfcn": earfcn,
+        })
+        raw_counts[identity] += 1
+        source_counts[identity][source] += 1
+        if tower_id is not None:
+            tower_ids[identity].add(int(tower_id))
+
+    # One modem poll can emit several cells.  Collapse it to a device event,
+    # and then to binary epoch windows, before calculating any evidence.
+    event_map: Dict[Tuple[str, float, str], Dict[str, Any]] = {}
+    for item in usable:
+        event_key = (item["sample_uid"], item["ts"], item["venue_id"])
+        event = event_map.setdefault(event_key, {
+            "ts": item["ts"],
+            "venue_id": item["venue_id"],
+            "identity_sources": set(),
+            "source_operator_rats": set(),
+            "identity_signals": defaultdict(lambda: defaultdict(list)),
+        })
+        identity_source = (item["identity"], item["source"])
+        event["identity_sources"].add(identity_source)
+        event["source_operator_rats"].add((item["operator"], item["rat"], item["source"]))
+        if item["signal"] is not None and item["signal_metric"]:
+            stratum = (item["source"], item["signal_metric"], item["earfcn"])
+            event["identity_signals"][identity_source][stratum].append(float(item["signal"]))
+
+    events = sorted(event_map.values(), key=lambda event: (event["ts"], event["venue_id"]))
+    visits: List[Dict[str, Any]] = []
+    active: Optional[Dict[str, Any]] = None
+    for event in events:
+        continues = bool(
+            active
+            and active["venue_id"] == event["venue_id"]
+            and float(event["ts"]) - float(active["last_ts"]) <= visit_gap_s
+        )
+        if not continues:
+            active = {
+                "id": len(visits),
+                "venue_id": event["venue_id"],
+                "start_ts": float(event["ts"]),
+                "last_ts": float(event["ts"]),
+                "source_operator_windows": defaultdict(set),
+                "identity_source_windows": defaultdict(set),
+                "identity_windows": defaultdict(set),
+                "source_tac_windows": defaultdict(set),
+                "identity_window_signals": defaultdict(lambda: defaultdict(lambda: defaultdict(list))),
+            }
+            visits.append(active)
+        active["last_ts"] = float(event["ts"])
+        epoch_window = int(math.floor(float(event["ts"]) / float(window_s)))
+        window_key = (int(active["id"]), epoch_window)
+        for source_operator_rat in event["source_operator_rats"]:
+            active["source_operator_windows"][source_operator_rat].add(window_key)
+        for identity_source in event["identity_sources"]:
+            identity, source = identity_source
+            active["identity_source_windows"][identity_source].add(window_key)
+            active["identity_windows"][identity].add(window_key)
+            meta = identity_meta.get(identity) or {}
+            tac_key = (
+                str(meta.get("operator") or ""),
+                str(meta.get("rat") or ""),
+                source,
+                meta.get("tac_lac"),
+            )
+            active["source_tac_windows"][tac_key].add(window_key)
+            for stratum, values in (event["identity_signals"].get(identity_source) or {}).items():
+                active["identity_window_signals"][identity_source][window_key][stratum].extend(values)
+
+    venue_visits: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for visit in visits:
+        venue_visits[str(visit["venue_id"])].append(visit)
+
+    def independent_visits(candidates: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        chosen: List[Dict[str, Any]] = []
+        for visit in candidates:
+            if not chosen or float(visit["start_ts"]) - float(chosen[-1]["last_ts"]) > visit_gap_s:
+                chosen.append(visit)
+        return chosen
+
+    def identity_windows(visit: Dict[str, Any], identity: str, source: Optional[str] = None) -> set:
+        if source is None:
+            return visit["identity_windows"].get(identity) or set()
+        return visit["identity_source_windows"].get((identity, source)) or set()
+
+    def opportunity_windows(visit: Dict[str, Any], operator: str, rat: str, source: str) -> set:
+        return visit["source_operator_windows"].get((operator, rat, source)) or set()
+
+    def signal_strata(visit: Dict[str, Any], identity: str, source: str) -> Dict[Tuple[str, str, Optional[int]], List[float]]:
+        by_stratum: Dict[Tuple[str, str, Optional[int]], List[float]] = defaultdict(list)
+        for _window_key, strata in (visit["identity_window_signals"].get((identity, source)) or {}).items():
+            for stratum, values in strata.items():
+                if values:
+                    by_stratum[stratum].append(float(median([float(value) for value in values])))
+        return dict(by_stratum)
+
+    # TAC evidence belongs to a TAC event, not every cell under that TAC.
+    tac_representatives: Dict[Tuple[str, int, str, str, str, Any], str] = {}
+    for visit in visits:
+        grouped: Dict[Tuple[str, str, str, Any], List[str]] = defaultdict(list)
+        for (identity, source), windows in visit["identity_source_windows"].items():
+            if not windows:
+                continue
+            meta = identity_meta.get(identity) or {}
+            grouped[(str(meta.get("operator") or ""), str(meta.get("rat") or ""), source, meta.get("tac_lac"))].append(identity)
+        for (operator, rat, source, tac_lac), candidates in grouped.items():
+            representative = sorted(
+                set(candidates),
+                key=lambda candidate: (-len(identity_windows(visit, candidate, source)), candidate),
+            )[0]
+            tac_representatives[(str(visit["venue_id"]), int(visit["id"]), operator, rat, source, tac_lac)] = representative
+
+    identities = sorted(raw_counts)
+    identity_context: Dict[str, Dict[str, Any]] = {}
+
+    def choose_event(events_list: List[Dict[str, Any]], default: Dict[str, Any]) -> Dict[str, Any]:
+        return max(
+            events_list,
+            key=lambda event: (
+                float(event.get("effect") or 0.0),
+                int(bool(event.get("triggered"))),
+                int(event.get("visit_id") or -1),
+            ),
+            default=default,
+        )
+
+    for identity in identities:
+        meta = identity_meta.get(identity) or json_loads(identity, {})
+        operator = str(meta.get("operator") or "")
+        rat = str(meta.get("rat") or "")
+        current_tac = meta.get("tac_lac")
+        complete_identity = isinstance(meta.get("cell_id"), int) and int(meta["cell_id"]) > 0
+        sources = sorted(source_counts.get(identity) or {"synthetic": 1})
+
+        all_presence_windows: set = set()
+        all_opportunity_windows: set = set()
+        all_presence_visits: set = set()
+        presence_days: set = set()
+        novelty_events: List[Dict[str, Any]] = []
+        transient_events: List[Dict[str, Any]] = []
+        disappearance_events: List[Dict[str, Any]] = []
+        tac_novelty_events: List[Dict[str, Any]] = []
+        visit_change_events: List[Dict[str, Any]] = []
+
+        for source in sources:
+            opportunity_key = (operator, rat, source)
+            for venue_id, same_venue_visits in venue_visits.items():
+                source_presence_indexes = [
+                    visit_index
+                    for visit_index, visit in enumerate(same_venue_visits)
+                    if identity_windows(visit, identity, source)
+                ]
+                if not source_presence_indexes:
+                    continue
+                first_presence_index = source_presence_indexes[0]
+                current_visit = same_venue_visits[first_presence_index]
+
+                for visit_index in source_presence_indexes:
+                    visit = same_venue_visits[visit_index]
+                    windows = identity_windows(visit, identity, source)
+                    all_presence_windows.update(windows)
+                    all_presence_visits.add(int(visit["id"]))
+                    presence_days.update(int(window[1] * window_s // 86400) for window in windows)
+                for visit in same_venue_visits[first_presence_index:]:
+                    all_opportunity_windows.update(opportunity_windows(visit, operator, rat, source))
+
+                current_hits = identity_windows(current_visit, identity, source)
+                prior_visits = independent_visits([
+                    visit
+                    for visit in same_venue_visits[:first_presence_index]
+                    if float(current_visit["start_ts"]) - float(visit["last_ts"]) > visit_gap_s
+                    and opportunity_windows(visit, operator, rat, source)
+                ])
+                prior_window_set: set = set()
+                for visit in prior_visits:
+                    prior_window_set.update(opportunity_windows(visit, operator, rat, source))
+                prior_windows = len(prior_window_set)
+                current_windows = len(current_hits)
+                novelty_eligible = bool(complete_identity and prior_visits and prior_windows >= min_prior_windows)
+                novelty_triggered = bool(novelty_eligible and current_windows >= min_current_windows)
+                if not complete_identity:
+                    novelty_state = "incomplete_cell_identity"
+                elif first_presence_index == 0:
+                    novelty_state = "baseline_building"
+                elif not prior_visits:
+                    novelty_state = "no_completed_prior_visit"
+                elif prior_windows < min_prior_windows:
+                    novelty_state = "insufficient_prior_coverage"
+                elif current_windows < min_current_windows:
+                    novelty_state = "new_single_sighting"
+                else:
+                    novelty_state = "locally_new"
+                novelty_effect = 0.0
+                if novelty_triggered:
+                    novelty_effect = clamp01(
+                        _sat(prior_windows, float(min_prior_windows) * 2.0)
+                        * _sat(current_windows, float(min_current_windows))
+                    )
+                novelty_events.append({
+                    "venue_id": venue_id,
+                    "visit_id": int(current_visit["id"]),
+                    "source": source,
+                    "state": novelty_state,
+                    "eligible": novelty_eligible,
+                    "triggered": novelty_triggered,
+                    "prior_visits": len(prior_visits),
+                    "prior_windows": int(prior_windows),
+                    "current_windows": int(current_windows),
+                    "effect": float(novelty_effect),
+                })
+
+                # First activation episode only: no arbitrary interval search.
+                current_hit_indexes = sorted(int(window[1]) for window in current_hits)
+                burst_indexes: List[int] = []
+                if current_hit_indexes:
+                    burst_indexes.append(current_hit_indexes[0])
+                    for epoch_window in current_hit_indexes[1:]:
+                        if epoch_window - burst_indexes[-1] > 2 or epoch_window - burst_indexes[0] + 1 > 12:
+                            break
+                        burst_indexes.append(epoch_window)
+                burst_span = burst_indexes[-1] - burst_indexes[0] + 1 if burst_indexes else 0
+                burst_hits = len(burst_indexes)
+                burst_rate = burst_hits / burst_span if burst_span else 0.0
+                burst_low, _ = _wilson_interval(burst_hits, burst_span)
+                burst_end = burst_indexes[-1] if burst_indexes else -1
+                post_opportunity_set = {
+                    window
+                    for window in opportunity_windows(current_visit, operator, rat, source)
+                    if int(window[1]) > burst_end
+                }
+                # A later observation from any source proves persistence.
+                post_hit_set = {
+                    window
+                    for window in identity_windows(current_visit, identity)
+                    if int(window[1]) > burst_end
+                }
+                later_visits = independent_visits([
+                    visit
+                    for visit in same_venue_visits[first_presence_index + 1:]
+                    if float(visit["start_ts"]) - float(current_visit["last_ts"]) > visit_gap_s
+                    and opportunity_windows(visit, operator, rat, source)
+                ])
+                for visit in later_visits:
+                    post_opportunity_set.update(opportunity_windows(visit, operator, rat, source))
+                    post_hit_set.update(identity_windows(visit, identity))
+                post_windows = len(post_opportunity_set)
+                post_hits = len(post_hit_set)
+                _, post_high = _wilson_interval(post_hits, post_windows)
+                rate_drop = max(0.0, burst_low - post_high)
+                transient_eligible = bool(
+                    complete_identity
+                    and len(prior_visits) >= TRANSIENT_MIN_PRIOR_VISITS
+                    and prior_windows >= TRANSIENT_MIN_PRIOR_WINDOWS
+                )
+                transient_triggered = bool(
+                    transient_eligible
+                    and burst_hits >= TRANSIENT_MIN_BURST_WINDOWS
+                    and burst_rate >= TRANSIENT_MIN_BURST_RATE
+                    and len(later_visits) >= TRANSIENT_MIN_POST_VISITS
+                    and post_windows >= TRANSIENT_MIN_POST_WINDOWS
+                    and rate_drop >= TRANSIENT_MIN_RATE_DROP
+                )
+                transient_effect = 0.0
+                if transient_triggered:
+                    transient_effect = clamp01(
+                        _sat(prior_windows, 12.0)
+                        * _sat(burst_hits, 4.0)
+                        * _sat(post_windows, 12.0)
+                        * norm_range(rate_drop, TRANSIENT_MIN_RATE_DROP, 0.65)
+                    )
+                transient_events.append({
+                    "venue_id": venue_id,
+                    "visit_id": int(current_visit["id"]),
+                    "source": source,
+                    "state": (
+                        "incomplete_cell_identity" if not complete_identity
+                        else "baseline_building" if not prior_visits
+                        else "insufficient_prior_visits" if len(prior_visits) < TRANSIENT_MIN_PRIOR_VISITS
+                        else "insufficient_prior_coverage" if prior_windows < TRANSIENT_MIN_PRIOR_WINDOWS
+                        else "insufficient_burst" if burst_hits < TRANSIENT_MIN_BURST_WINDOWS
+                        else "insufficient_post_visits" if len(later_visits) < TRANSIENT_MIN_POST_VISITS
+                        else "insufficient_post_context" if post_windows < TRANSIENT_MIN_POST_WINDOWS
+                        else "persistent_or_reappearing" if rate_drop < TRANSIENT_MIN_RATE_DROP
+                        else "transient_activation"
+                    ),
+                    "eligible": transient_eligible,
+                    "triggered": transient_triggered,
+                    "pre_windows": int(prior_windows),
+                    "prior_visits": len(prior_visits),
+                    "present_windows": int(burst_hits),
+                    "burst_span_windows": int(burst_span),
+                    "burst_rate": float(burst_rate),
+                    "burst_rate_low": float(burst_low),
+                    "post_windows": int(post_windows),
+                    "post_hit_windows": int(post_hits),
+                    "post_visits": len(later_visits),
+                    "post_rate_high": float(post_high),
+                    "rate_drop": float(rate_drop),
+                    "effect": float(transient_effect),
+                })
+
+                # Reappearance from either source moves the disappearance
+                # cutoff, while opportunity remains source-specific.
+                any_presence_indexes = [
+                    visit_index
+                    for visit_index, visit in enumerate(same_venue_visits)
+                    if identity_windows(visit, identity)
+                ]
+                last_any_presence_index = any_presence_indexes[-1]
+                last_source_presence_index = source_presence_indexes[-1]
+                last_any_presence_visit = same_venue_visits[last_any_presence_index]
+                baseline_hit_visits = independent_visits([
+                    same_venue_visits[visit_index] for visit_index in source_presence_indexes
+                ])
+                baseline_opportunities: set = set()
+                baseline_hits: set = set()
+                for visit in same_venue_visits[first_presence_index:last_source_presence_index + 1]:
+                    baseline_opportunities.update(opportunity_windows(visit, operator, rat, source))
+                    baseline_hits.update(identity_windows(visit, identity, source))
+                later_visits_for_disappearance = independent_visits([
+                    visit
+                    for visit in same_venue_visits[last_any_presence_index + 1:]
+                    if float(visit["start_ts"]) - float(last_any_presence_visit["last_ts"]) > visit_gap_s
+                    and len(opportunity_windows(visit, operator, rat, source)) >= 3
+                ])
+                later_opportunities: set = set()
+                for visit in later_visits_for_disappearance:
+                    later_opportunities.update(opportunity_windows(visit, operator, rat, source))
+                baseline_window_count = len(baseline_opportunities)
+                baseline_hit_count = len(baseline_hits)
+                baseline_rate = baseline_hit_count / baseline_window_count if baseline_window_count else 0.0
+                baseline_rate_low, _ = _wilson_interval(baseline_hit_count, baseline_window_count)
+                later_window_count = len(later_opportunities)
+                predictive_zero_p = (
+                    _beta_predictive_zero_probability(baseline_hit_count, baseline_window_count, later_window_count)
+                    if later_window_count else 1.0
+                )
+                disappearance_eligible = bool(
+                    complete_identity
+                    and len(baseline_hit_visits) >= DISAPPEAR_MIN_BASELINE_VISITS
+                    and baseline_window_count >= DISAPPEAR_MIN_BASELINE_WINDOWS
+                    and baseline_hit_count >= DISAPPEAR_MIN_BASELINE_HIT_WINDOWS
+                    and baseline_rate_low >= DISAPPEAR_MIN_BASELINE_RATE_LOW
+                )
+                disappearance_triggered = bool(
+                    disappearance_eligible
+                    and len(later_visits_for_disappearance) >= DISAPPEAR_MIN_LATER_VISITS
+                    and later_window_count >= DISAPPEAR_MIN_LATER_WINDOWS
+                    and predictive_zero_p <= DISAPPEAR_MAX_PREDICTIVE_ZERO_P
+                )
+                disappearance_effect = 0.0
+                if disappearance_triggered:
+                    disappearance_effect = clamp01(
+                        norm_range(baseline_rate_low, DISAPPEAR_MIN_BASELINE_RATE_LOW, 0.70)
+                        * norm_range(
+                            DISAPPEAR_MAX_PREDICTIVE_ZERO_P - predictive_zero_p,
+                            0.0,
+                            DISAPPEAR_MAX_PREDICTIVE_ZERO_P,
+                        )
+                        * _sat(len(later_visits_for_disappearance), 2.0)
+                    )
+                disappearance_events.append({
+                    "venue_id": venue_id,
+                    "visit_id": int(last_any_presence_visit["id"]),
+                    "source": source,
+                    "state": (
+                        "incomplete_cell_identity" if not complete_identity
+                        else "insufficient_baseline_visits" if len(baseline_hit_visits) < DISAPPEAR_MIN_BASELINE_VISITS
+                        else "insufficient_baseline_coverage" if baseline_window_count < DISAPPEAR_MIN_BASELINE_WINDOWS
+                        else "historically_unreliable" if baseline_rate_low < DISAPPEAR_MIN_BASELINE_RATE_LOW
+                        else "insufficient_later_visits" if len(later_visits_for_disappearance) < DISAPPEAR_MIN_LATER_VISITS
+                        else "insufficient_later_coverage" if later_window_count < DISAPPEAR_MIN_LATER_WINDOWS
+                        else "absence_not_improbable" if predictive_zero_p > DISAPPEAR_MAX_PREDICTIVE_ZERO_P
+                        else "disappearance_candidate"
+                    ),
+                    "eligible": disappearance_eligible,
+                    "triggered": disappearance_triggered,
+                    "baseline_visits": len(baseline_hit_visits),
+                    "historical_visits": len(baseline_hit_visits),
+                    "baseline_windows": int(baseline_window_count),
+                    "historical_windows": int(baseline_window_count),
+                    "baseline_hit_windows": int(baseline_hit_count),
+                    "historical_detection_rate": float(baseline_rate),
+                    "baseline_detection_rate": float(baseline_rate),
+                    "baseline_rate_low": float(baseline_rate_low),
+                    "later_visits": len(later_visits_for_disappearance),
+                    "later_windows": int(later_window_count),
+                    "predictive_zero_p": float(predictive_zero_p),
+                    "effect": float(disappearance_effect),
+                })
+
+                # Source-specific TAC context prevents decimal/hex-like modem
+                # representations from manufacturing area-code changes.
+                tac_key = (operator, rat, source, current_tac)
+                tac_presence_indexes = [
+                    visit_index
+                    for visit_index, visit in enumerate(same_venue_visits)
+                    if visit["source_tac_windows"].get(tac_key)
+                ] if current_tac is not None else []
+                first_tac_index = tac_presence_indexes[0] if tac_presence_indexes else None
+                tac_current_visit = same_venue_visits[first_tac_index] if first_tac_index is not None else current_visit
+                tac_prior_visits = independent_visits([
+                    visit
+                    for visit in same_venue_visits[:first_tac_index or 0]
+                    if float(tac_current_visit["start_ts"]) - float(visit["last_ts"]) > visit_gap_s
+                    and opportunity_windows(visit, operator, rat, source)
+                ]) if first_tac_index is not None else []
+                tac_prior_window_set: set = set()
+                prior_tac_counts: Counter = Counter()
+                for visit in tac_prior_visits:
+                    tac_prior_window_set.update(opportunity_windows(visit, operator, rat, source))
+                    for (tac_operator, tac_rat, tac_source, tac_value), tac_windows in visit["source_tac_windows"].items():
+                        if (tac_operator, tac_rat, tac_source) == opportunity_key and tac_value is not None:
+                            prior_tac_counts[tac_value] += len(tac_windows)
+                tac_prior_windows = len(tac_prior_window_set)
+                prior_dominant_tac = None
+                prior_dominant_count = 0
+                if prior_tac_counts:
+                    prior_dominant_tac, prior_dominant_count = max(
+                        prior_tac_counts.items(), key=lambda item: (int(item[1]), str(item[0]))
+                    )
+                total_prior_tac_windows = sum(int(value) for value in prior_tac_counts.values())
+                prior_dominant_fraction = (
+                    prior_dominant_count / total_prior_tac_windows if total_prior_tac_windows else 0.0
+                )
+                tac_current_window_set = tac_current_visit["source_tac_windows"].get(tac_key) or set()
+                tac_current_windows = len(tac_current_window_set)
+                tac_current_opportunities = len(opportunity_windows(tac_current_visit, operator, rat, source))
+                tac_current_fraction = (
+                    tac_current_windows / tac_current_opportunities if tac_current_opportunities else 0.0
+                )
+                tac_representative = tac_representatives.get((
+                    venue_id,
+                    int(tac_current_visit["id"]),
+                    operator,
+                    rat,
+                    source,
+                    current_tac,
+                ))
+                tac_is_primary = tac_representative == identity
+                tac_was_known = bool(first_tac_index is not None and first_tac_index < first_presence_index)
+                tac_current_cells = sum(
+                    1
+                    for (candidate, candidate_source), windows in tac_current_visit["identity_source_windows"].items()
+                    if windows
+                    and candidate_source == source
+                    and (identity_meta.get(candidate) or {}).get("operator") == operator
+                    and (identity_meta.get(candidate) or {}).get("rat") == rat
+                    and (identity_meta.get(candidate) or {}).get("tac_lac") == current_tac
+                )
+                tac_eligible = bool(
+                    complete_identity
+                    and current_tac is not None
+                    and not tac_was_known
+                    and len(tac_prior_visits) >= LOCAL_TAC_MIN_PRIOR_VISITS
+                    and tac_prior_windows >= LOCAL_TAC_MIN_PRIOR_WINDOWS
+                    and prior_dominant_tac is not None
+                )
+                tac_triggered = bool(
+                    tac_eligible
+                    and tac_is_primary
+                    and prior_dominant_fraction >= LOCAL_TAC_MIN_DOMINANT_FRAC
+                    and tac_current_windows >= LOCAL_TAC_MIN_CURRENT_WINDOWS
+                    and tac_current_fraction >= LOCAL_TAC_MIN_CURRENT_FRACTION
+                )
+                tac_effect_raw = 0.0
+                if (
+                    tac_eligible
+                    and prior_dominant_fraction >= LOCAL_TAC_MIN_DOMINANT_FRAC
+                    and tac_current_windows >= LOCAL_TAC_MIN_CURRENT_WINDOWS
+                    and tac_current_fraction >= LOCAL_TAC_MIN_CURRENT_FRACTION
+                ):
+                    tac_effect_raw = clamp01(
+                        _sat(tac_prior_windows, 12.0)
+                        * norm_range(prior_dominant_fraction, LOCAL_TAC_MIN_DOMINANT_FRAC, 0.98)
+                        * _sat(tac_current_windows, 3.0)
+                        * norm_range(tac_current_fraction, LOCAL_TAC_MIN_CURRENT_FRACTION, 1.0)
+                    )
+                tac_novelty_events.append({
+                    "venue_id": venue_id,
+                    "visit_id": int(tac_current_visit["id"]),
+                    "source": source,
+                    "state": (
+                        "incomplete_cell_identity" if not complete_identity
+                        else "missing_tac_lac" if current_tac is None
+                        else "baseline_building" if not tac_prior_visits
+                        else "known_local_tac" if tac_was_known
+                        else "insufficient_prior_visits" if len(tac_prior_visits) < LOCAL_TAC_MIN_PRIOR_VISITS
+                        else "insufficient_prior_coverage" if tac_prior_windows < LOCAL_TAC_MIN_PRIOR_WINDOWS
+                        else "unstable_prior_tac" if prior_dominant_fraction < LOCAL_TAC_MIN_DOMINANT_FRAC
+                        else "new_tac_single_sighting" if tac_current_windows < LOCAL_TAC_MIN_CURRENT_WINDOWS
+                        else "weak_current_tac_fraction" if tac_current_fraction < LOCAL_TAC_MIN_CURRENT_FRACTION
+                        else "new_local_tac"
+                    ),
+                    "eligible": tac_eligible,
+                    "triggered": tac_triggered,
+                    "tac_lac": current_tac,
+                    "prior_visits": len(tac_prior_visits),
+                    "prior_windows": int(tac_prior_windows),
+                    "prior_distinct_tacs": len(prior_tac_counts),
+                    "prior_dominant_tac": prior_dominant_tac,
+                    "prior_dominant_fraction": float(prior_dominant_fraction),
+                    "current_windows": int(tac_current_windows),
+                    "current_opportunity_windows": int(tac_current_opportunities),
+                    "current_fraction": float(tac_current_fraction),
+                    "current_cells": int(tac_current_cells),
+                    "primary_identity": tac_representative,
+                    "is_primary_identity": bool(tac_is_primary),
+                    "effect_raw": float(tac_effect_raw),
+                    "effect": float(tac_effect_raw if tac_is_primary else 0.0),
+                })
+
+                # Fixed first-two versus last-two visits; signal comparisons
+                # require the same source, metric, and EARFCN plus peer control.
+                comparable_visits = independent_visits([
+                    visit
+                    for visit in same_venue_visits[first_presence_index:]
+                    if opportunity_windows(visit, operator, rat, source)
+                ])
+                if len(comparable_visits) >= VISIT_CHANGE_MIN_BASELINE_VISITS + VISIT_CHANGE_MIN_RECENT_VISITS:
+                    baseline_phase = comparable_visits[:VISIT_CHANGE_MIN_BASELINE_VISITS]
+                    recent_phase = comparable_visits[-VISIT_CHANGE_MIN_RECENT_VISITS:]
+                    if {int(visit["id"]) for visit in baseline_phase}.isdisjoint(
+                        {int(visit["id"]) for visit in recent_phase}
+                    ):
+                        baseline_opp = sum(len(opportunity_windows(visit, operator, rat, source)) for visit in baseline_phase)
+                        recent_opp = sum(len(opportunity_windows(visit, operator, rat, source)) for visit in recent_phase)
+                        baseline_hits_count = sum(len(identity_windows(visit, identity, source)) for visit in baseline_phase)
+                        recent_hits_count = sum(len(identity_windows(visit, identity, source)) for visit in recent_phase)
+                        baseline_detection_rate = baseline_hits_count / baseline_opp if baseline_opp else 0.0
+                        recent_detection_rate = recent_hits_count / recent_opp if recent_opp else 0.0
+                        baseline_detection_low, baseline_detection_high = _wilson_interval(
+                            baseline_hits_count, baseline_opp
+                        )
+                        recent_detection_low, recent_detection_high = _wilson_interval(
+                            recent_hits_count, recent_opp
+                        )
+                        detection_interval_gap = max(
+                            recent_detection_low - baseline_detection_high,
+                            baseline_detection_low - recent_detection_high,
+                            0.0,
+                        )
+                        target_present_all = all(identity_windows(visit, identity, source) for visit in baseline_phase + recent_phase)
+
+                        peers = [
+                            candidate
+                            for candidate in identities
+                            if candidate != identity
+                            and source_counts.get(candidate, {}).get(source, 0) > 0
+                            and (identity_meta.get(candidate) or {}).get("operator") == operator
+                            and (identity_meta.get(candidate) or {}).get("rat") == rat
+                        ]
+                        peer_detection_shifts: List[float] = []
+                        for peer in peers:
+                            peer_baseline_hits = sum(len(identity_windows(visit, peer, source)) for visit in baseline_phase)
+                            peer_recent_hits = sum(len(identity_windows(visit, peer, source)) for visit in recent_phase)
+                            if peer_baseline_hits and peer_recent_hits and baseline_opp and recent_opp:
+                                peer_detection_shifts.append(
+                                    peer_recent_hits / recent_opp - peer_baseline_hits / baseline_opp
+                                )
+                        common_detection_shift = (
+                            float(median(peer_detection_shifts))
+                            if len(peer_detection_shifts) >= VISIT_CHANGE_MIN_SIGNAL_PEERS else 0.0
+                        )
+                        raw_detection_shift = recent_detection_rate - baseline_detection_rate
+                        residual_detection_shift = raw_detection_shift - common_detection_shift
+                        detection_direction = (
+                            "up" if raw_detection_shift > 0
+                            else "down" if raw_detection_shift < 0
+                            else "same"
+                        )
+                        recent_visit_detection_rates = [
+                            len(identity_windows(visit, identity, source))
+                            / max(1, len(opportunity_windows(visit, operator, rat, source)))
+                            for visit in recent_phase
+                        ]
+                        detection_same_direction = (
+                            all(rate > baseline_detection_rate for rate in recent_visit_detection_rates)
+                            or all(rate < baseline_detection_rate for rate in recent_visit_detection_rates)
+                        )
+                        detection_norm = 0.0
+                        if detection_same_direction and len(peer_detection_shifts) >= VISIT_CHANGE_MIN_SIGNAL_PEERS:
+                            conservative_detection_shift = min(
+                                abs(residual_detection_shift), detection_interval_gap
+                            )
+                            detection_norm = norm_range(conservative_detection_shift, 0.15, 0.50)
+
+                        signal_candidates: List[Dict[str, Any]] = []
+                        phase_visits = baseline_phase + recent_phase
+                        stratum_sets = [set(signal_strata(visit, identity, source)) for visit in phase_visits]
+                        target_strata = set.intersection(*stratum_sets) if stratum_sets and all(stratum_sets) else set()
+                        target_strata = {
+                            stratum
+                            for stratum in target_strata
+                            if all(len(signal_strata(visit, identity, source)[stratum]) >= 4 for visit in phase_visits)
+                        }
+                        for stratum in target_strata:
+                            baseline_visit_medians = [
+                                float(median(signal_strata(visit, identity, source)[stratum]))
+                                for visit in baseline_phase
+                            ]
+                            recent_visit_medians = [
+                                float(median(signal_strata(visit, identity, source)[stratum]))
+                                for visit in recent_phase
+                            ]
+                            baseline_signal = float(median(baseline_visit_medians))
+                            recent_signal = float(median(recent_visit_medians))
+                            raw_signal_shift = recent_signal - baseline_signal
+                            peer_signal_shifts: List[float] = []
+                            for peer in peers:
+                                peer_strata = [signal_strata(visit, peer, source) for visit in phase_visits]
+                                if not all(
+                                    stratum in strata and len(strata[stratum]) >= 4
+                                    for strata in peer_strata
+                                ):
+                                    continue
+                                peer_baseline = [float(median(strata[stratum])) for strata in peer_strata[:len(baseline_phase)]]
+                                peer_recent = [float(median(strata[stratum])) for strata in peer_strata[len(baseline_phase):]]
+                                peer_signal_shifts.append(float(median(peer_recent)) - float(median(peer_baseline)))
+                            if len(peer_signal_shifts) < VISIT_CHANGE_MIN_SIGNAL_PEERS:
+                                continue
+                            common_signal_shift = float(median(peer_signal_shifts))
+                            residual_recent = [
+                                recent_value - baseline_signal - common_signal_shift
+                                for recent_value in recent_visit_medians
+                            ]
+                            same_direction = all(value > 0 for value in residual_recent) or all(value < 0 for value in residual_recent)
+                            min_residual_shift = min((abs(value) for value in residual_recent), default=0.0)
+                            robust_scale = max(3.0, 1.4826 * float(mad(baseline_visit_medians) or 0.0))
+                            robust_z = min_residual_shift / robust_scale
+                            signal_norm = 0.0
+                            if same_direction and min_residual_shift >= VISIT_CHANGE_MIN_SIGNAL_SHIFT_DB and robust_z >= 2.0:
+                                signal_norm = (
+                                    norm_range(min_residual_shift, VISIT_CHANGE_MIN_SIGNAL_SHIFT_DB, 15.0)
+                                    * norm_range(robust_z, 2.0, 5.0)
+                                )
+                            signal_candidates.append({
+                                "source": source,
+                                "metric": stratum[1],
+                                "earfcn": stratum[2],
+                                "baseline_signal_median": baseline_signal,
+                                "recent_signal_median": recent_signal,
+                                "signal_shift_db": float(raw_signal_shift),
+                                "common_mode_shift_db": float(common_signal_shift),
+                                "residual_signal_shift_db": float(raw_signal_shift - common_signal_shift),
+                                "signal_peer_count": len(peer_signal_shifts),
+                                "robust_z": float(robust_z),
+                                "signal_norm": float(signal_norm),
+                            })
+                        best_signal = max(signal_candidates, key=lambda item: item["signal_norm"], default={
+                            "source": source,
+                            "metric": None,
+                            "earfcn": None,
+                            "baseline_signal_median": None,
+                            "recent_signal_median": None,
+                            "signal_shift_db": 0.0,
+                            "common_mode_shift_db": 0.0,
+                            "residual_signal_shift_db": 0.0,
+                            "signal_peer_count": 0,
+                            "robust_z": 0.0,
+                            "signal_norm": 0.0,
+                        })
+                        visit_change_eligible = bool(
+                            complete_identity
+                            and target_present_all
+                            and baseline_opp >= VISIT_CHANGE_MIN_PHASE_WINDOWS
+                            and recent_opp >= VISIT_CHANGE_MIN_PHASE_WINDOWS
+                            and baseline_hits_count >= 3
+                            and recent_hits_count >= 3
+                        )
+                        phase_confidence = math.sqrt(_sat(baseline_opp, 8.0) * _sat(recent_opp, 8.0))
+                        visit_change_effect = clamp01(
+                            max(detection_norm, float(best_signal["signal_norm"])) * phase_confidence
+                        ) if visit_change_eligible else 0.0
+                        visit_change_triggered = bool(visit_change_eligible and visit_change_effect > 0.0)
+                        visit_change_events.append({
+                            "venue_id": venue_id,
+                            "visit_id": int(recent_phase[-1]["id"]),
+                            "source": source,
+                            "state": (
+                                "incomplete_cell_identity" if not complete_identity
+                                else "insufficient_phase_coverage" if not visit_change_eligible
+                                else "cell_specific_visit_change" if visit_change_triggered
+                                else "stable_after_common_mode_control"
+                            ),
+                            "eligible": visit_change_eligible,
+                            "triggered": visit_change_triggered,
+                            "baseline_visits": len(baseline_phase),
+                            "recent_visits": len(recent_phase),
+                            "baseline_windows": int(baseline_opp),
+                            "baseline_hit_windows": int(baseline_hits_count),
+                            "recent_windows": int(recent_opp),
+                            "recent_hit_windows": int(recent_hits_count),
+                            "baseline_detection_rate": float(baseline_detection_rate),
+                            "recent_detection_rate": float(recent_detection_rate),
+                            "detection_interval_gap": float(detection_interval_gap),
+                            "detection_shift": float(raw_detection_shift),
+                            "common_detection_shift": float(common_detection_shift),
+                            "residual_detection_shift": float(residual_detection_shift),
+                            "detection_direction": detection_direction,
+                            "signal_metric": best_signal["metric"],
+                            "signal_earfcn": best_signal["earfcn"],
+                            "baseline_signal_median": best_signal["baseline_signal_median"],
+                            "recent_signal_median": best_signal["recent_signal_median"],
+                            "signal_shift_db": float(best_signal["signal_shift_db"]),
+                            "common_mode_shift_db": float(best_signal["common_mode_shift_db"]),
+                            "residual_signal_shift_db": float(best_signal["residual_signal_shift_db"]),
+                            "signal_peer_count": int(best_signal["signal_peer_count"]),
+                            "signal_robust_z": float(best_signal["robust_z"]),
+                            "effect": float(visit_change_effect),
+                        })
+
+        presence_n = len(all_presence_windows)
+        opportunity_n = max(presence_n, len(all_opportunity_windows))
+        visit_n = len(all_presence_visits)
+        day_n = len(presence_days)
+        detection_rate = presence_n / opportunity_n if opportunity_n else 0.0
+        normality_credit = clamp01(
+            (
+                0.55 * _sat(presence_n, 12.0)
+                + 0.25 * _sat(visit_n, 2.0)
+                + 0.20 * _sat(day_n, 3.0)
+            )
+            * math.sqrt(clamp01(detection_rate))
+        )
+
+        novelty = choose_event(novelty_events, {
+            "venue_id": None, "visit_id": None, "source": None, "state": "unlocated",
+            "eligible": False, "triggered": False, "prior_visits": 0,
+            "prior_windows": 0, "current_windows": 0, "effect": 0.0,
+        })
+        transient = choose_event(transient_events, {
+            "venue_id": None, "visit_id": None, "source": None, "state": "insufficient_context",
+            "eligible": False, "triggered": False, "pre_windows": 0, "prior_visits": 0,
+            "present_windows": 0, "post_windows": 0, "post_visits": 0, "effect": 0.0,
+        })
+        disappearance = choose_event(disappearance_events, {
+            "venue_id": None, "visit_id": None, "source": None, "state": "insufficient_context",
+            "eligible": False, "triggered": False, "historical_visits": 0,
+            "historical_windows": 0, "historical_detection_rate": 0.0,
+            "later_visits": 0, "later_windows": 0, "predictive_zero_p": 1.0, "effect": 0.0,
+        })
+        local_tac_novelty = choose_event(tac_novelty_events, {
+            "venue_id": None, "visit_id": None, "source": None, "state": "insufficient_context",
+            "eligible": False, "triggered": False, "tac_lac": current_tac,
+            "prior_visits": 0, "prior_windows": 0, "prior_dominant_tac": None,
+            "prior_dominant_fraction": 0.0, "current_windows": 0,
+            "current_fraction": 0.0, "is_primary_identity": False, "effect": 0.0,
+        })
+        visit_change = choose_event(visit_change_events, {
+            "venue_id": None, "visit_id": None, "source": None, "state": "insufficient_context",
+            "eligible": False, "triggered": False, "baseline_visits": 0, "recent_visits": 0,
+            "baseline_windows": 0, "recent_windows": 0, "signal_shift_db": 0.0,
+            "common_mode_shift_db": 0.0, "residual_signal_shift_db": 0.0,
+            "signal_peer_count": 0, "effect": 0.0,
+        })
+        primary_source = max(
+            source_counts.get(identity, {"synthetic": 1}).items(),
+            key=lambda item: (int(item[1]), int(str(item[0]).lower() == "cpsi"), str(item[0])),
+        )[0]
+        # Smallest persistent DB id is invariant to polling density.  The old
+        # count-based representative could jump between PCI/EARFCN children.
+        primary_tower_id = min(tower_ids[identity]) if tower_ids.get(identity) else None
+        identity_context[identity] = {
+            "raw_observations": int(raw_counts[identity]),
+            "opportunity_windows": int(presence_n),
+            "presence_windows": int(presence_n),
+            "eligible_windows": int(opportunity_n),
+            "detection_rate": float(detection_rate),
+            "independent_visits": int(visit_n),
+            "distinct_days": int(day_n),
+            "normality_credit": float(normality_credit),
+            "sources": sources,
+            "primary_source": primary_source,
+            "local_novelty": novelty,
+            "local_novelty_events": novelty_events,
+            "transient_activation": transient,
+            "transient_activation_events": transient_events,
+            "disappearance": disappearance,
+            "disappearance_events": disappearance_events,
+            "local_tac_novelty": local_tac_novelty,
+            "local_tac_novelty_events": tac_novelty_events,
+            "visit_change": visit_change,
+            "visit_change_events": visit_change_events,
+            "primary_tower_id": primary_tower_id,
+        }
+
+    visit_payload = [
+        {
+            "id": int(visit["id"]),
+            "venue_id": str(visit["venue_id"]),
+            "start_ts": float(visit["start_ts"]),
+            "last_ts": float(visit["last_ts"]),
+            "window_count": len(set().union(*visit["source_operator_windows"].values()))
+            if visit["source_operator_windows"] else 0,
+        }
+        for visit in visits
+    ]
+    return {"identities": identity_context, "visits": visit_payload}
+
+
+def rebuild_dwell_context(con: sqlite3.Connection) -> Dict[str, Dict[str, Any]]:
+    """Rebuild the shared v2 dwell context used by every tower variant."""
+
+    rows = con.execute(
+        """
+        SELECT
+          o.ts, o.sample_uid, o.tower_id, o.place_id, o.bad_gps,
+          COALESCE(o.ignored,0) AS ignored, COALESCE(o.stationary,0) AS stationary,
+          o.signal, o.signal_metric, o.observation_source, o.raw_cell_json,
+          t.operator, t.rat, t.tac_lac, t.cell_id, t.pci, t.earfcn
+        FROM tower_observations o
+        JOIN towers t ON t.id=o.tower_id
+        WHERE o.ts IS NOT NULL
+          AND o.place_id IS NOT NULL
+          AND o.bad_gps=0
+          AND COALESCE(o.ignored,0)=0
+          AND COALESCE(o.stationary,0)=1
+        ORDER BY o.ts, o.id
+        """
+    ).fetchall()
+    evidence = compute_dwell_evidence(rows)
+    identities = evidence.get("identities") or {}
+    now = utc_now()
+    con.execute("DELETE FROM dwell_identity_features")
+    con.executemany(
+        """
+        INSERT INTO dwell_identity_features
+        (coarse_identity_key,computed_at,model_version,primary_tower_id,features_json)
+        VALUES (?,?,?,?,?)
+        """,
+        [
+            (
+                str(identity),
+                now,
+                2,
+                metrics.get("primary_tower_id"),
+                json_dumps(metrics),
+            )
+            for identity, metrics in identities.items()
+        ],
+    )
+    set_app_setting(con, "dwell_context_v2", {
+        "computed_at": now,
+        "model_version": 2,
+        "identity_count": len(identities),
+        "visit_count": len(evidence.get("visits") or []),
+        "window_s": DWELL_WINDOW_S,
+        "visit_gap_s": DWELL_VISIT_GAP_S,
+    })
+    return {str(identity): dict(metrics) for identity, metrics in identities.items()}
+
+
+def load_dwell_context(con: sqlite3.Connection) -> Dict[str, Dict[str, Any]]:
+    return {
+        str(row["coarse_identity_key"]): json_loads(row["features_json"], {})
+        for row in con.execute("SELECT coarse_identity_key,features_json FROM dwell_identity_features").fetchall()
+    }
+
+
+def attach_dwell_features(
+    features: Dict[str, Any],
+    *,
+    coarse_identity: str,
+    tower_id: int,
+    context: Dict[str, Dict[str, Any]],
+) -> None:
+    metrics = dict(context.get(str(coarse_identity)) or {})
+    novelty = dict(metrics.get("local_novelty") or {})
+    primary_tower_id = metrics.get("primary_tower_id")
+    is_primary = primary_tower_id is None or int(primary_tower_id) == int(tower_id)
+    raw_effect = float(novelty.get("effect") or 0.0)
+    features["dwell_model_version"] = 2
+    features["dwell_window_s"] = DWELL_WINDOW_S
+    features["dwell_visit_gap_s"] = DWELL_VISIT_GAP_S
+    features["effective_observation_windows"] = int(metrics.get("presence_windows") or 0)
+    features["eligible_observation_windows"] = int(metrics.get("eligible_windows") or 0)
+    features["independent_visits"] = int(metrics.get("independent_visits") or 0)
+    features["dwell_detection_rate"] = metrics.get("detection_rate")
+    features["dwell_normality_credit"] = float(metrics.get("normality_credit") or 0.0)
+    features["coarse_identity_primary"] = bool(is_primary)
+    features["coarse_identity_primary_tower_id"] = primary_tower_id
+    features["local_novelty"] = novelty
+    features["local_novelty_state"] = novelty.get("state") or "no_stationary_context"
+    features["local_novelty_prior_visits"] = int(novelty.get("prior_visits") or 0)
+    features["local_novelty_prior_windows"] = int(novelty.get("prior_windows") or 0)
+    features["local_novelty_current_windows"] = int(novelty.get("current_windows") or 0)
+    features["local_novelty_effect_raw"] = raw_effect
+    # PCI/EARFCN children retain the diagnostics, but only one representative
+    # fingerprint can contribute the coarse Cell-ID novelty to ranking.
+    features["local_novelty_effect"] = raw_effect if is_primary else 0.0
+    features["local_novelty_triggered"] = bool(novelty.get("triggered") and is_primary)
+
+    transient = dict(metrics.get("transient_activation") or {})
+    transient_raw_effect = float(transient.get("effect") or 0.0)
+    features["transient_activation"] = transient
+    features["transient_activation_state"] = transient.get("state") or "no_stationary_context"
+    features["transient_activation_venue_id"] = transient.get("venue_id")
+    features["transient_activation_source"] = transient.get("source")
+    features["transient_activation_prior_visits"] = int(transient.get("prior_visits") or 0)
+    features["transient_activation_pre_windows"] = int(transient.get("pre_windows") or 0)
+    features["transient_activation_present_windows"] = int(transient.get("present_windows") or 0)
+    features["transient_activation_burst_span_windows"] = int(transient.get("burst_span_windows") or 0)
+    features["transient_activation_burst_rate"] = transient.get("burst_rate")
+    features["transient_activation_burst_rate_low"] = transient.get("burst_rate_low")
+    features["transient_activation_post_windows"] = int(transient.get("post_windows") or 0)
+    features["transient_activation_post_hit_windows"] = int(transient.get("post_hit_windows") or 0)
+    features["transient_activation_post_visits"] = int(transient.get("post_visits") or 0)
+    features["transient_activation_post_rate_high"] = transient.get("post_rate_high")
+    features["transient_activation_rate_drop"] = transient.get("rate_drop")
+    features["transient_activation_effect_raw"] = transient_raw_effect
+    features["transient_activation_effect"] = transient_raw_effect if is_primary else 0.0
+    features["transient_activation_triggered"] = bool(transient.get("triggered") and is_primary)
+
+    disappearance = dict(metrics.get("disappearance") or {})
+    disappearance_raw_effect = float(disappearance.get("effect") or 0.0)
+    features["disappearance"] = disappearance
+    features["disappearance_state"] = disappearance.get("state") or "no_stationary_context"
+    features["disappearance_venue_id"] = disappearance.get("venue_id")
+    features["disappearance_source"] = disappearance.get("source")
+    features["disappearance_baseline_visits"] = int(disappearance.get("baseline_visits") or disappearance.get("historical_visits") or 0)
+    features["disappearance_baseline_windows"] = int(disappearance.get("baseline_windows") or disappearance.get("historical_windows") or 0)
+    features["disappearance_baseline_hit_windows"] = int(disappearance.get("baseline_hit_windows") or 0)
+    features["disappearance_baseline_detection_rate"] = disappearance.get("baseline_detection_rate", disappearance.get("historical_detection_rate"))
+    features["disappearance_baseline_rate_low"] = disappearance.get("baseline_rate_low")
+    features["disappearance_later_visits"] = int(disappearance.get("later_visits") or 0)
+    features["disappearance_later_windows"] = int(disappearance.get("later_windows") or 0)
+    features["disappearance_predictive_zero_p"] = disappearance.get("predictive_zero_p")
+    features["disappearance_effect_raw"] = disappearance_raw_effect
+    features["disappearance_effect"] = disappearance_raw_effect if is_primary else 0.0
+    features["disappearance_triggered"] = bool(disappearance.get("triggered") and is_primary)
+
+    local_tac = dict(metrics.get("local_tac_novelty") or {})
+    local_tac_raw_effect = float(local_tac.get("effect_raw", local_tac.get("effect") or 0.0) or 0.0)
+    local_tac_identity_primary = bool(local_tac.get("is_primary_identity"))
+    features["local_tac_novelty"] = local_tac
+    features["local_tac_state"] = local_tac.get("state") or "no_stationary_context"
+    features["local_tac_venue_id"] = local_tac.get("venue_id")
+    features["local_tac_source"] = local_tac.get("source")
+    features["local_tac_value"] = local_tac.get("tac_lac")
+    features["local_tac_prior_visits"] = int(local_tac.get("prior_visits") or 0)
+    features["local_tac_prior_windows"] = int(local_tac.get("prior_windows") or 0)
+    features["local_tac_prior_distinct_tacs"] = int(local_tac.get("prior_distinct_tacs") or 0)
+    features["local_tac_prior_dominant_tac"] = local_tac.get("prior_dominant_tac")
+    features["local_tac_prior_dominant_fraction"] = local_tac.get("prior_dominant_fraction")
+    features["local_tac_current_windows"] = int(local_tac.get("current_windows") or 0)
+    features["local_tac_current_opportunity_windows"] = int(local_tac.get("current_opportunity_windows") or 0)
+    features["local_tac_current_fraction"] = local_tac.get("current_fraction")
+    features["local_tac_current_cells"] = int(local_tac.get("current_cells") or 0)
+    features["local_tac_primary_identity"] = local_tac.get("primary_identity")
+    features["local_tac_is_primary_identity"] = local_tac_identity_primary
+    features["local_tac_effect_raw"] = local_tac_raw_effect
+    features["local_tac_effect"] = local_tac_raw_effect if (is_primary and local_tac_identity_primary) else 0.0
+    features["local_tac_triggered"] = bool(local_tac.get("triggered") and is_primary and local_tac_identity_primary)
+
+    visit_change = dict(metrics.get("visit_change") or {})
+    visit_change_raw_effect = float(visit_change.get("effect") or 0.0)
+    features["visit_change"] = visit_change
+    features["visit_change_state"] = visit_change.get("state") or "no_stationary_context"
+    features["visit_change_venue_id"] = visit_change.get("venue_id")
+    features["visit_change_source"] = visit_change.get("source")
+    features["visit_change_baseline_visits"] = int(visit_change.get("baseline_visits") or 0)
+    features["visit_change_recent_visits"] = int(visit_change.get("recent_visits") or 0)
+    features["visit_change_baseline_windows"] = int(visit_change.get("baseline_windows") or 0)
+    features["visit_change_baseline_hit_windows"] = int(visit_change.get("baseline_hit_windows") or 0)
+    features["visit_change_baseline_detection_rate"] = visit_change.get("baseline_detection_rate")
+    features["visit_change_recent_windows"] = int(visit_change.get("recent_windows") or 0)
+    features["visit_change_recent_hit_windows"] = int(visit_change.get("recent_hit_windows") or 0)
+    features["visit_change_recent_detection_rate"] = visit_change.get("recent_detection_rate")
+    features["visit_change_detection_interval_gap"] = visit_change.get("detection_interval_gap")
+    features["visit_change_detection_shift"] = visit_change.get("detection_shift")
+    features["visit_change_common_detection_shift"] = visit_change.get("common_detection_shift")
+    features["visit_change_residual_detection_shift"] = visit_change.get("residual_detection_shift")
+    features["visit_change_detection_direction"] = visit_change.get("detection_direction")
+    features["visit_change_signal_metric"] = visit_change.get("signal_metric")
+    features["visit_change_signal_earfcn"] = visit_change.get("signal_earfcn")
+    features["visit_change_baseline_signal_median"] = visit_change.get("baseline_signal_median")
+    features["visit_change_recent_signal_median"] = visit_change.get("recent_signal_median")
+    features["visit_change_signal_shift_db"] = visit_change.get("signal_shift_db")
+    features["visit_change_common_mode_shift_db"] = visit_change.get("common_mode_shift_db")
+    features["visit_change_residual_signal_shift_db"] = visit_change.get("residual_signal_shift_db")
+    features["visit_change_signal_peer_count"] = int(visit_change.get("signal_peer_count") or 0)
+    features["visit_change_signal_robust_z"] = visit_change.get("signal_robust_z")
+    features["visit_change_effect_raw"] = visit_change_raw_effect
+    features["visit_change_effect"] = visit_change_raw_effect if is_primary else 0.0
+    features["visit_change_triggered"] = bool(visit_change.get("triggered") and is_primary)
+
+
 def tower_label(row_or_key: Any) -> str:
     if isinstance(row_or_key, TowerKey):
         return row_or_key.label()
@@ -606,6 +1797,8 @@ CREATE TABLE IF NOT EXISTS tower_observations (
   lon REAL,
   place_id TEXT,
   signal REAL,
+  signal_metric TEXT,
+  observation_source TEXT,
   raw_cell_json TEXT NOT NULL,
   bad_gps INTEGER NOT NULL DEFAULT 0,
   ignored INTEGER NOT NULL DEFAULT 0,
@@ -629,6 +1822,15 @@ CREATE TABLE IF NOT EXISTS tower_features (
   methods_json TEXT NOT NULL,
   bayes_json TEXT NOT NULL,
   FOREIGN KEY(tower_id) REFERENCES towers(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS dwell_identity_features (
+  coarse_identity_key TEXT PRIMARY KEY,
+  computed_at TEXT NOT NULL,
+  model_version INTEGER NOT NULL DEFAULT 2,
+  primary_tower_id INTEGER,
+  features_json TEXT NOT NULL,
+  FOREIGN KEY(primary_tower_id) REFERENCES towers(id) ON DELETE SET NULL
 );
 
 CREATE TABLE IF NOT EXISTS wigle_enrichments (
@@ -804,6 +2006,86 @@ VARIABLE_GLOSSARY: Dict[str, str] = {
     "rat_surprise": "How surprising the RAT transition pattern is inside a place bucket. Higher means more unusual.",
     "place_rat_surprise": "Average negative log probability of RAT transitions in the place buckets where this tower appeared.",
     "stability_bonus": "Negative-evidence score awarded when a tower looks stable across days, location, and stationary behavior.",
+    "effective_observation_windows": "Independent 10-minute stationary windows containing this coarse Cell ID. Repeated scans inside one window count once.",
+    "eligible_observation_windows": "Comparable operator/RAT windows available to estimate this Cell ID's detection rate.",
+    "independent_visits": "Continuous stationary visits containing this coarse Cell ID. Midnight alone does not split a visit.",
+    "dwell_detection_rate": "Fraction of eligible independent windows in which this coarse Cell ID was detected.",
+    "dwell_normality_credit": "Bounded normality evidence from stable repeated windows, days, and visits, with diminishing returns.",
+    "coarse_identity_primary": "Whether this fingerprint row is the stable single representative allowed to score evidence shared by PCI/EARFCN variants of one coarse Cell ID.",
+    "local_novelty_state": "Local Cell-ID state: first-visit baseline, insufficient prior coverage, unconfirmed single sighting, or confirmed locally new after a completed prior visit.",
+    "local_novelty_prior_visits": "Completed comparable visits to this venue before the Cell ID first appeared there.",
+    "local_novelty_prior_windows": "Independent same-operator/RAT windows in completed prior visits where this Cell ID was absent.",
+    "local_novelty_current_windows": "Independent windows containing the Cell ID in its discovery visit.",
+    "local_novelty_effect": "Dwell-invariant 0..1 novelty strength. It requires a completed prior visit, sufficient prior windows, and repeated current sightings.",
+    "transient_activation_state": "Visit-aware state for a Cell ID that appears in a bounded burst after prior local absence and then becomes uncommon again despite later comparable coverage.",
+    "transient_activation_venue_id": "Coarse venue used for the transient Cell-ID comparison; it is intentionally less sensitive to indoor GPS bucket jitter.",
+    "transient_activation_source": "Observation source whose comparable windows define this transient-activation episode; opportunities are never mixed across incompatible modem sources.",
+    "transient_activation_prior_visits": "Completed comparable visits before the candidate Cell ID's activation burst.",
+    "transient_activation_pre_windows": "Comparable same-operator/RAT windows before the activation burst in which this Cell ID was absent.",
+    "transient_activation_present_windows": "Independent windows containing the Cell ID in its fixed activation burst.",
+    "transient_activation_burst_span_windows": "Elapsed independent-window span from the first to last hit in the fixed activation burst.",
+    "transient_activation_burst_rate": "Fraction of windows in the fixed activation-burst span that contain this Cell ID.",
+    "transient_activation_burst_rate_low": "Conservative Wilson lower bound for the activation-burst detection rate.",
+    "transient_activation_post_visits": "Later independent comparable visits used to check whether the Cell ID persisted or reappeared.",
+    "transient_activation_post_windows": "Comparable same-operator/RAT windows after the activation burst.",
+    "transient_activation_post_hit_windows": "Post-burst windows in which this Cell ID was detected again.",
+    "transient_activation_post_rate_high": "Conservative Wilson upper bound for the post-burst detection rate.",
+    "transient_activation_rate_drop": "Conservative activation-to-post rate drop: burst lower bound minus post-burst upper bound.",
+    "transient_activation_effect": "Bounded 0..1 transient Cell-ID activation evidence after visit/window, burst, and post-coverage gates.",
+    "disappearance_state": "Visit-aware state describing whether an established Cell ID later disappears despite independent comparable visits.",
+    "disappearance_venue_id": "Coarse venue used for the established-then-absent comparison.",
+    "disappearance_source": "Observation source used for the disappearance opportunity baseline and later-coverage comparison.",
+    "disappearance_baseline_visits": "Independent visits in which the Cell ID established a usable historical baseline.",
+    "disappearance_baseline_windows": "Comparable same-operator/RAT opportunity windows in the established baseline period.",
+    "disappearance_baseline_hit_windows": "Baseline windows containing this Cell ID.",
+    "disappearance_baseline_detection_rate": "Historical fraction of comparable baseline windows containing this Cell ID.",
+    "disappearance_baseline_rate_low": "Conservative Wilson lower bound for the historical detection rate.",
+    "disappearance_later_visits": "Independent comparable visits after the Cell ID's last established appearance.",
+    "disappearance_later_windows": "Comparable same-operator/RAT windows after the Cell ID's last established appearance.",
+    "disappearance_predictive_zero_p": "Posterior-predictive probability of observing zero later hits if the historical detection behavior continued.",
+    "disappearance_effect": "Bounded 0..1 visit-aware disappearance evidence; repeated scans within one window do not increase it.",
+    "local_tac_state": "Visit-aware state for a TAC/LAC that is new relative to a stable prior local operator/RAT context.",
+    "local_tac_venue_id": "Coarse venue used for the local TAC/LAC comparison.",
+    "local_tac_source": "Observation source used for the local TAC/LAC baseline so incompatible modem representations are not mixed.",
+    "local_tac_value": "Candidate TAC (LTE/5G) or LAC (older RATs) represented by this evidence row.",
+    "local_tac_prior_visits": "Completed comparable visits before this TAC/LAC first appeared locally.",
+    "local_tac_prior_windows": "Independent prior same-operator/RAT windows used to learn the local TAC/LAC pattern.",
+    "local_tac_prior_distinct_tacs": "Number of distinct TAC/LAC values in the prior local operator/RAT context.",
+    "local_tac_prior_dominant_tac": "Most frequent TAC/LAC in prior local independent windows.",
+    "local_tac_prior_dominant_fraction": "Fraction of prior local windows represented by the dominant TAC/LAC.",
+    "local_tac_current_windows": "Independent windows containing the candidate TAC/LAC during its first local visit.",
+    "local_tac_current_opportunity_windows": "Comparable same-source operator/RAT windows available during the candidate TAC/LAC's first local visit.",
+    "local_tac_current_fraction": "Fraction of comparable current-visit windows containing the candidate TAC/LAC.",
+    "local_tac_current_cells": "Number of coarse Cell IDs sharing the candidate TAC/LAC in that first local visit.",
+    "local_tac_primary_identity": "Single coarse Cell-ID representative selected for a multi-cell new-TAC/LAC episode.",
+    "local_tac_is_primary_identity": "Whether this coarse Cell ID is the sole scoring representative for its new-TAC/LAC episode.",
+    "local_tac_effect": "Bounded 0..1 local TAC/LAC novelty evidence, assigned to exactly one coarse Cell-ID representative.",
+    "visit_change_state": "State for a fixed recent-visits versus earlier-visits comparison after common-mode peer correction.",
+    "visit_change_venue_id": "Coarse venue used for the per-cell visit-change comparison.",
+    "visit_change_source": "Observation source held constant across the fixed per-cell visit comparison.",
+    "visit_change_baseline_visits": "Independent earlier visits in the fixed baseline phase.",
+    "visit_change_recent_visits": "Independent visits in the fixed recent phase.",
+    "visit_change_baseline_windows": "Comparable opportunity windows in the baseline phase.",
+    "visit_change_baseline_hit_windows": "Baseline-phase windows containing this Cell ID.",
+    "visit_change_baseline_detection_rate": "Cell-ID detection rate in the fixed baseline phase.",
+    "visit_change_recent_windows": "Comparable opportunity windows in the recent phase.",
+    "visit_change_recent_hit_windows": "Recent-phase windows containing this Cell ID.",
+    "visit_change_recent_detection_rate": "Cell-ID detection rate in the fixed recent phase.",
+    "visit_change_detection_interval_gap": "Non-overlap gap between conservative baseline and recent detection-rate intervals.",
+    "visit_change_detection_shift": "Raw recent-minus-baseline Cell-ID detection-rate shift across the fixed visit phases.",
+    "visit_change_common_detection_shift": "Median detection-rate shift among comparable peer Cell IDs, treated as common-mode network behavior.",
+    "visit_change_residual_detection_shift": "Cell-specific detection-rate shift remaining after comparable-peer common-mode correction.",
+    "visit_change_detection_direction": "Direction of the raw baseline-to-recent detection-rate change.",
+    "visit_change_signal_metric": "Signal metric used for the visit comparison; only like-for-like metrics are compared.",
+    "visit_change_signal_earfcn": "EARFCN stratum used for the visit signal comparison.",
+    "visit_change_baseline_signal_median": "Median per-visit signal in the fixed baseline phase.",
+    "visit_change_recent_signal_median": "Median per-visit signal in the fixed recent phase.",
+    "visit_change_signal_shift_db": "Raw recent-minus-baseline signal shift for a like-for-like signal/EARFCN stratum.",
+    "visit_change_common_mode_shift_db": "Median signal shift of comparable peer cells in the same stratum.",
+    "visit_change_residual_signal_shift_db": "Cell-specific signal shift remaining after peer common-mode correction.",
+    "visit_change_signal_peer_count": "Number of comparable peer Cell IDs supporting common-mode signal correction.",
+    "visit_change_signal_robust_z": "Peer-adjusted signal shift divided by a robust baseline scale for the selected like-for-like signal stratum.",
+    "visit_change_effect": "Bounded 0..1 per-cell visit-change evidence after fixed-phase, repeated-visit, and peer-correction gates.",
     "dataset_mostly_lte": "True when the overall dataset is mostly LTE observations. Used only as weak contextual evidence for non-LTE towers.",
     "altitude_samples": "Number of observations for this tower that had usable altitude and could therefore be altitude-adjusted.",
     "stationary_altitude_samples": "Number of stationary observations for this tower that had usable altitude.",
@@ -827,12 +2109,18 @@ VARIABLE_GLOSSARY: Dict[str, str] = {
     "bayes_prior": "Starting probability before evidence. Kept low to reduce false positives.",
     "bayes_post_p": "Posterior probability after adding enabled evidence terms in log-odds space.",
     "delta_logodds": "How much one method changes log-odds. Positive raises suspicion; negative lowers it.",
+    "family": "Evidence-family name used to group correlated methods before their combined score contribution is capped.",
+    "raw_delta_logodds": "Method log-odds contribution before the correlated evidence-family cap is applied.",
+    "family_scale": "Multiplier applied to every contribution in an over-limit evidence family. One means no family cap was needed.",
     "odds_multiplier": "exp(delta_logodds). It tells how much this method alone multiplies suspicious odds at its current strength.",
     "p_before": "Posterior probability immediately before this method's contribution is applied in the explanation ordering.",
     "p_after": "Posterior probability immediately after this method's contribution is applied in the explanation ordering.",
     "delta_p": "Change in posterior probability caused by this method at that point in the explanation ordering.",
     "weight": "Maximum absolute log-odds contribution this method can add once its normalized evidence reaches 1.",
     "triggered": "Whether this method's gating conditions were satisfied and the computed evidence strength was above zero.",
+    "would_trigger": "Whether the method's gates would be satisfied using current data, even when the method is disabled for shadow evaluation.",
+    "shadow_norm01": "Uncapped 0..1 evidence strength the method would use if enabled; retained for disabled shadow methods.",
+    "shadow_delta_logodds": "Uncapped log-odds contribution the method would make if enabled; it never changes the live score while the method is disabled.",
     "base_norm01": "Raw normalized evidence before any altitude discount is applied.",
     "altitude_factor": "Altitude discount multiplier applied to some methods. Elevated observation points reduce the effective strength because they can hear farther towers.",
     "norm01": "Evidence strength normalized to 0..1 before multiplying by a method weight.",
@@ -850,6 +2138,28 @@ VARIABLE_GLOSSARY: Dict[str, str] = {
     "min_stationary_count": "Minimum number of stationary observations required before this method can trigger.",
     "min_count": "Minimum number of observations required before this method can trigger.",
     "min_bins": "Minimum number of weekly bins required before weekly drift is considered valid.",
+    "min_prior_visits": "Minimum number of independent completed prior visits required by a visit-aware method.",
+    "min_prior_windows": "Minimum number of independent comparable windows required before a local prior baseline is considered usable.",
+    "min_current_windows": "Minimum number of independent current-visit windows required to confirm a new local identity or TAC/LAC.",
+    "min_burst_windows": "Minimum number of detected independent windows required in the fixed activation burst.",
+    "max_burst_span_windows": "Maximum elapsed window span allowed for the fixed activation burst.",
+    "min_burst_rate": "Minimum detection fraction required inside the fixed activation-burst span.",
+    "min_post_visits": "Minimum number of independent later visits required to evaluate post-burst behavior.",
+    "min_post_windows": "Minimum number of comparable later windows required to evaluate post-burst behavior.",
+    "min_rate_drop": "Minimum conservative burst-to-post detection-rate drop required for transient-activation evidence.",
+    "min_baseline_visits": "Minimum number of independent visits required in a historical or earlier-phase baseline.",
+    "min_baseline_windows": "Minimum number of comparable windows required in the historical baseline.",
+    "min_baseline_hit_windows": "Minimum number of baseline windows that must contain the Cell ID before it is considered established.",
+    "min_baseline_rate_low": "Minimum conservative lower bound for the baseline detection rate.",
+    "min_later_visits": "Minimum number of genuinely later independent visits required for disappearance evidence.",
+    "min_later_windows": "Minimum number of genuinely later comparable windows required for disappearance evidence.",
+    "max_predictive_zero_p": "Largest posterior-predictive zero-detection probability allowed for disappearance evidence.",
+    "min_dominant_fraction": "Minimum fraction of prior local windows that must share the dominant TAC/LAC before that local pattern is considered stable.",
+    "min_current_fraction": "Minimum fraction of comparable current-visit windows that must contain a candidate new TAC/LAC.",
+    "min_recent_visits": "Minimum number of independent visits required in the fixed recent comparison phase.",
+    "min_phase_windows": "Minimum number of comparable opportunity windows required in each fixed visit-change phase.",
+    "min_signal_shift_db": "Minimum peer-adjusted signal shift considered by the per-cell visit-change method.",
+    "min_signal_peers": "Minimum number of comparable peer Cell IDs required for common-mode signal correction.",
     "min_model_n": "Minimum number of observations required before fitting the signal-vs-distance residual model.",
     "min_obs": "Minimum number of stationary coarse-identity observations required before churn methods can trigger.",
     "min_window_min": "Minimum stationary opportunity window, in minutes, required before the bursty-opportunity method can trigger.",
@@ -887,30 +2197,30 @@ VARIABLE_GLOSSARY: Dict[str, str] = {
 METHOD_REGISTRY: List[Dict[str, Any]] = [
     {
         "id": "new_in_well_covered_place",
-        "label": "New tower in a well-covered place",
+        "label": "Locally new Cell ID after a prior visit",
         "direction": "up",
         "weight": 1.6,
         "thresholds": {
-            "prior_count_start": 120,
-            "prior_count_full": 1200,
-            "min_tower_count_in_place": 6,
-            "min_prior_days": 2,
+            "min_prior_windows": DWELL_MIN_PRIOR_WINDOWS,
+            "min_current_windows": DWELL_MIN_CURRENT_WINDOWS,
         },
         "variables": [
-            "new_place_prior_count",
-            "new_place_prior_days",
-            "new_place_prior_stationary_count",
-            "new_place_prior_stationary_days",
-            "new_place_count",
+            "local_novelty_state",
+            "local_novelty_prior_visits",
+            "local_novelty_prior_windows",
+            "local_novelty_current_windows",
+            "local_novelty_effect",
+            "coarse_identity_primary",
         ],
-        "equation": "norm01 = clamp((new_place_prior_count - prior_count_start) / (prior_count_full - prior_count_start), 0, 1) if new_place_prior_days >= min_prior_days",
-        "help": "If a tower first appears inside a place bucket that previously had lots of good observations, we have higher confidence it was not simply missed earlier. This flags new deployments in well-covered areas (still probabilistic).",
+        "equation": "norm01 = prior-absence confidence × repeated-current-window confidence; requires a completed comparable prior visit and repeated sightings now",
+        "help": "Core rogue-cell candidate evidence. A Cell ID is locally new only when the same reliable venue was covered during a completed earlier visit for the same operator/RAT, the Cell ID was absent, and it now repeats across independent windows. First visits build a baseline and never trigger this method.",
         "map_layers": ["place_buckets", "points"],
     },
     {
         "id": "disappears_despite_coverage",
-        "label": "Disappears despite later coverage",
+        "label": "Legacy: disappears despite later raw coverage",
         "direction": "up",
+        "enabled": False,
         "weight": 1.2,
         "thresholds": {
             "post_count_start": 120,
@@ -927,13 +2237,14 @@ METHOD_REGISTRY: List[Dict[str, Any]] = [
             "new_place_id",
         ],
         "equation": "norm01 = clamp((new_place_post_count - post_count_start) / (post_count_full - post_count_start), 0, 1) if new_place_post_days >= min_post_days",
-        "help": "If a tower is observed in a place bucket, and then later we spend lots of time in that same bucket (seeing other towers), but never see this tower again, that is evidence it was short-lived or inconsistent. This is still probabilistic: phones do not observe every tower on every pass.",
+        "help": "Legacy disabled diagnostic based on raw later-row/day counts. Long dwell and scan cadence can inflate it. Use visit_aware_disappearance_v2 for source-aware independent-window evidence.",
         "map_layers": ["place_buckets", "points"],
     },
     {
         "id": "new_area_code_in_well_covered_place",
-        "label": "New TAC/LAC in a well-covered place",
+        "label": "Legacy: new TAC/LAC from raw place counts",
         "direction": "up",
+        "enabled": False,
         "weight": 1.2,
         "thresholds": {
             "prior_count_start": 40,
@@ -954,7 +2265,7 @@ METHOD_REGISTRY: List[Dict[str, Any]] = [
             "new_place_count",
         ],
         "equation": "coverage_norm = clamp((new_area_code_prior_same_rat_count - prior_count_start) / (prior_count_full - prior_count_start), 0, 1); stability_norm = clamp((new_area_code_prior_dominant_frac - dominant_frac_start) / (dominant_frac_full - dominant_frac_start), 0, 1); norm01 = coverage_norm * stability_norm when this TAC/LAC was unseen before in that same place for the same operator and RAT.",
-        "help": "Conservative local-context evidence only. LTE/5G uses TAC; older RATs use LAC in the same field. If a tower first appears in a place where the same operator and RAT were already well covered, and this TAC/LAC was not seen there before, that is mildly suspicious. The signal is stronger only when the previous local TAC/LAC pattern was itself stable.",
+        "help": "Legacy disabled diagnostic based on raw place counts. It can mix modem sources and incompatible TAC encodings. Use local_tac_novelty_v2 for source-specific visit/window evidence.",
         "map_layers": ["place_buckets", "points"],
     },
     {
@@ -1058,25 +2369,171 @@ METHOD_REGISTRY: List[Dict[str, Any]] = [
     },
     {
         "id": "ephemeral_stationary_opportunity",
-        "label": "Bursty despite stationary opportunity",
+        "label": "Legacy: bursty from wall-clock opportunity",
         "direction": "up",
+        "enabled": False,
         "weight": 1.6,
         "thresholds": {"min_stationary_count": 5, "min_window_min": 8, "max_frac": 0.35, "full_frac": 0.05},
         "variables": ["local_stationary_window_min", "local_stationary_window_frac", "stationary_span_s"],
         "equation": "norm01 = clamp((max_frac - local_stationary_window_frac) / (max_frac - full_frac), 0, 1)",
-        "help": "This fixes the old false-positive problem: a tower is only bursty if you had stationary opportunity nearby and it still appeared briefly.",
+        "help": "Legacy disabled diagnostic based on wall-clock span and raw stationary rows. Long dwell can inflate it. Use transient_activation_v2 for fixed-burst, independent-visit evidence.",
         "map_layers": ["stationary_points", "place_buckets"],
     },
     {
         "id": "place_change_correlation",
-        "label": "Correlates with changed place buckets",
+        "label": "Legacy: changed-place correlation",
         "direction": "up",
+        "enabled": False,
         "weight": 0.9,
         "thresholds": {"frac_start": 0.35, "frac_full": 0.80, "min_count": 20},
         "variables": ["change_places_frac_stationary", "change_places_frac", "place_details"],
         "equation": "norm01 = clamp((changed_bucket_fraction - frac_start) / (frac_full - frac_start), 0, 1)",
-        "help": "Weak evidence: this tower is seen mostly in place buckets where the signal you recorded in that same area changed over time. We mark a bucket as \"changed\" when simple change tests say the earlier vs later signal-strength distribution looks different (KS) or there is a sustained shift (CUSUM).",
+        "help": "Legacy disabled place-level correlation. It can repeat the same contextual change across many Cell IDs. Use per_cell_visit_change_v2 for fixed visits, typed signals, and peer common-mode control.",
         "map_layers": ["place_buckets"],
+    },
+    {
+        "id": "transient_activation_v2",
+        "label": "Transient Cell-ID activation (v2 shadow)",
+        "direction": "up",
+        "enabled": False,
+        "weight": 1.2,
+        "thresholds": {
+            "min_prior_visits": TRANSIENT_MIN_PRIOR_VISITS,
+            "min_prior_windows": TRANSIENT_MIN_PRIOR_WINDOWS,
+            "min_burst_windows": TRANSIENT_MIN_BURST_WINDOWS,
+            "max_burst_span_windows": 12,
+            "min_burst_rate": TRANSIENT_MIN_BURST_RATE,
+            "min_post_visits": TRANSIENT_MIN_POST_VISITS,
+            "min_post_windows": TRANSIENT_MIN_POST_WINDOWS,
+            "min_rate_drop": TRANSIENT_MIN_RATE_DROP,
+        },
+        "variables": [
+            "coarse_identity_primary",
+            "transient_activation_state",
+            "transient_activation_source",
+            "transient_activation_prior_visits",
+            "transient_activation_pre_windows",
+            "transient_activation_present_windows",
+            "transient_activation_burst_span_windows",
+            "transient_activation_burst_rate",
+            "transient_activation_burst_rate_low",
+            "transient_activation_post_visits",
+            "transient_activation_post_windows",
+            "transient_activation_post_hit_windows",
+            "transient_activation_post_rate_high",
+            "transient_activation_rate_drop",
+            "transient_activation_effect",
+        ],
+        "equation": "norm01 = pre-coverage confidence × fixed-burst confidence × post-coverage confidence × conservative burst-to-post rate-drop strength",
+        "help": "Shadow-only v2 lifecycle evidence. It looks for a coarse Cell ID that was absent during multiple earlier visits, appears repeatedly in one fixed short burst, and then becomes uncommon again despite later independent coverage. Repeated scans in one window and arbitrary best-change-point searches cannot inflate it.",
+        "map_layers": ["place_buckets", "stationary_points"],
+    },
+    {
+        "id": "visit_aware_disappearance_v2",
+        "label": "Visit-aware Cell-ID disappearance (v2 shadow)",
+        "direction": "up",
+        "enabled": False,
+        "weight": 1.0,
+        "thresholds": {
+            "min_baseline_visits": DISAPPEAR_MIN_BASELINE_VISITS,
+            "min_baseline_windows": DISAPPEAR_MIN_BASELINE_WINDOWS,
+            "min_baseline_hit_windows": DISAPPEAR_MIN_BASELINE_HIT_WINDOWS,
+            "min_baseline_rate_low": DISAPPEAR_MIN_BASELINE_RATE_LOW,
+            "min_later_visits": DISAPPEAR_MIN_LATER_VISITS,
+            "min_later_windows": DISAPPEAR_MIN_LATER_WINDOWS,
+            "max_predictive_zero_p": DISAPPEAR_MAX_PREDICTIVE_ZERO_P,
+        },
+        "variables": [
+            "coarse_identity_primary",
+            "disappearance_state",
+            "disappearance_source",
+            "disappearance_baseline_visits",
+            "disappearance_baseline_windows",
+            "disappearance_baseline_hit_windows",
+            "disappearance_baseline_detection_rate",
+            "disappearance_baseline_rate_low",
+            "disappearance_later_visits",
+            "disappearance_later_windows",
+            "disappearance_predictive_zero_p",
+            "disappearance_effect",
+        ],
+        "equation": "norm01 = conservative historical reliability × posterior-predictive surprise of zero later detections × independent-later-visit confidence",
+        "help": "Shadow-only v2 lifecycle evidence. A Cell ID must first be reliably established across independent visits, then remain absent over multiple genuinely later visits with comparable operator/RAT coverage. Staying longer in one visit does not manufacture more visits.",
+        "map_layers": ["place_buckets", "stationary_points"],
+    },
+    {
+        "id": "local_tac_novelty_v2",
+        "label": "Locally new TAC/LAC (v2 shadow)",
+        "direction": "up",
+        "enabled": False,
+        "weight": 0.8,
+        "thresholds": {
+            "min_prior_visits": LOCAL_TAC_MIN_PRIOR_VISITS,
+            "min_prior_windows": LOCAL_TAC_MIN_PRIOR_WINDOWS,
+            "min_current_windows": LOCAL_TAC_MIN_CURRENT_WINDOWS,
+            "min_dominant_fraction": LOCAL_TAC_MIN_DOMINANT_FRAC,
+            "min_current_fraction": LOCAL_TAC_MIN_CURRENT_FRACTION,
+        },
+        "variables": [
+            "coarse_identity_primary",
+            "local_tac_is_primary_identity",
+            "local_tac_state",
+            "local_tac_source",
+            "local_tac_value",
+            "local_tac_prior_visits",
+            "local_tac_prior_windows",
+            "local_tac_prior_distinct_tacs",
+            "local_tac_prior_dominant_tac",
+            "local_tac_prior_dominant_fraction",
+            "local_tac_current_windows",
+            "local_tac_current_opportunity_windows",
+            "local_tac_current_fraction",
+            "local_tac_current_cells",
+            "local_tac_primary_identity",
+            "local_tac_effect",
+        ],
+        "equation": "norm01 = prior-window confidence × prior-local-TAC stability × repeated-current-window confidence, assigned once per new-TAC episode",
+        "help": "Shadow-only v2 local-context evidence. A TAC/LAC is locally new only after multiple completed prior visits established a stable same-operator/RAT TAC pattern. If several Cell IDs arrive with the same new TAC/LAC, exactly one representative carries the evidence so the episode is not multiplied.",
+        "map_layers": ["place_buckets", "stationary_points"],
+    },
+    {
+        "id": "per_cell_visit_change_v2",
+        "label": "Per-cell visit change (v2 shadow)",
+        "direction": "up",
+        "enabled": False,
+        "weight": 1.0,
+        "thresholds": {
+            "min_baseline_visits": VISIT_CHANGE_MIN_BASELINE_VISITS,
+            "min_recent_visits": VISIT_CHANGE_MIN_RECENT_VISITS,
+            "min_phase_windows": VISIT_CHANGE_MIN_PHASE_WINDOWS,
+            "min_signal_shift_db": VISIT_CHANGE_MIN_SIGNAL_SHIFT_DB,
+            "min_signal_peers": VISIT_CHANGE_MIN_SIGNAL_PEERS,
+        },
+        "variables": [
+            "coarse_identity_primary",
+            "visit_change_state",
+            "visit_change_source",
+            "visit_change_baseline_visits",
+            "visit_change_recent_visits",
+            "visit_change_baseline_windows",
+            "visit_change_baseline_detection_rate",
+            "visit_change_recent_windows",
+            "visit_change_recent_detection_rate",
+            "visit_change_detection_shift",
+            "visit_change_common_detection_shift",
+            "visit_change_residual_detection_shift",
+            "visit_change_signal_metric",
+            "visit_change_signal_earfcn",
+            "visit_change_signal_shift_db",
+            "visit_change_common_mode_shift_db",
+            "visit_change_residual_signal_shift_db",
+            "visit_change_signal_peer_count",
+            "visit_change_signal_robust_z",
+            "visit_change_effect",
+        ],
+        "equation": "norm01 = max(conservative detection-rate change, robust signal shift) after subtracting the median comparable-peer shift, using fixed earlier-versus-recent visit phases",
+        "help": "Shadow-only v2 radio evidence. It compares fixed independent visit phases for one coarse Cell ID and removes changes shared by peer cells, so a whole-network retune, indoor propagation change, or simply collecting more scans is less likely to look rogue.",
+        "map_layers": ["place_buckets", "stationary_points"],
     },
     {
         "id": "rat_transition_surprise",
@@ -1136,6 +2593,23 @@ METHOD_REGISTRY: List[Dict[str, Any]] = [
         "map_layers": [],
     },
     {
+        "id": "dwell_stability",
+        "label": "Stable repeated dwell evidence",
+        "direction": "down",
+        "weight": 1.8,
+        "thresholds": {"min_windows": 3},
+        "variables": [
+            "dwell_normality_credit",
+            "effective_observation_windows",
+            "eligible_observation_windows",
+            "independent_visits",
+            "dwell_detection_rate",
+        ],
+        "equation": "norm01 = dwell_normality_credit when effective_observation_windows >= min_windows; contribution is negative and saturates",
+        "help": "Long, unchanged observation is evidence of normality. Repeated raw scans inside one window add nothing; independent windows, days, and revisits add bounded confidence with diminishing returns.",
+        "map_layers": ["place_buckets", "stationary_points"],
+    },
+    {
         "id": "stability",
         "label": "Stability evidence",
         "direction": "down",
@@ -1159,22 +2633,58 @@ METHOD_REGISTRY: List[Dict[str, Any]] = [
     },
 ]
 
+METHOD_EVIDENCE_FAMILIES: Dict[str, str] = {
+    "multi_location_stationary": "location_gps",
+    "multi_location": "location_gps",
+    "gps_spread": "location_gps",
+    "center_drift": "location_gps",
+    "signal_distance_mismatch": "location_gps",
+    "stationary_signal_mad": "radio_stability",
+    "stationary_jump_rate": "radio_stability",
+    "stationary_pci_churn": "network_identity",
+    "stationary_earfcn_churn": "network_identity",
+    "new_in_well_covered_place": "cell_lifecycle",
+    "new_area_code_in_well_covered_place": "cell_lifecycle",
+    "disappears_despite_coverage": "cell_lifecycle",
+    "ephemeral_stationary_opportunity": "cell_lifecycle",
+    "transient_activation_v2": "cell_lifecycle",
+    "visit_aware_disappearance_v2": "cell_lifecycle",
+    "local_tac_novelty_v2": "cell_lifecycle",
+    "per_cell_visit_change_v2": "radio_stability",
+    "place_change_correlation": "place_context",
+    "rat_transition_surprise": "place_context",
+    "non_lte_when_mostly_lte": "network_identity",
+    "wigle_absent": "external",
+    "wigle_historical_presence": "external",
+    "dwell_stability": "normality",
+    "stability": "normality",
+    "many_days": "normality",
+    "known_tower": "manual",
+}
+
+EVIDENCE_FAMILY_CAPS: Dict[Tuple[str, str], float] = {
+    ("location_gps", "up"): 2.5,
+    ("radio_stability", "up"): 2.0,
+    ("network_identity", "up"): 1.5,
+    ("cell_lifecycle", "up"): 2.5,
+    ("place_context", "up"): 1.5,
+    ("external", "up"): 1.5,
+    ("external", "down"): 2.0,
+    ("normality", "down"): 2.5,
+}
+
 METHOD_XAI_SPECS: Dict[str, Dict[str, Any]] = {
     "new_in_well_covered_place": {
-        "trigger_summary": "Requires enough tower observations in its main place bucket and substantial prior coverage (count and days) in that place before the tower first appeared there.",
+        "trigger_summary": "Requires a completed comparable prior visit, sufficient independent prior windows with this Cell ID absent, and repeated sightings during a later visit. A first visit never triggers.",
         "rows": [
-            ("Gate", "new_place_count"),
-            ("Gate", "min_tower_count_in_place"),
-            ("Context", "new_place_first_seen_local"),
-            ("Gate", "new_place_prior_days"),
-            ("Gate", "min_prior_days"),
-            ("Equation", "new_place_prior_count"),
-            ("Equation", "prior_count_start"),
-            ("Equation", "prior_count_full"),
-            ("Context", "new_place_id"),
-            ("Context", "new_place_prior_range"),
-            ("Context", "new_place_prior_stationary_count"),
-            ("Context", "new_place_prior_stationary_days"),
+            ("Gate", "coarse_identity_primary"),
+            ("Context", "local_novelty_state"),
+            ("Gate", "local_novelty_prior_visits"),
+            ("Gate", "local_novelty_prior_windows"),
+            ("Gate", "min_prior_windows"),
+            ("Gate", "local_novelty_current_windows"),
+            ("Gate", "min_current_windows"),
+            ("Equation", "local_novelty_effect"),
         ],
     },
     "disappears_despite_coverage": {
@@ -1211,6 +2721,114 @@ METHOD_XAI_SPECS: Dict[str, Dict[str, Any]] = {
             ("Context", "new_area_code_prior_dominant_code"),
             ("Context", "new_area_code_prior_range"),
             ("Context", "new_place_id"),
+        ],
+    },
+    "transient_activation_v2": {
+        "trigger_summary": "Shadow evaluation: requires completed prior visits and absence windows, a dense fixed activation burst, and enough later visits/windows for a conservative burst-to-post detection-rate drop.",
+        "rows": [
+            ("Gate", "coarse_identity_primary"),
+            ("Context", "transient_activation_state"),
+            ("Context", "transient_activation_source"),
+            ("Gate", "transient_activation_prior_visits"),
+            ("Gate", "min_prior_visits"),
+            ("Gate", "transient_activation_pre_windows"),
+            ("Gate", "min_prior_windows"),
+            ("Gate", "transient_activation_present_windows"),
+            ("Gate", "min_burst_windows"),
+            ("Gate", "transient_activation_burst_span_windows"),
+            ("Gate", "max_burst_span_windows"),
+            ("Equation", "transient_activation_burst_rate"),
+            ("Gate", "min_burst_rate"),
+            ("Context", "transient_activation_burst_rate_low"),
+            ("Gate", "transient_activation_post_visits"),
+            ("Gate", "min_post_visits"),
+            ("Gate", "transient_activation_post_windows"),
+            ("Gate", "min_post_windows"),
+            ("Context", "transient_activation_post_hit_windows"),
+            ("Context", "transient_activation_post_rate_high"),
+            ("Equation", "transient_activation_rate_drop"),
+            ("Gate", "min_rate_drop"),
+            ("Equation", "transient_activation_effect"),
+        ],
+    },
+    "visit_aware_disappearance_v2": {
+        "trigger_summary": "Shadow evaluation: requires a reliable Cell-ID baseline across visits and windows, followed by zero detections over multiple independent later visits with enough comparable coverage.",
+        "rows": [
+            ("Gate", "coarse_identity_primary"),
+            ("Context", "disappearance_state"),
+            ("Context", "disappearance_source"),
+            ("Gate", "disappearance_baseline_visits"),
+            ("Gate", "min_baseline_visits"),
+            ("Gate", "disappearance_baseline_windows"),
+            ("Gate", "min_baseline_windows"),
+            ("Gate", "disappearance_baseline_hit_windows"),
+            ("Gate", "min_baseline_hit_windows"),
+            ("Context", "disappearance_baseline_detection_rate"),
+            ("Equation", "disappearance_baseline_rate_low"),
+            ("Gate", "min_baseline_rate_low"),
+            ("Gate", "disappearance_later_visits"),
+            ("Gate", "min_later_visits"),
+            ("Gate", "disappearance_later_windows"),
+            ("Gate", "min_later_windows"),
+            ("Equation", "disappearance_predictive_zero_p"),
+            ("Gate", "max_predictive_zero_p"),
+            ("Equation", "disappearance_effect"),
+        ],
+    },
+    "local_tac_novelty_v2": {
+        "trigger_summary": "Shadow evaluation: requires multiple prior visits with a stable dominant local TAC/LAC and repeated current windows; only one coarse Cell ID represents a multi-cell new-TAC episode.",
+        "rows": [
+            ("Gate", "coarse_identity_primary"),
+            ("Gate", "local_tac_is_primary_identity"),
+            ("Context", "local_tac_state"),
+            ("Context", "local_tac_source"),
+            ("Context", "local_tac_value"),
+            ("Gate", "local_tac_prior_visits"),
+            ("Gate", "min_prior_visits"),
+            ("Gate", "local_tac_prior_windows"),
+            ("Gate", "min_prior_windows"),
+            ("Context", "local_tac_prior_distinct_tacs"),
+            ("Context", "local_tac_prior_dominant_tac"),
+            ("Equation", "local_tac_prior_dominant_fraction"),
+            ("Gate", "min_dominant_fraction"),
+            ("Gate", "local_tac_current_windows"),
+            ("Gate", "min_current_windows"),
+            ("Context", "local_tac_current_opportunity_windows"),
+            ("Equation", "local_tac_current_fraction"),
+            ("Gate", "min_current_fraction"),
+            ("Context", "local_tac_current_cells"),
+            ("Context", "local_tac_primary_identity"),
+            ("Equation", "local_tac_effect"),
+        ],
+    },
+    "per_cell_visit_change_v2": {
+        "trigger_summary": "Shadow evaluation: compares fixed earlier and recent independent visits, then requires a cell-specific detection or signal shift that remains after comparable-peer common-mode correction.",
+        "rows": [
+            ("Gate", "coarse_identity_primary"),
+            ("Context", "visit_change_state"),
+            ("Context", "visit_change_source"),
+            ("Gate", "visit_change_baseline_visits"),
+            ("Gate", "min_baseline_visits"),
+            ("Gate", "visit_change_recent_visits"),
+            ("Gate", "min_recent_visits"),
+            ("Gate", "visit_change_baseline_windows"),
+            ("Gate", "visit_change_recent_windows"),
+            ("Gate", "min_phase_windows"),
+            ("Context", "visit_change_baseline_detection_rate"),
+            ("Context", "visit_change_recent_detection_rate"),
+            ("Context", "visit_change_detection_shift"),
+            ("Context", "visit_change_common_detection_shift"),
+            ("Equation", "visit_change_residual_detection_shift"),
+            ("Context", "visit_change_signal_metric"),
+            ("Context", "visit_change_signal_earfcn"),
+            ("Context", "visit_change_signal_shift_db"),
+            ("Context", "visit_change_common_mode_shift_db"),
+            ("Equation", "visit_change_residual_signal_shift_db"),
+            ("Gate", "min_signal_shift_db"),
+            ("Context", "visit_change_signal_peer_count"),
+            ("Gate", "min_signal_peers"),
+            ("Equation", "visit_change_signal_robust_z"),
+            ("Equation", "visit_change_effect"),
         ],
     },
     "multi_location_stationary": {
@@ -1394,6 +3012,17 @@ METHOD_XAI_SPECS: Dict[str, Dict[str, Any]] = {
             ("Equation", "norm01"),
         ],
     },
+    "dwell_stability": {
+        "trigger_summary": "Negative evidence from repeated stable independent windows. Raw scans inside the same window do not increase it, and the credit saturates.",
+        "rows": [
+            ("Gate", "effective_observation_windows"),
+            ("Gate", "min_windows"),
+            ("Context", "eligible_observation_windows"),
+            ("Context", "independent_visits"),
+            ("Context", "dwell_detection_rate"),
+            ("Equation", "dwell_normality_credit"),
+        ],
+    },
     "many_days": {
         "trigger_summary": "Negative evidence: once distinct days seen exceeds the start threshold, suspicion is reduced.",
         "rows": [
@@ -1413,6 +3042,9 @@ METHOD_XAI_SPECS: Dict[str, Dict[str, Any]] = {
 COMMON_EFFECT_ROWS: List[Tuple[str, str]] = [
     ("Effect", "base_norm01"),
     ("Effect", "altitude_factor"),
+    ("Effect", "would_trigger"),
+    ("Effect", "shadow_norm01"),
+    ("Effect", "shadow_delta_logodds"),
     ("Effect", "norm01"),
     ("Effect", "weight"),
     ("Effect", "delta_logodds"),
@@ -1548,6 +3180,8 @@ def ensure_column(con: sqlite3.Connection, table: str, column: str, spec: str) -
 def migrate_db(con: sqlite3.Connection) -> None:
     ensure_column(con, "raw_samples", "alt_m", "REAL")
     ensure_column(con, "tower_observations", "ignored", "INTEGER NOT NULL DEFAULT 0")
+    ensure_column(con, "tower_observations", "signal_metric", "TEXT")
+    ensure_column(con, "tower_observations", "observation_source", "TEXT")
     ensure_column(con, "import_files", "new_samples", "INTEGER NOT NULL DEFAULT 0")
     ensure_column(con, "import_files", "tower_fingerprints", "INTEGER NOT NULL DEFAULT 0")
     ensure_column(con, "import_files", "new_towers", "INTEGER NOT NULL DEFAULT 0")
@@ -1561,6 +3195,34 @@ def migrate_db(con: sqlite3.Connection) -> None:
     if location_view_columns and "first_observation_ts" not in location_view_columns:
         con.execute("DROP VIEW tower_location_quality")
     con.executescript(LOCATION_QUALITY_VIEW_SQL)
+    signal_metric_key = "migration_signal_metric_v1"
+    if not get_app_setting(con, signal_metric_key, False):
+        con.execute(
+            """
+            UPDATE tower_observations
+            SET signal_metric = CASE
+              WHEN json_extract(raw_cell_json,'$.rsrp') IS NOT NULL THEN 'rsrp'
+              WHEN json_extract(raw_cell_json,'$.rssi_dbm') IS NOT NULL THEN 'rssi_dbm'
+              WHEN json_extract(raw_cell_json,'$.rssi') IS NOT NULL THEN 'rssi'
+              WHEN json_extract(raw_cell_json,'$.rssnr') IS NOT NULL THEN 'rssnr'
+              WHEN json_extract(raw_cell_json,'$.rsrq') IS NOT NULL THEN 'rsrq'
+              WHEN signal IS NOT NULL THEN 'csq_rssi_dbm'
+              ELSE NULL
+            END
+            WHERE signal_metric IS NULL
+            """
+        )
+        set_app_setting(con, signal_metric_key, True)
+    observation_source_key = "migration_observation_source_v1"
+    if not get_app_setting(con, observation_source_key, False):
+        con.execute(
+            """
+            UPDATE tower_observations
+            SET observation_source=COALESCE(NULLIF(json_extract(raw_cell_json,'$.source'),''),'unknown')
+            WHERE observation_source IS NULL
+            """
+        )
+        set_app_setting(con, observation_source_key, True)
     place_cleanup_key = "migration_clear_bad_gps_place_ids_v1"
     if not get_app_setting(con, place_cleanup_key, False):
         # place_id is derived from coordinates. Keeping it on a rejected fix is
@@ -1581,6 +3243,33 @@ def migrate_db(con: sqlite3.Connection) -> None:
         )
         con.execute("UPDATE tower_observations SET place_id=NULL WHERE bad_gps=1 AND place_id IS NOT NULL")
         set_app_setting(con, place_cleanup_key, True)
+    dwell_v2_key = "migration_dwell_scoring_v2"
+    if not get_app_setting(con, dwell_v2_key, False):
+        # These methods use raw row counts or first-to-last wall time. They are
+        # disabled until they are rebuilt on independent visits/windows.
+        con.execute(
+            """
+            UPDATE method_settings SET enabled=0, updated_at=?
+            WHERE method_id IN (
+              'disappears_despite_coverage',
+              'new_area_code_in_well_covered_place',
+              'ephemeral_stationary_opportunity',
+              'place_change_correlation'
+            )
+            """,
+            (utc_now(),),
+        )
+        con.execute(
+            "UPDATE method_settings SET thresholds_json=?, updated_at=? WHERE method_id='new_in_well_covered_place'",
+            (
+                json_dumps({
+                    "min_prior_windows": DWELL_MIN_PRIOR_WINDOWS,
+                    "min_current_windows": DWELL_MIN_CURRENT_WINDOWS,
+                }),
+                utc_now(),
+            ),
+        )
+        set_app_setting(con, dwell_v2_key, True)
     con.commit()
 
 
@@ -1632,17 +3321,32 @@ def seed_methods(con: sqlite3.Connection) -> None:
             (method_id,enabled,weight,thresholds_json,updated_at)
             VALUES (?,?,?,?,?)
             """,
-            (method["id"], 1, method["weight"], json_dumps(method["thresholds"]), utc_now()),
+            (method["id"], 1 if method.get("enabled", True) else 0, method["weight"], json_dumps(method["thresholds"]), utc_now()),
         )
+        # Preserve every user-edited value while filling newly introduced
+        # threshold keys during code upgrades. Runtime evaluation already
+        # falls back to defaults; materializing the keys keeps the DB/API
+        # explanation complete as well.
+        setting_row = con.execute(
+            "SELECT thresholds_json FROM method_settings WHERE method_id=?",
+            (method["id"],),
+        ).fetchone()
+        configured_thresholds = json_loads(setting_row["thresholds_json"], {}) if setting_row else {}
+        configured_thresholds = configured_thresholds if isinstance(configured_thresholds, dict) else {}
+        merged_thresholds = dict(method["thresholds"])
+        merged_thresholds.update(configured_thresholds)
+        if merged_thresholds != configured_thresholds:
+            con.execute(
+                "UPDATE method_settings SET thresholds_json=?, updated_at=? WHERE method_id=?",
+                (json_dumps(merged_thresholds), utc_now(), method["id"]),
+            )
     con.commit()
 
 
 def seed_methods_if_missing(con: sqlite3.Connection) -> None:
-    existing_methods = {str(row["id"]) for row in con.execute("SELECT id FROM anomaly_methods").fetchall()}
-    existing_settings = {str(row["method_id"]) for row in con.execute("SELECT method_id FROM method_settings").fetchall()}
-    required = {str(method["id"]) for method in METHOD_REGISTRY}
-    if required.issubset(existing_methods) and required.issubset(existing_settings):
-        return
+    # Built-in labels/help/equations evolve with the code. seed_methods()
+    # upserts that registry metadata while INSERT OR IGNORE preserves each
+    # user's enabled flag, weight, and configured threshold values.
     seed_methods(con)
 
 
@@ -1771,10 +3475,13 @@ def add_method_result(
     direction = method["direction"]
     base_norm01 = clamp01(norm01)
     altitude_factor = clamp01(altitude_factor)
-    effective_norm01 = base_norm01 * altitude_factor if triggered else 0.0
-    delta = weight * effective_norm01
+    would_trigger = bool(triggered)
+    shadow_norm01 = base_norm01 * altitude_factor if would_trigger else 0.0
+    shadow_delta_logodds = weight * shadow_norm01
     if direction == "down":
-        delta = -delta
+        shadow_delta_logodds = -shadow_delta_logodds
+    effective_norm01 = shadow_norm01
+    delta = shadow_delta_logodds
     if not method["enabled"]:
         delta = 0.0
         triggered = False
@@ -1799,9 +3506,41 @@ def add_method_result(
         "odds_multiplier": math.exp(delta),
         "help": method["help"],
         "map_layers": method["map_layers"],
+        "would_trigger": would_trigger,
+        "shadow_norm01": shadow_norm01,
+        "shadow_delta_logodds": shadow_delta_logodds,
     }
     results.append(result)
     return delta
+
+
+def apply_evidence_family_caps(results: List[Dict[str, Any]]) -> float:
+    """Cap correlated evidence while preserving every diagnostic explanation."""
+
+    grouped: Dict[Tuple[str, str], List[Dict[str, Any]]] = defaultdict(list)
+    for result in results:
+        method_id = str(result.get("id") or "")
+        family = METHOD_EVIDENCE_FAMILIES.get(method_id, method_id or "other")
+        direction = str(result.get("direction") or "up")
+        result["family"] = family
+        result["raw_delta_logodds"] = float(result.get("delta_logodds") or 0.0)
+        result["family_scale"] = 1.0
+        if family != "manual":
+            grouped[(family, direction)].append(result)
+
+    for group_key, items in grouped.items():
+        cap = EVIDENCE_FAMILY_CAPS.get(group_key)
+        magnitude = sum(abs(float(item.get("raw_delta_logodds") or 0.0)) for item in items)
+        scale = min(1.0, float(cap) / magnitude) if cap is not None and magnitude > 0 else 1.0
+        for item in items:
+            raw_delta = float(item.get("raw_delta_logodds") or 0.0)
+            delta = raw_delta * scale
+            item["family_scale"] = scale
+            item["delta_logodds"] = delta
+            item["norm01"] = float(item.get("norm01") or 0.0) * scale
+            item["odds_multiplier"] = math.exp(delta)
+
+    return sum(float(result.get("delta_logodds") or 0.0) for result in results)
 
 
 def evaluate_methods(
@@ -1889,14 +3628,16 @@ def evaluate_methods(
     total_delta += add_method_result(results, m(mid), context, n, bool(stat_count >= th(mid, "min_stationary_count", 5) and isinstance(window, (int, float)) and window >= th(mid, "min_window_min", 8) and n > 0), "Tower appeared briefly despite stationary nearby opportunity.", altitude_factor=stationary_altitude_factor(), altitude_factor_name="stationary_geo_altitude_confidence")
 
     mid = "new_in_well_covered_place"
-    prior_count = features.get("new_place_prior_count")
-    prior_days = features.get("new_place_prior_days")
-    tower_place_n = features.get("new_place_count") or 0
-    n = norm_range(prior_count, th(mid, "prior_count_start", 120), th(mid, "prior_count_full", 1200))
+    prior_visits = int(features.get("local_novelty_prior_visits") or 0)
+    prior_windows = int(features.get("local_novelty_prior_windows") or 0)
+    current_windows = int(features.get("local_novelty_current_windows") or 0)
+    n = clamp01(float(features.get("local_novelty_effect") or 0.0))
     triggered = bool(
-        isinstance(prior_days, (int, float))
-        and prior_days >= th(mid, "min_prior_days", 2)
-        and (tower_place_n >= th(mid, "min_tower_count_in_place", 6))
+        bool(features.get("coarse_identity_primary"))
+        and bool(features.get("local_novelty_triggered"))
+        and prior_visits >= 1
+        and prior_windows >= th(mid, "min_prior_windows", DWELL_MIN_PRIOR_WINDOWS)
+        and current_windows >= th(mid, "min_current_windows", DWELL_MIN_CURRENT_WINDOWS)
         and n > 0
     )
     total_delta += add_method_result(
@@ -1905,18 +3646,7 @@ def evaluate_methods(
         context,
         n,
         triggered,
-        (
-            "Tower first appears in a well-covered place bucket. "
-            + (f"First seen: {features.get('new_place_first_seen_local')}. " if features.get("new_place_first_seen_local") else "")
-            + (
-                f"Prior coverage in this bucket: {features.get('new_place_prior_range')} ({int(prior_days)} distinct days with data). "
-                if features.get("new_place_prior_range") and isinstance(prior_days, (int, float))
-                else ""
-            )
-            + (f"Prior good-GPS obs in bucket: {int(prior_count)}. " if isinstance(prior_count, (int, float)) else "")
-        ).strip(),
-        altitude_factor=geo_altitude_factor(),
-        altitude_factor_name="geo_altitude_confidence",
+        f"Cell ID state={features.get('local_novelty_state')}; absent across {prior_windows} independent window(s) in {prior_visits} completed prior visit(s), then repeated in {current_windows} window(s).",
     )
 
     mid = "new_area_code_in_well_covered_place"
@@ -2002,6 +3732,145 @@ def evaluate_methods(
         "Tower is concentrated in place buckets where the local signal behavior changed over time (earlier vs later looks different).",
     )
 
+    mid = "transient_activation_v2"
+    transient_prior_visits = int(features.get("transient_activation_prior_visits") or 0)
+    transient_pre_windows = int(features.get("transient_activation_pre_windows") or 0)
+    transient_present_windows = int(features.get("transient_activation_present_windows") or 0)
+    transient_burst_span = int(features.get("transient_activation_burst_span_windows") or 0)
+    transient_burst_rate = features.get("transient_activation_burst_rate")
+    transient_post_visits = int(features.get("transient_activation_post_visits") or 0)
+    transient_post_windows = int(features.get("transient_activation_post_windows") or 0)
+    transient_rate_drop = features.get("transient_activation_rate_drop")
+    n = clamp01(float(features.get("transient_activation_effect") or 0.0))
+    triggered = bool(
+        bool(features.get("coarse_identity_primary"))
+        and transient_prior_visits >= th(mid, "min_prior_visits", TRANSIENT_MIN_PRIOR_VISITS)
+        and transient_pre_windows >= th(mid, "min_prior_windows", TRANSIENT_MIN_PRIOR_WINDOWS)
+        and transient_present_windows >= th(mid, "min_burst_windows", TRANSIENT_MIN_BURST_WINDOWS)
+        and 0 < transient_burst_span <= th(mid, "max_burst_span_windows", 12)
+        and isinstance(transient_burst_rate, (int, float))
+        and transient_burst_rate >= th(mid, "min_burst_rate", TRANSIENT_MIN_BURST_RATE)
+        and transient_post_visits >= th(mid, "min_post_visits", TRANSIENT_MIN_POST_VISITS)
+        and transient_post_windows >= th(mid, "min_post_windows", TRANSIENT_MIN_POST_WINDOWS)
+        and isinstance(transient_rate_drop, (int, float))
+        and transient_rate_drop >= th(mid, "min_rate_drop", TRANSIENT_MIN_RATE_DROP)
+        and n > 0
+    )
+    total_delta += add_method_result(
+        results,
+        m(mid),
+        context,
+        n,
+        triggered,
+        (
+            f"Cell ID state={features.get('transient_activation_state')}; absent over {transient_pre_windows} window(s) "
+            f"in {transient_prior_visits} prior visit(s), present in {transient_present_windows}/{transient_burst_span} "
+            f"fixed-burst window(s), then checked over {transient_post_windows} window(s) in "
+            f"{transient_post_visits} later visit(s); conservative rate drop={transient_rate_drop}."
+        ),
+    )
+
+    mid = "visit_aware_disappearance_v2"
+    disappearance_baseline_visits = int(features.get("disappearance_baseline_visits") or 0)
+    disappearance_baseline_windows = int(features.get("disappearance_baseline_windows") or 0)
+    disappearance_baseline_hits = int(features.get("disappearance_baseline_hit_windows") or 0)
+    disappearance_rate_low = features.get("disappearance_baseline_rate_low")
+    disappearance_later_visits = int(features.get("disappearance_later_visits") or 0)
+    disappearance_later_windows = int(features.get("disappearance_later_windows") or 0)
+    disappearance_zero_p = features.get("disappearance_predictive_zero_p")
+    n = clamp01(float(features.get("disappearance_effect") or 0.0))
+    triggered = bool(
+        bool(features.get("coarse_identity_primary"))
+        and disappearance_baseline_visits >= th(mid, "min_baseline_visits", DISAPPEAR_MIN_BASELINE_VISITS)
+        and disappearance_baseline_windows >= th(mid, "min_baseline_windows", DISAPPEAR_MIN_BASELINE_WINDOWS)
+        and disappearance_baseline_hits >= th(mid, "min_baseline_hit_windows", DISAPPEAR_MIN_BASELINE_HIT_WINDOWS)
+        and isinstance(disappearance_rate_low, (int, float))
+        and disappearance_rate_low >= th(mid, "min_baseline_rate_low", DISAPPEAR_MIN_BASELINE_RATE_LOW)
+        and disappearance_later_visits >= th(mid, "min_later_visits", DISAPPEAR_MIN_LATER_VISITS)
+        and disappearance_later_windows >= th(mid, "min_later_windows", DISAPPEAR_MIN_LATER_WINDOWS)
+        and isinstance(disappearance_zero_p, (int, float))
+        and disappearance_zero_p <= th(mid, "max_predictive_zero_p", DISAPPEAR_MAX_PREDICTIVE_ZERO_P)
+        and n > 0
+    )
+    total_delta += add_method_result(
+        results,
+        m(mid),
+        context,
+        n,
+        triggered,
+        (
+            f"Cell ID state={features.get('disappearance_state')}; historical baseline has "
+            f"{disappearance_baseline_hits}/{disappearance_baseline_windows} detected window(s) across "
+            f"{disappearance_baseline_visits} visit(s), followed by zero detections over "
+            f"{disappearance_later_windows} window(s) in {disappearance_later_visits} later visit(s); "
+            f"predictive P(zero)={disappearance_zero_p}."
+        ),
+    )
+
+    mid = "local_tac_novelty_v2"
+    local_tac_prior_visits = int(features.get("local_tac_prior_visits") or 0)
+    local_tac_prior_windows = int(features.get("local_tac_prior_windows") or 0)
+    local_tac_dominant_fraction = features.get("local_tac_prior_dominant_fraction")
+    local_tac_current_windows = int(features.get("local_tac_current_windows") or 0)
+    local_tac_current_fraction = features.get("local_tac_current_fraction")
+    n = clamp01(float(features.get("local_tac_effect") or 0.0))
+    triggered = bool(
+        bool(features.get("coarse_identity_primary"))
+        and bool(features.get("local_tac_is_primary_identity"))
+        and features.get("local_tac_value") is not None
+        and local_tac_prior_visits >= th(mid, "min_prior_visits", LOCAL_TAC_MIN_PRIOR_VISITS)
+        and local_tac_prior_windows >= th(mid, "min_prior_windows", LOCAL_TAC_MIN_PRIOR_WINDOWS)
+        and isinstance(local_tac_dominant_fraction, (int, float))
+        and local_tac_dominant_fraction >= th(mid, "min_dominant_fraction", LOCAL_TAC_MIN_DOMINANT_FRAC)
+        and local_tac_current_windows >= th(mid, "min_current_windows", LOCAL_TAC_MIN_CURRENT_WINDOWS)
+        and isinstance(local_tac_current_fraction, (int, float))
+        and local_tac_current_fraction >= th(mid, "min_current_fraction", LOCAL_TAC_MIN_CURRENT_FRACTION)
+        and n > 0
+    )
+    total_delta += add_method_result(
+        results,
+        m(mid),
+        context,
+        n,
+        triggered,
+        (
+            f"TAC/LAC state={features.get('local_tac_state')}; candidate={features.get('local_tac_value')} after "
+            f"{local_tac_prior_windows} local window(s) in {local_tac_prior_visits} prior visit(s), where "
+            f"TAC/LAC {features.get('local_tac_prior_dominant_tac')} represented "
+            f"{local_tac_dominant_fraction} of coverage; candidate repeats in {local_tac_current_windows} window(s) "
+            f"({local_tac_current_fraction} of current comparable coverage)."
+        ),
+    )
+
+    mid = "per_cell_visit_change_v2"
+    visit_change_baseline_visits = int(features.get("visit_change_baseline_visits") or 0)
+    visit_change_recent_visits = int(features.get("visit_change_recent_visits") or 0)
+    visit_change_baseline_windows = int(features.get("visit_change_baseline_windows") or 0)
+    visit_change_recent_windows = int(features.get("visit_change_recent_windows") or 0)
+    n = clamp01(float(features.get("visit_change_effect") or 0.0))
+    triggered = bool(
+        bool(features.get("coarse_identity_primary"))
+        and visit_change_baseline_visits >= th(mid, "min_baseline_visits", VISIT_CHANGE_MIN_BASELINE_VISITS)
+        and visit_change_recent_visits >= th(mid, "min_recent_visits", VISIT_CHANGE_MIN_RECENT_VISITS)
+        and visit_change_baseline_windows >= th(mid, "min_phase_windows", VISIT_CHANGE_MIN_PHASE_WINDOWS)
+        and visit_change_recent_windows >= th(mid, "min_phase_windows", VISIT_CHANGE_MIN_PHASE_WINDOWS)
+        and n > 0
+    )
+    total_delta += add_method_result(
+        results,
+        m(mid),
+        context,
+        n,
+        triggered,
+        (
+            f"Cell ID state={features.get('visit_change_state')}; fixed {visit_change_baseline_visits}-visit baseline "
+            f"versus {visit_change_recent_visits} recent visit(s), peer-adjusted detection-rate shift="
+            f"{features.get('visit_change_residual_detection_shift')}, residual signal shift="
+            f"{features.get('visit_change_residual_signal_shift_db')} dB after "
+            f"{features.get('visit_change_signal_peer_count')} signal peer(s)."
+        ),
+    )
+
     mid = "rat_transition_surprise"
     n = norm_range(features.get("place_rat_surprise"), th(mid, "surprise_start", 0.9), th(mid, "surprise_full", 2.0))
     total_delta += add_method_result(results, m(mid), context, n, bool((features.get("count") or 0) >= th(mid, "min_count", 30) and n > 0), "Place-level RAT transitions are unusually surprising.")
@@ -2034,6 +3903,18 @@ def evaluate_methods(
         n,
         bool(checked and exists and n > 0),
         "An exact WiGLE record lowers suspicion more when its first appearance is older and its latest appearance is recent.",
+    )
+
+    mid = "dwell_stability"
+    dwell_windows = int(features.get("effective_observation_windows") or 0)
+    n = clamp01(float(features.get("dwell_normality_credit") or 0.0))
+    total_delta += add_method_result(
+        results,
+        m(mid),
+        context,
+        n,
+        bool(dwell_windows >= th(mid, "min_windows", 3) and n > 0),
+        f"Stable coarse Cell ID repeated across {dwell_windows} independent window(s) and {int(features.get('independent_visits') or 0)} visit(s); raw polling duplicates do not add credit.",
     )
 
     mid = "stability"
@@ -2073,6 +3954,10 @@ def evaluate_methods(
     if ignored:
         total_delta -= 4.0
 
+    # Recalculate from the effective family-capped method deltas. Manual ignore
+    # remains an explicit adjustment outside the evidence families.
+    total_delta = apply_evidence_family_caps(results) - (4.0 if ignored else 0.0)
+
     prior_logit = logit(prior)
     post = logistic(prior_logit + total_delta)
     running = prior_logit
@@ -2088,7 +3973,8 @@ def evaluate_methods(
         "prior_logit": prior_logit,
         "total_delta_logodds": total_delta,
         "posterior": post,
-        "explanation": "logit(posterior) = logit(prior) + sum(enabled method Δ log-odds). Negative evidence lowers the final probability.",
+        "family_caps": {f"{family}:{direction}": cap for (family, direction), cap in EVIDENCE_FAMILY_CAPS.items()},
+        "explanation": "logit(posterior) = logit(prior) + sum(family-capped enabled method Δ log-odds). Correlated reasons remain visible but cannot each contribute full independent weight. Negative evidence lowers the final probability.",
     }
     return results, bayes, rule_score, post
 
@@ -2592,15 +4478,17 @@ def ingest_files(
                         observation_rows += 1
                         tower_id = upsert_tower(con, key)
                         signal = observation_signal(obj, cell)
+                        signal_metric = observation_signal_metric(cell, signal)
+                        observation_source = str(cell.get("source") or "unknown")
                         obs_uid = stable_uid(content_hash, tower_identity_key(key), obs_count)
                         obs_count += 1
                         con.execute(
                             """
                             INSERT OR IGNORE INTO tower_observations
-                            (obs_uid,sample_uid,tower_id,coarse_identity_key,ts,lat,lon,place_id,signal,raw_cell_json,bad_gps)
-                            VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                            (obs_uid,sample_uid,tower_id,coarse_identity_key,ts,lat,lon,place_id,signal,signal_metric,observation_source,raw_cell_json,bad_gps)
+                            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
                             """,
-                            (obs_uid, sample_uid, tower_id, base_identity_key(BaseKey(key.operator, key.rat, key.tac_lac, key.cell_id)), ts, lat, lon, place_id, signal, json_dumps(cell), bad_gps),
+                            (obs_uid, sample_uid, tower_id, base_identity_key(BaseKey(key.operator, key.rat, key.tac_lac, key.cell_id)), ts, lat, lon, place_id, signal, signal_metric, observation_source, json_dumps(cell), bad_gps),
                         )
                     imported_rows += 1
                     now_mono = time.monotonic()
@@ -2963,6 +4851,7 @@ def recompute(
             con.commit()
         settings = get_method_settings(con)
         app_config = get_app_config(con)
+        dwell_context = rebuild_dwell_context(con)
         tower_rows = {int(r["id"]): r for r in con.execute("SELECT * FROM towers").fetchall()}
         aggs: Dict[int, TowerAgg] = {}
         base_aggs: Dict[str, BaseAgg] = {}
@@ -3325,6 +5214,8 @@ def recompute(
             tower_row = tower_rows.get(tid)
             known = bool(tower_row["known"]) if tower_row else False
             ignored = bool(tower_row["ignored"]) if tower_row else False
+            coarse_identity = str(tower_row["coarse_identity_key"] or "") if tower_row else ""
+            attach_dwell_features(agg.features, coarse_identity=coarse_identity, tower_id=tid, context=dwell_context)
             apply_wigle_features(agg.features, get_wigle_enrichment(con, tid))
             methods, bayes, rule_score, post = evaluate_methods(agg.features, settings, mostly_lte=mostly_lte, known=known, ignored=ignored)
             con.execute(
@@ -3397,19 +5288,93 @@ def _compute_churn_baselines_from_features(con: sqlite3.Connection) -> Dict[str,
     }
 
 
+def refresh_dwell_dependent_scores(
+    con: sqlite3.Connection,
+    *,
+    dwell_context: Dict[str, Dict[str, Any]],
+    settings: Dict[str, Dict[str, Any]],
+    mostly_lte: bool,
+    computed_at: Optional[str] = None,
+) -> int:
+    """Refresh shared dwell fields and scores without recomputing geo features.
+
+    A local opportunity window can affect several Cell IDs at the same venue.
+    Therefore a one-tower feature recompute may rebuild the shared dwell model,
+    but it must then re-evaluate every existing feature row that consumes that
+    model. This inexpensive pass prevents a mixture of old and new baselines.
+    """
+
+    now = computed_at or utc_now()
+    rows = con.execute(
+        """
+        SELECT
+          f.tower_id, f.features_json,
+          t.operator, t.rat, t.tac_lac, t.cell_id,
+          t.coarse_identity_key, t.known, t.ignored
+        FROM tower_features f
+        JOIN towers t ON t.id=f.tower_id
+        """
+    ).fetchall()
+    updates: List[Tuple[Any, ...]] = []
+    for row in rows:
+        features = json_loads(row["features_json"], {}) or {}
+        features.setdefault("rat", row["rat"])
+        features.setdefault("tac_lac", row["tac_lac"])
+        coarse_identity = str(row["coarse_identity_key"] or base_identity_key(BaseKey(
+            row["operator"] or "",
+            row["rat"] or "",
+            row["tac_lac"],
+            row["cell_id"],
+        )))
+        attach_dwell_features(
+            features,
+            coarse_identity=coarse_identity,
+            tower_id=int(row["tower_id"]),
+            context=dwell_context,
+        )
+        methods, bayes, rule_score, post = evaluate_methods(
+            features,
+            settings,
+            mostly_lte=bool(mostly_lte),
+            known=bool(row["known"]),
+            ignored=bool(row["ignored"]),
+        )
+        updates.append((
+            now,
+            float(rule_score),
+            float(post),
+            json_dumps(features),
+            json_dumps(methods),
+            json_dumps(bayes),
+            int(row["tower_id"]),
+        ))
+    con.executemany(
+        """
+        UPDATE tower_features
+        SET computed_at=?, rule_score=?, bayes_post_p=?,
+            features_json=?, methods_json=?, bayes_json=?
+        WHERE tower_id=?
+        """,
+        updates,
+    )
+    return len(updates)
+
+
 def recompute_one_tower(db_path: str, tower_id: int, *, sample_size: int = 2500) -> Dict[str, Any]:
     """
     Fast-ish recompute for a single tower.
 
     Uses cached global stats from the last full recompute for z-score baselines.
     Recomputes this tower's own features from its (non-ignored, non-bad-gps) observations,
-    and updates just its row in tower_features.
+    and updates its full feature row. Because dwell opportunities are shared,
+    it then performs a lightweight score-only refresh of all feature rows.
     """
     init_db(db_path)
     rng = random.Random(1)
     with connect_db(db_path) as con:
         settings = get_method_settings(con)
         app_config = get_app_config(con)
+        dwell_context = rebuild_dwell_context(con)
         tower_row = con.execute("SELECT * FROM towers WHERE id=?", (int(tower_id),)).fetchone()
         if not tower_row:
             raise ValueError("tower not found")
@@ -3439,7 +5404,40 @@ def recompute_one_tower(db_path: str, tower_id: int, *, sample_size: int = 2500)
             (int(tower_id),),
         ).fetchall()
         if not rows:
-            # Still create an empty-ish features row so the UI doesn't break.
+            # Retain cellular/time review for bad-GPS-only or unlocated rows,
+            # while keeping all geographic evidence empty.
+            obs_summary = con.execute(
+                """
+                SELECT MIN(ts) AS first_ts, MAX(ts) AS last_ts,
+                       SUM(CASE WHEN bad_gps THEN 1 ELSE 0 END) AS bad_count
+                FROM tower_observations
+                WHERE tower_id=? AND COALESCE(ignored,0)=0
+                """,
+                (int(tower_id),),
+            ).fetchone()
+            first_ts = float(obs_summary["first_ts"]) if isinstance(obs_summary["first_ts"], (int, float)) else 0.0
+            last_ts = float(obs_summary["last_ts"]) if isinstance(obs_summary["last_ts"], (int, float)) else first_ts
+            empty_agg = TowerAgg(key=key, first_seen_ts=first_ts, last_seen_ts=last_ts)
+            empty_agg.bad_gps_skipped = int(obs_summary["bad_count"] or 0)
+            empty_agg.center_lat, empty_agg.center_lon, empty_agg.center_meta = None, None, {"n": 0, "n_used": 0}
+            features, _ = compute_features(empty_agg, global_stats)
+            features["rat"] = key.rat
+            features["tac_lac"] = key.tac_lac
+            features["bad_gps_skipped"] = empty_agg.bad_gps_skipped
+            attach_dwell_features(
+                features,
+                coarse_identity=str(tower_row["coarse_identity_key"] or ""),
+                tower_id=int(tower_id),
+                context=dwell_context,
+            )
+            apply_wigle_features(features, get_wigle_enrichment(con, tower_id))
+            methods, bayes, rule_score, post = evaluate_methods(
+                features,
+                settings,
+                mostly_lte=bool(global_stats.get("mostly_lte")),
+                known=bool(tower_row["known"]),
+                ignored=bool(tower_row["ignored"]),
+            )
             now = utc_now()
             con.execute(
                 """
@@ -3459,10 +5457,23 @@ def recompute_one_tower(db_path: str, tower_id: int, *, sample_size: int = 2500)
                   methods_json=excluded.methods_json,
                   bayes_json=excluded.bayes_json
                 """,
-                (int(tower_id), now, 0, None, None, None, None, 0.0, 0.0, json_dumps({}), json_dumps([]), json_dumps({})),
+                (
+                    int(tower_id), now, 0, None, None,
+                    first_ts if first_ts else None,
+                    last_ts if last_ts else None,
+                    rule_score, post,
+                    json_dumps(features), json_dumps(methods), json_dumps(bayes),
+                ),
+            )
+            rescored = refresh_dwell_dependent_scores(
+                con,
+                dwell_context=dwell_context,
+                settings=settings,
+                mostly_lte=bool(global_stats.get("mostly_lte")),
+                computed_at=now,
             )
             con.commit()
-            return {"updated_towers": 1, "computed_at": now}
+            return {"updated_towers": 1, "rescored_towers": rescored, "computed_at": now}
 
         agg = TowerAgg(key=key, first_seen_ts=float(rows[0]["ts"]), last_seen_ts=float(rows[-1]["ts"]))
 
@@ -3775,6 +5786,12 @@ def recompute_one_tower(db_path: str, tower_id: int, *, sample_size: int = 2500)
         mostly_lte = bool(global_stats.get("mostly_lte"))
         known = bool(tower_row["known"])
         ignored = bool(tower_row["ignored"])
+        attach_dwell_features(
+            agg.features,
+            coarse_identity=str(tower_row["coarse_identity_key"] or ""),
+            tower_id=int(tower_id),
+            context=dwell_context,
+        )
         apply_wigle_features(agg.features, get_wigle_enrichment(con, tower_id))
         methods, bayes, rule_score2, post = evaluate_methods(agg.features, settings, mostly_lte=mostly_lte, known=known, ignored=ignored)
 
@@ -3812,8 +5829,15 @@ def recompute_one_tower(db_path: str, tower_id: int, *, sample_size: int = 2500)
                 json_dumps(bayes),
             ),
         )
+        rescored = refresh_dwell_dependent_scores(
+            con,
+            dwell_context=dwell_context,
+            settings=settings,
+            mostly_lte=mostly_lte,
+            computed_at=now,
+        )
         con.commit()
-        return {"updated_towers": 1, "computed_at": now}
+        return {"updated_towers": 1, "rescored_towers": rescored, "computed_at": now}
 
 
 def db_stats(db_path: str) -> Dict[str, Any]:
@@ -3946,6 +5970,18 @@ def export_markdown(con: sqlite3.Connection, tower_id: int) -> str:
     if not row:
         raise KeyError("tower not found")
     payload = tower_payload(row, enrich_methods=True)
+    shadow_methods = [
+        method for method in payload.get("methods", [])
+        if not method.get("enabled") and method.get("would_trigger")
+    ]
+    v2_shadow_ids = {
+        "transient_activation_v2",
+        "visit_aware_disappearance_v2",
+        "local_tac_novelty_v2",
+        "per_cell_visit_change_v2",
+    }
+    v2_shadow_methods = [method for method in shadow_methods if method.get("id") in v2_shadow_ids]
+    legacy_shadow_methods = [method for method in shadow_methods if method.get("id") not in v2_shadow_ids]
     pts = con.execute(
         "SELECT COUNT(*) c, SUM(stationary) stat, SUM(bad_gps) bad, MIN(ts) first_ts, MAX(ts) last_ts FROM tower_observations WHERE tower_id=?",
         (tower_id,),
@@ -3985,15 +6021,34 @@ def export_markdown(con: sqlite3.Connection, tower_id: int) -> str:
         f"- Weird-GPS fallback centroid (unreliable): `{payload['weird_center_lat']}, {payload['weird_center_lon']}`",
         "- Location warning: Weird-GPS coordinates are retained only for coarse visual review. They are not a base-station estimate and are excluded from geographic scoring.",
         "",
+        "## Local visit baseline (dwell model v2)",
+        f"- Local Cell-ID state: `{payload['features'].get('local_novelty_state', 'no_stationary_context')}`",
+        f"- Primary coarse Cell-ID representative: `{payload['features'].get('coarse_identity_primary')}`",
+        f"- Independent 10-minute presence windows: `{payload['features'].get('effective_observation_windows', 0)}`",
+        f"- Comparable eligible windows: `{payload['features'].get('eligible_observation_windows', 0)}`",
+        f"- Independent visits: `{payload['features'].get('independent_visits', 0)}`",
+        f"- Detection rate across eligible windows: `{payload['features'].get('dwell_detection_rate')}`",
+        f"- Bounded normality credit: `{payload['features'].get('dwell_normality_credit', 0)}`",
+        f"- Completed prior visits/windows for novelty: `{payload['features'].get('local_novelty_prior_visits', 0)}` / `{payload['features'].get('local_novelty_prior_windows', 0)}`",
+        f"- Repeated current windows: `{payload['features'].get('local_novelty_current_windows', 0)}`",
+        f"- Effective local-novelty effect: `{payload['features'].get('local_novelty_effect', 0)}`",
+        f"- V2 replacement shadow hits (zero live score): `{', '.join(str(method.get('id')) for method in v2_shadow_methods) or 'none'}`",
+        f"- Legacy disabled diagnostic hits (zero live score): `{', '.join(str(method.get('id')) for method in legacy_shadow_methods) or 'none'}`",
+        "- Interpretation: the first visit builds the local baseline. A Cell ID is locally new only after it was absent during enough windows in a completed prior visit and then repeats in a later visit. Raw scan frequency does not increase this evidence.",
+        "",
         "## Evidence terms",
     ]
     for method in payload["methods"]:
         lines += [
             f"### {method['label']} (`{method['id']}`)",
-            f"- Enabled / triggered: `{method.get('enabled')}` / `{method.get('triggered')}`",
+            f"- Enabled / live triggered / shadow would-trigger: `{method.get('enabled')}` / `{method.get('triggered')}` / `{method.get('would_trigger')}`",
             f"- Direction: `{method.get('direction')}`",
+            f"- Evidence family: `{method.get('family')}`",
+            f"- Raw / family-capped Δ log-odds: `{method.get('raw_delta_logodds', method.get('delta_logodds'))}` / `{method.get('delta_logodds')}`",
+            f"- Family scale: `{method.get('family_scale', 1.0)}`",
             f"- Δ log-odds: `{method.get('delta_logodds')}`",
-            f"- Normalized evidence: `{method.get('norm01')}`",
+            f"- Live / shadow Δ log-odds: `{method.get('delta_logodds')}` / `{method.get('shadow_delta_logodds')}`",
+            f"- Live / shadow normalized evidence: `{method.get('norm01')}` / `{method.get('shadow_norm01')}`",
             f"- Equation: `{method.get('equation')}`",
             f"- Equation note: {method.get('equation_note') or '—'}",
             f"- Applies when: {method.get('trigger_summary') or '—'}",
@@ -4109,10 +6164,17 @@ def export_docx(con: sqlite3.Connection, tower_id: int) -> bytes:
 
     score = float(payload.get("bayes_post_p") or 0.0)
     features = payload.get("features") or {}
-    methods = sorted(payload.get("methods") or [], key=lambda x: abs(float(x.get("delta_logodds") or 0)), reverse=True)
-    triggered = [m for m in methods if m.get("triggered")]
-    if not triggered:
-        triggered = methods[:8]
+    methods = sorted(
+        payload.get("methods") or [],
+        key=lambda x: max(
+            abs(float(x.get("delta_logodds") or 0)),
+            abs(float(x.get("shadow_delta_logodds") or 0)),
+        ),
+        reverse=True,
+    )
+    notable_methods = [m for m in methods if m.get("triggered") or m.get("would_trigger")]
+    if not notable_methods:
+        notable_methods = methods[:8]
 
     children: List[str] = []
     children.append(_w_para(_w_run("Tower Intelligence Report", bold=True, color="FFFFFF", size=42), align="center", before=180, after=40, shading="0F172A"))
@@ -4180,6 +6242,49 @@ def export_docx(con: sqlite3.Connection, tower_id: int) -> bytes:
         [4200, 5160],
     ))
 
+    children.append(_w_heading("Local Visit Baseline (Dwell Model v2)", 1))
+    novelty_state = features.get("local_novelty_state") or "no_stationary_context"
+    if features.get("local_novelty_triggered"):
+        children.append(_w_para(
+            _w_run("LOCALLY NEW CELL ID: ", bold=True, color="B91C1C", size=22),
+            _w_run(
+                "This coarse Cell ID was absent in sufficiently covered completed prior visits and repeated in a later visit.",
+                color="7F1D1D",
+                size=20,
+            ),
+            before=40,
+            after=100,
+            shading="FEE2E2",
+            border_color="DC2626",
+        ))
+    children.append(_w_table(
+        [
+            ["Metric", "Value", "Meaning"],
+            ["Local Cell-ID state", novelty_state, VARIABLE_GLOSSARY["local_novelty_state"]],
+            ["Primary coarse representative", features.get("coarse_identity_primary"), "PCI/EARFCN variants share one coarse Cell-ID result; only its primary row can affect ranking."],
+            ["Independent presence windows", features.get("effective_observation_windows") or 0, VARIABLE_GLOSSARY["effective_observation_windows"]],
+            ["Comparable eligible windows", features.get("eligible_observation_windows") or 0, VARIABLE_GLOSSARY["eligible_observation_windows"]],
+            ["Independent visits", features.get("independent_visits") or 0, VARIABLE_GLOSSARY["independent_visits"]],
+            ["Detection rate", _fmt_num(features.get("dwell_detection_rate"), 4), VARIABLE_GLOSSARY["dwell_detection_rate"]],
+            ["Bounded normality credit", _fmt_num(features.get("dwell_normality_credit"), 4), VARIABLE_GLOSSARY["dwell_normality_credit"]],
+            ["Completed prior visits / windows", f"{features.get('local_novelty_prior_visits') or 0} / {features.get('local_novelty_prior_windows') or 0}", "Comparable evidence gathered before this Cell ID first appeared locally."],
+            ["Repeated current windows", features.get("local_novelty_current_windows") or 0, "Independent windows containing the Cell ID when it first appeared after the baseline."],
+            ["Local-novelty effect", _fmt_num(features.get("local_novelty_effect"), 4), "Saturating positive effect; zero on a first visit or for unconfirmed sightings."],
+        ],
+        [3000, 1700, 4660],
+    ))
+    children.append(_w_para(
+        _w_run(
+            "The first visit builds the local baseline. Ten-minute windows and completed visits replace raw scan counts, so polling frequency and a long continuous stay do not manufacture novelty.",
+            color="475569",
+            size=20,
+        ),
+        before=40,
+        after=80,
+        shading="F8FAFC",
+        border_color="64748B",
+    ))
+
     children.append(_w_heading("Bayesian Score Explanation", 1))
     bayes = payload.get("bayes") or {}
     children.append(_w_para(_w_run(bayes.get("explanation") or "logit(posterior) = logit(prior) + Σ method Δ log-odds", color="334155", size=22), before=40, after=80, shading="F8FAFC", border_color="2563EB"))
@@ -4194,28 +6299,40 @@ def export_docx(con: sqlite3.Connection, tower_id: int) -> bytes:
     ))
 
     children.append(_w_heading("Evidence Terms", 1))
-    evidence_rows = [["Method", "Dir", "Triggered", "Δ log-odds", "norm01", "Explanation"]]
+    evidence_rows = [["Method", "Dir", "Live / shadow", "Family", "Raw / effective / shadow Δ", "Live / shadow norm", "Explanation"]]
     fills = ["E0F2FE"]
     for m in methods:
         direction = "Raises" if m.get("direction") == "up" else "Lowers"
         evidence_rows.append([
             m.get("label"),
             direction,
-            str(bool(m.get("triggered"))),
-            _fmt_num(m.get("delta_logodds"), 3),
-            _fmt_num(m.get("norm01"), 3),
+            f"{bool(m.get('triggered'))} / {bool(m.get('would_trigger'))}",
+            m.get("family") or "",
+            f"{_fmt_num(m.get('raw_delta_logodds', m.get('delta_logodds')), 3)} / {_fmt_num(m.get('delta_logodds'), 3)} / {_fmt_num(m.get('shadow_delta_logodds'), 3)}",
+            f"{_fmt_num(m.get('norm01'), 3)} / {_fmt_num(m.get('shadow_norm01'), 3)}",
             m.get("why") or m.get("help"),
         ])
-        fills.append("FEE2E2" if m.get("direction") == "up" and m.get("triggered") else "DCFCE7" if m.get("direction") == "down" and m.get("triggered") else "F8FAFC")
-    children.append(_w_table(evidence_rows, [2200, 900, 1000, 1100, 900, 3260], fills=fills))
+        fills.append(
+            "F3E8FF" if not m.get("enabled") and m.get("would_trigger")
+            else "FEE2E2" if m.get("direction") == "up" and m.get("triggered")
+            else "DCFCE7" if m.get("direction") == "down" and m.get("triggered")
+            else "F8FAFC"
+        )
+    children.append(_w_table(evidence_rows, [1750, 650, 850, 950, 1400, 750, 3010], fills=fills))
 
     children.append(_w_heading("Method Details", 1))
-    for m in triggered[:12]:
-        color = "DC2626" if m.get("direction") == "up" else "16A34A"
-        shade = "FEF2F2" if m.get("direction") == "up" else "F0FDF4"
+    for m in notable_methods[:12]:
+        shadow_hit = bool(not m.get("enabled") and m.get("would_trigger"))
+        color = "7C3AED" if shadow_hit else "DC2626" if m.get("direction") == "up" else "16A34A"
+        shade = "F3E8FF" if shadow_hit else "FEF2F2" if m.get("direction") == "up" else "F0FDF4"
         children.append(_w_para(
             _w_run(m.get("label"), bold=True, color=color, size=26),
-            _w_run(f"  Δ={_fmt_num(m.get('delta_logodds'), 3)}", bold=True, color="111827", size=22),
+            _w_run(
+                f"  live Δ={_fmt_num(m.get('delta_logodds'), 3)} / shadow Δ={_fmt_num(m.get('shadow_delta_logodds'), 3)}",
+                bold=True,
+                color="111827",
+                size=22,
+            ),
             before=180,
             after=60,
             shading=shade,
@@ -4234,6 +6351,35 @@ def export_docx(con: sqlite3.Connection, tower_id: int) -> bytes:
 
     children.append(_w_heading("Important Feature Values", 1))
     keys = [
+        "dwell_model_version",
+        "local_novelty_state",
+        "local_novelty_prior_visits",
+        "local_novelty_prior_windows",
+        "local_novelty_current_windows",
+        "local_novelty_effect",
+        "local_novelty_triggered",
+        "transient_activation_state",
+        "transient_activation_source",
+        "transient_activation_effect",
+        "transient_activation_triggered",
+        "disappearance_state",
+        "disappearance_source",
+        "disappearance_effect",
+        "disappearance_triggered",
+        "local_tac_state",
+        "local_tac_source",
+        "local_tac_effect",
+        "local_tac_triggered",
+        "visit_change_state",
+        "visit_change_source",
+        "visit_change_effect",
+        "visit_change_triggered",
+        "coarse_identity_primary",
+        "effective_observation_windows",
+        "eligible_observation_windows",
+        "independent_visits",
+        "dwell_detection_rate",
+        "dwell_normality_credit",
         "count",
         "days_seen",
         "stationary_count",
@@ -4276,6 +6422,8 @@ def export_docx(con: sqlite3.Connection, tower_id: int) -> bytes:
     for line in [
         "This report ranks anomalies for manual review; it does not identify an operator or prove IMSI-catcher activity.",
         "Bad GPS points are stored and visible in the dashboard, but excluded from derived anomaly calculations by default.",
+        "Local novelty requires a reliable stationary location, a completed prior visit, enough comparable windows, and repetition in a later visit; a first visit only builds the baseline.",
+        "Correlated methods remain visible as diagnostics, but evidence-family caps limit their combined effect on ranking.",
         "Threshold changes affect only derived evidence and scores, never raw observations.",
     ]:
         children.append(_w_para(_w_run(line, color="475569", size=20), before=20, after=40))
@@ -4425,6 +6573,50 @@ function locationQualityHtml(t){
   if(quality==='valid_gps') return `<span class="status-tag imported" title="${Number(t.valid_gps_count||0)} accepted; ${Number(t.weird_gps_count||0)} weird GPS excluded">valid GPS</span>`;
   if(quality==='weird_gps') return `<span class="status-tag error" title="Unreliable fallback from ${Number(t.weird_gps_count||0)} rejected GPS observation(s); excluded from geo scoring">⚠ weird GPS</span>`;
   return `<span class="status-tag skipped" title="No coordinates available">unlocated</span>`;
+}
+function towerLocationHtml(t){
+  const isWeird=t&&t.center_lat==null&&t.center_lon==null&&t.weird_center_lat!=null&&t.weird_center_lon!=null;
+  const lat=isWeird?t.weird_center_lat:t&&t.center_lat;
+  const lon=isWeird?t.weird_center_lon:t&&t.center_lon;
+  const coords=(lat!=null&&lon!=null)
+    ? `<br><code title="${isWeird?'Unreliable rejected-GPS centroid':'Valid-GPS robust center'}">${Number(lat).toFixed(5)}, ${Number(lon).toFixed(5)}</code>`
+    : '';
+  return `${locationQualityHtml(t)}${coords}`;
+}
+function seenDateHtml(ts){
+  if(ts===null||ts===undefined||!Number.isFinite(Number(ts))) return '—';
+  const iso=new Date(Number(ts)*1000).toISOString();
+  return `<span title="${iso.replace('T',' ').replace('.000Z',' UTC')}">${iso.slice(0,10)}</span>`;
+}
+function dwellEvidenceHtml(t){
+  const f=(t&&t.features)||{}, state=String(f.local_novelty_state||'no_stationary_context');
+  const badges=[];
+  if(f.local_novelty_triggered) badges.push(`<span class="status-tag error" title="Absent during ${Number(f.local_novelty_prior_windows||0)} prior independent windows; repeated in ${Number(f.local_novelty_current_windows||0)} current windows">NEW HERE</span>`);
+  else if(state==='new_single_sighting') badges.push(`<span class="status-tag skipped" title="Locally new candidate seen in only one independent window">new, unconfirmed</span>`);
+  else if(state==='baseline_building') badges.push(`<span class="status-tag skipped" title="First comparable visit: this Cell ID is building the local baseline">first-visit baseline</span>`);
+  else if(state==='incomplete_cell_identity') badges.push(`<span class="status-tag skipped">incomplete ID</span>`);
+  else if(Number(f.dwell_normality_credit||0)>0.35) badges.push(`<span class="status-tag imported" title="Bounded stability credit ${Number(f.dwell_normality_credit||0).toFixed(3)} from ${Number(f.effective_observation_windows||0)} independent windows">stable dwell</span>`);
+  else badges.push(`<span class="status-tag skipped" title="${esc(state)}">${esc(state.replaceAll('_',' '))}</span>`);
+  const shadow=v2ShadowEvidence(f);
+  if(shadow.length) badges.push(`<span class="tag-badge" style="border-color:#7c3aed;color:#6d28d9" title="Experimental v2 shadow evidence: ${esc(shadow.join(', '))}. It is visible for review but contributes zero live score.">v2 SHADOW ${shadow.length}</span>`);
+  return `<div class="pillbar">${badges.join('')}</div>`;
+}
+function v2ShadowEvidence(f){
+  const evidence=[];
+  if(f&&f.transient_activation_triggered)evidence.push('transient activation');
+  if(f&&f.disappearance_triggered)evidence.push('visit-aware disappearance');
+  if(f&&f.local_tac_triggered)evidence.push('new local TAC/LAC');
+  if(f&&f.visit_change_triggered)evidence.push('peer-corrected visit change');
+  return evidence;
+}
+function dwellTooltipHtml(t){
+  const f=(t&&t.features)||{};
+  let text=f.local_novelty_triggered
+    ? `<br><b>⚠ LOCALLY NEW CELL ID</b><br>Absent in ${Number(f.local_novelty_prior_windows||0)} prior window(s) across ${Number(f.local_novelty_prior_visits||0)} completed visit(s); now repeated in ${Number(f.local_novelty_current_windows||0)} window(s).`
+    : `<br>Local state: ${esc(f.local_novelty_state||'no stationary context')}<br>Independent windows ${Number(f.effective_observation_windows||0)} · stability ${Number(f.dwell_normality_credit||0).toFixed(3)}`;
+  const shadow=v2ShadowEvidence(f);
+  if(shadow.length) text+=`<br><b style="color:#6d28d9">V2 SHADOW: ${esc(shadow.join(', '))}</b><br>Diagnostic only; live score contribution is zero.`;
+  return text;
 }
 function pointTooltipHtml(point, mode){
   const canToggle = Boolean(point && point.obs_uid);
@@ -4683,10 +6875,11 @@ function updateAreaLegend(groups){
     if(b[0]===null) return -1;
     return String(a[0]).localeCompare(String(b[0]),undefined,{numeric:true});
   });
-  el.innerHTML=entries.length?entries.map(([key,count])=>{
+  const colors=entries.length?entries.map(([key,count])=>{
     const label=key===null?'Unknown':key;
     return `<div class="area-legend-row"><span class="area-legend-swatch" style="background:${tacLacColor(key)}"></span><span>${esc(label)}</span><span class="area-legend-count">${count}</span></div>`;
   }).join(''):'<span class="small">No towers shown</span>';
+  el.innerHTML=colors+`<div style="border-top:1px solid #e2e8f0;margin:6px 0 4px"></div><div class="area-legend-row"><span class="area-legend-swatch" style="background:transparent;border:3px dashed #dc2626"></span><span>Locally new</span></div><div class="area-legend-row"><span class="area-legend-swatch" style="background:transparent;border:3px dotted #7c3aed"></span><span>v2 shadow</span></div>`;
 }
 function minScore(){return Math.max(0,Math.min(1,(Number(document.getElementById('scoreMin').value)||0)/100))}
 function syncScoreFilter(source){
@@ -4731,7 +6924,7 @@ function renderMapTowers(fit){
   towerLayer.clearLayers(); weirdTowerLayer.clearLayers(); estimateLayer.clearLayers();
   const threshold=minScore();
   let bounds=[]; let weirdBounds=[]; let shown=0; let exactShown=0; let weirdShown=0; let unlocated=0;
-  let counts={normal:0,anom:0,known:0,ignored:0}; let areaGroups=new Map();
+  let counts={normal:0,anom:0,known:0,ignored:0}; let shadowShown=0; let areaGroups=new Map();
   for(const t of allTowers){
     const cat=towerCategory(t); counts[cat]++;
     if(!categoryVisible(cat)) continue;
@@ -4747,10 +6940,14 @@ function renderMapTowers(fit){
     const markerRadius=7+Math.min(12,obsCount**0.35);
     if(hasExact){
       exactShown++;
+      const shadow=v2ShadowEvidence(t.features||{});
+      if(shadow.length)shadowShown++;
       const spread=(t.features&&typeof t.features.gps_spread_m==='number')?t.features.gps_spread_m:null;
       if(spread!==null){const radius=Math.max(5,Math.min(500,spread)); L.circle([t.center_lat,t.center_lon],{radius,color:'#94a3b8',weight:1,fillColor:'#94a3b8',fillOpacity:0.06,interactive:false,bubblingMouseEvents:false}).addTo(estimateLayer);}
+      if(t.features&&t.features.local_novelty_triggered)L.circleMarker([t.center_lat,t.center_lon],{radius:markerRadius+5,color:'#dc2626',fillOpacity:0,weight:3,dashArray:'3 3',interactive:false,bubblingMouseEvents:false}).addTo(towerLayer);
+      if(shadow.length)L.circleMarker([t.center_lat,t.center_lon],{radius:markerRadius+(t.features&&t.features.local_novelty_triggered?10:5),color:'#7c3aed',fillOpacity:0,weight:3,dashArray:'1 5',interactive:false,bubblingMouseEvents:false}).addTo(towerLayer);
       const m=L.circleMarker([t.center_lat,t.center_lon],{radius:markerRadius,color,fillColor:color,fillOpacity:.82,weight:2,interactive:true}).addTo(towerLayer);
-      m.bindTooltip(`${esc(t.label)}<br><b>VALID GPS CENTER</b><br>TAC/LAC ${esc(areaKey===null?'unknown':areaKey)}<br>Bayes ${pct(t.bayes_post_p)} / observations ${obsCount}${Number(t.weird_gps_count||0)>0?`<br>Excluded weird GPS ${t.weird_gps_count}`:''}${spread!==null?`<br>GPS spread ${Math.round(spread)} m`:''}`);
+      m.bindTooltip(`${esc(t.label)}<br><b>VALID GPS CENTER</b><br>TAC/LAC ${esc(areaKey===null?'unknown':areaKey)}<br>Bayes ${pct(t.bayes_post_p)} / observations ${obsCount}${dwellTooltipHtml(t)}${Number(t.weird_gps_count||0)>0?`<br>Excluded weird GPS ${t.weird_gps_count}`:''}${spread!==null?`<br>GPS spread ${Math.round(spread)} m`:''}`);
       m.on('click',()=>openTower(t.id)); bounds.push([t.center_lat,t.center_lon]);
     }else{
       weirdShown++;
@@ -4762,7 +6959,7 @@ function renderMapTowers(fit){
   updateAreaLegend(areaGroups);
   const from=document.getElementById('lastSeenFrom').value, to=document.getElementById('lastSeenTo').value;
   const dateStatus=(from||to)?` · last seen ${from||'any date'} to ${to||'any date'} UTC`:'';
-  document.getElementById('mapStatus').textContent=`${shown}/${allTowers.length} mapped · valid GPS ${exactShown} · weird GPS ${weirdShown} · unlocated ${unlocated} · normal ${counts.normal} · anomalous ${counts.anom} · known ${counts.known} · ignored ${counts.ignored} · min Bayes ${pct(threshold)}${dateStatus}`;
+  document.getElementById('mapStatus').textContent=`${shown}/${allTowers.length} mapped · valid GPS ${exactShown} · weird GPS ${weirdShown} · unlocated ${unlocated} · v2 shadow ${shadowShown} · normal ${counts.normal} · anomalous ${counts.anom} · known ${counts.known} · ignored ${counts.ignored} · min Bayes ${pct(threshold)}${dateStatus}`;
   const fitBounds=bounds.length?bounds:weirdBounds;
   if(fit&&fitBounds.length) map.fitBounds(fitBounds,{padding:[30,30],maxZoom:17});
 }
@@ -4774,7 +6971,7 @@ function renderMapTowers(fit){
       const lat=t.center_lat??t.weird_center_lat, lon=t.center_lon??t.weird_center_lon;
       if(opts.recenter && lat!=null&&lon!=null) map.setView([lat,lon], Math.max(map.getZoom(),t.location_quality==='weird_gps'?15:17));
     }
-	function pickFeatures(f){const keys=['count','days_seen','stationary_count','gps_spread_m','clusters','cluster_top2_sep_m','stationary_clusters','stationary_cluster_top2_sep_m','signal_dist_model','stationary_signal_mad','stationary_signal_mad_z','stationary_jump_rate_8db','stationary_jump_rate_z','stationary_param_obs','stationary_pci_change_rate_z','stationary_earfcn_change_rate_z','local_stationary_window_min','local_stationary_window_frac','change_places_frac_stationary','place_rat_surprise','new_place_id','new_place_count','new_place_first_seen_local','new_place_prior_range','new_place_prior_count','new_place_prior_days','new_place_prior_stationary_count','new_place_prior_stationary_days','new_area_code_prior_same_rat_count','new_area_code_prior_same_rat_days','new_area_code_prior_same_code_count','new_area_code_prior_distinct_codes','new_area_code_prior_dominant_code','new_area_code_prior_dominant_frac','new_area_code_prior_range','new_place_post_count','new_place_post_days','new_place_post_stationary_count','new_place_post_stationary_days','stability_bonus','bad_gps_skipped','altitude_samples','altitude_rel_median_m','altitude_rel_p90_m','high_altitude_obs_frac','geo_altitude_confidence','stationary_altitude_samples','stationary_altitude_rel_median_m','stationary_altitude_rel_p90_m','stationary_high_altitude_obs_frac','stationary_geo_altitude_confidence']; let o={}; keys.forEach(k=>{if(f&&f[k]!==undefined)o[k]=f[k]}); return o}
+	function pickFeatures(f){const keys=['dwell_model_version','local_novelty_state','local_novelty_prior_visits','local_novelty_prior_windows','local_novelty_current_windows','local_novelty_effect','local_novelty_triggered','transient_activation_state','transient_activation_source','transient_activation_prior_visits','transient_activation_pre_windows','transient_activation_present_windows','transient_activation_burst_span_windows','transient_activation_burst_rate','transient_activation_post_visits','transient_activation_post_windows','transient_activation_post_hit_windows','transient_activation_rate_drop','transient_activation_effect','transient_activation_triggered','disappearance_state','disappearance_source','disappearance_baseline_visits','disappearance_baseline_windows','disappearance_baseline_hit_windows','disappearance_baseline_rate_low','disappearance_later_visits','disappearance_later_windows','disappearance_predictive_zero_p','disappearance_effect','disappearance_triggered','local_tac_state','local_tac_source','local_tac_value','local_tac_prior_visits','local_tac_prior_windows','local_tac_prior_dominant_tac','local_tac_prior_dominant_fraction','local_tac_current_windows','local_tac_current_opportunity_windows','local_tac_current_fraction','local_tac_current_cells','local_tac_is_primary_identity','local_tac_effect','local_tac_triggered','visit_change_state','visit_change_source','visit_change_baseline_visits','visit_change_recent_visits','visit_change_baseline_windows','visit_change_recent_windows','visit_change_detection_shift','visit_change_common_detection_shift','visit_change_residual_detection_shift','visit_change_signal_metric','visit_change_signal_earfcn','visit_change_signal_shift_db','visit_change_common_mode_shift_db','visit_change_residual_signal_shift_db','visit_change_signal_peer_count','visit_change_signal_robust_z','visit_change_effect','visit_change_triggered','coarse_identity_primary','effective_observation_windows','eligible_observation_windows','independent_visits','dwell_detection_rate','dwell_normality_credit','count','days_seen','stationary_count','gps_spread_m','clusters','cluster_top2_sep_m','stationary_clusters','stationary_cluster_top2_sep_m','signal_dist_model','stationary_signal_mad','stationary_signal_mad_z','stationary_jump_rate_8db','stationary_jump_rate_z','stationary_param_obs','stationary_pci_change_rate_z','stationary_earfcn_change_rate_z','local_stationary_window_min','local_stationary_window_frac','change_places_frac_stationary','place_rat_surprise','new_place_id','new_place_count','new_place_first_seen_local','new_place_prior_range','new_place_prior_count','new_place_prior_days','new_place_prior_stationary_count','new_place_prior_stationary_days','new_area_code_prior_same_rat_count','new_area_code_prior_same_rat_days','new_area_code_prior_same_code_count','new_area_code_prior_distinct_codes','new_area_code_prior_dominant_code','new_area_code_prior_dominant_frac','new_area_code_prior_range','new_place_post_count','new_place_post_days','new_place_post_stationary_count','new_place_post_stationary_days','stability_bonus','bad_gps_skipped','altitude_samples','altitude_rel_median_m','altitude_rel_p90_m','high_altitude_obs_frac','geo_altitude_confidence','stationary_altitude_samples','stationary_altitude_rel_median_m','stationary_altitude_rel_p90_m','stationary_high_altitude_obs_frac','stationary_geo_altitude_confidence']; let o={}; keys.forEach(k=>{if(f&&f[k]!==undefined)o[k]=f[k]}); return o}
 	function bucketExplainerHtml(){
 	  return `<details class="small" style="margin:8px 0 0">
 	    <summary><b>What is a place bucket?</b></summary>
@@ -4789,8 +6986,8 @@ function renderMapTowers(fit){
 	  document.getElementById('drawerTitle').textContent=t.label;
 	  const totalObs=Number(t.total_observation_count||t.count||0);
 	  document.getElementById('drawerSub').textContent=`Bayes ${pct(t.bayes_post_p)} · rules ${Number(t.rule_score||0).toFixed(2)} · observations ${totalObs} · location ${t.location_quality||'unlocated'}`;
-  const allMethods=(t.methods||[]).slice().sort((a,b)=>Math.abs(b.delta_logodds||0)-Math.abs(a.delta_logodds||0));
-  const shownMethods=drawerShowAllMethods ? allMethods : allMethods.filter(m=>m.triggered);
+  const allMethods=(t.methods||[]).slice().sort((a,b)=>Math.abs(b.delta_logodds||b.shadow_delta_logodds||0)-Math.abs(a.delta_logodds||a.shadow_delta_logodds||0));
+  const shownMethods=drawerShowAllMethods ? allMethods : allMethods.filter(m=>m.triggered||m.would_trigger);
   const hiddenCount=Math.max(0, allMethods.length - shownMethods.length);
   const toggleLabel=drawerShowAllMethods ? 'Hide inactive methods' : `Show all methods${hiddenCount?` (${hiddenCount} hidden)`:''}`;
 	  const locationQuality=t.location_quality||'unlocated';
@@ -4800,10 +6997,18 @@ function renderMapTowers(fit){
 	    : locationQuality==='valid_gps'
 	      ? `<div class="status-line success"><b>Valid-GPS tower center</b><br>${validCount} accepted GPS observation(s) determine the center.${weirdCount?` ${weirdCount} weird-GPS observation(s) were retained in the database but excluded from the center and geographic scoring.`:''}</div>`
 	      : `<div class="status-line warn"><b>Unlocated tower</b><br>No usable or fallback coordinates exist. ${unlocatedCount} observation(s) had no coordinates. Cellular and temporal evidence remain available, but this tower cannot be placed on the map.</div>`;
+	  const df=t.features||{}, dwellNotice=df.local_novelty_triggered
+	    ? `<div class="status-line warn"><b>⚠ LOCALLY NEW CELL ID</b><br>This coarse Cell ID was absent during ${Number(df.local_novelty_prior_windows||0)} independent windows across ${Number(df.local_novelty_prior_visits||0)} completed comparable visit(s), then repeated during ${Number(df.local_novelty_current_windows||0)} windows. First-visit cells never receive this evidence.</div>`
+	    : `<div class="status-line success"><b>Local baseline: ${esc(String(df.local_novelty_state||'no stationary context').replaceAll('_',' '))}</b><br>${Number(df.effective_observation_windows||0)} independent 10-minute presence window(s), ${Number(df.independent_visits||0)} visit(s), bounded normality credit ${Number(df.dwell_normality_credit||0).toFixed(3)}.</div>`;
+	  const shadowEvidence=v2ShadowEvidence(df), shadowNotice=shadowEvidence.length
+	    ? `<div class="status-line warn" style="border-color:#7c3aed"><b style="color:#6d28d9">V2 SHADOW EVIDENCE</b><br>${esc(shadowEvidence.join(', '))}. These visit/window replacements are visible for review, but are disabled and contribute exactly zero to the live score. Their detailed shadow calculations appear below.</div>`
+	    : '';
 	  document.getElementById('drawerBody').innerHTML=`
 	    <div class="pillbar"><button class="ghost" onclick="showPoints(${t.id},'all')" title="Overlay all good-GPS observation points for this tower (blue).">Obs points</button><button class="ghost" onclick="showPoints(${t.id},'raw')" title="Overlay all good-GPS observation points for this tower as small green dots.">Raw obs</button><button class="ghost" onclick="showPoints(${t.id},'stationary')" title="Overlay only stationary observations for this tower (green).">Stationary</button><button class="ghost" onclick="showPoints(${t.id},'bad')" title="Overlay excluded bad-GPS observations (orange).">Bad GPS</button><button class="ghost" onclick="showPoints(${t.id},'clusters')" title="Show cluster centers/radii used by multi-location methods.">Clusters</button><button class="ghost" onclick="showPoints(${t.id},'places')" title="Show place buckets (z17 tiles) where this tower was seen.">Place buckets</button><button class="ghost" onclick="clearOverlays()" title="Clear overlay layers.">Clear overlays</button></div>
 	    ${bucketExplainerHtml()}
 	    ${locationNotice}
+	    ${dwellNotice}
+	    ${shadowNotice}
 	    <div class="pillbar"><a class="badge" href="/api/towers/${t.id}/export.md">Export MD</a><a class="badge" href="/api/towers/${t.id}/export.docx">Export DOCX</a><button class="ghost" onclick="recomputeOneTower(${t.id})">Recompute this tower</button><button id="wigleEnrichButton" class="ghost" onclick="enrichTowerWithWigle(${t.id},${Boolean(t.wigle_enrichment)})">${t.wigle_enrichment?'Refresh WiGLE':'Check WiGLE'}</button><span id="towerRecomputeStatus" class="small"></span></div>
       <div id="wigleEnrichmentBox"></div>
 	    <div class="meta-editor">
@@ -4965,7 +7170,10 @@ function toggleDrawerMethods(){drawerShowAllMethods=!drawerShowAllMethods; if(cu
 	function renderMethod(m){
 	  const rows=(m.xai_rows||[]).map(i=>`<tr><td>${esc(i.role||'')}</td><td><code>${esc(i.name)}</code></td><td>${formatValue(i.value)}</td><td>${esc(i.definition||'')}</td></tr>`).join('');
 	  const needsBucketHelp = (String(m.help||'').toLowerCase().includes('place bucket')) || (m.xai_rows||[]).some(r=>String(r.name||'').includes('place'));
-	  return `<div class="term ${m.direction}"><h3>${esc(m.label)} <span class="badge">${m.direction==='down'?'lowers':'raises'}</span> <code>${Number(m.delta_logodds||0).toFixed(3)}</code></h3><p>${esc(m.help)}</p>${needsBucketHelp?bucketExplainerHtml():''}<p><b>Result for this tower:</b> ${esc(m.why)} Triggered: <code>${m.triggered}</code></p>${m.trigger_summary?`<p><b>Applies when:</b> ${esc(m.trigger_summary)}</p>`:''}<p><b>Equation:</b> <code>${esc(m.equation)}</code></p>${m.equation_note?`<p class="small"><b>Equation note:</b> ${esc(m.equation_note)}</p>`:''}<p><b>Effect summary:</b> norm01=<code>${Number(m.norm01||0).toFixed(3)}</code>, odds×=<code>${Number(m.odds_multiplier||1).toFixed(3)}</code>, P ${pct(m.p_before)} → ${pct(m.p_after)}</p><div class="term-table-wrap"><table><colgroup><col style="width:12%"><col style="width:20%"><col style="width:20%"><col style="width:48%"></colgroup><tr><th>Role</th><th>Variable</th><th>Value</th><th>Meaning</th></tr>${rows}</table></div>${(m.map_layers||[]).length?`<p><button class="ghost" onclick="showPoints(currentTowerId(),'${m.map_layers[0].includes('stationary')?'stationary':'all'}')">Show evidence points on map</button></p>`:''}</div>`
+	  const shadowHit=Boolean(!m.enabled&&m.would_trigger);
+	  const badge=shadowHit?'shadow hit':(m.direction==='down'?'lowers':'raises');
+	  const deltaText=shadowHit?`shadow ${Number(m.shadow_delta_logodds||0).toFixed(3)} · live 0.000`:Number(m.delta_logodds||0).toFixed(3);
+	  return `<div class="term ${m.direction}"><h3>${esc(m.label)} <span class="badge">${badge}</span> <code>${deltaText}</code></h3><p>${esc(m.help)}</p>${needsBucketHelp?bucketExplainerHtml():''}<p><b>Result for this tower:</b> ${esc(m.why)} Triggered: <code>${m.triggered}</code>${!m.enabled?` · Would trigger in shadow: <code>${Boolean(m.would_trigger)}</code>`:''}</p>${m.trigger_summary?`<p><b>Applies when:</b> ${esc(m.trigger_summary)}</p>`:''}<p><b>Equation:</b> <code>${esc(m.equation)}</code></p>${m.equation_note?`<p class="small"><b>Equation note:</b> ${esc(m.equation_note)}</p>`:''}<p><b>Effect summary:</b> family=<code>${esc(m.family||'other')}</code>, raw Δ=<code>${Number(m.raw_delta_logodds??m.delta_logodds??0).toFixed(3)}</code>, family scale=<code>${Number(m.family_scale??1).toFixed(3)}</code>, effective Δ=<code>${Number(m.delta_logodds||0).toFixed(3)}</code>, norm01=<code>${Number(m.norm01||0).toFixed(3)}</code>, shadow norm=<code>${Number(m.shadow_norm01||0).toFixed(3)}</code>, shadow Δ=<code>${Number(m.shadow_delta_logodds||0).toFixed(3)}</code>, odds×=<code>${Number(m.odds_multiplier||1).toFixed(3)}</code>, P ${pct(m.p_before)} → ${pct(m.p_after)}</p><div class="term-table-wrap"><table><colgroup><col style="width:12%"><col style="width:20%"><col style="width:20%"><col style="width:48%"></colgroup><tr><th>Role</th><th>Variable</th><th>Value</th><th>Meaning</th></tr>${rows}</table></div>${(m.map_layers||[]).length?`<p><button class="ghost" onclick="showPoints(currentTowerId(),'${m.map_layers[0].includes('stationary')?'stationary':'all'}')">Show evidence points on map</button></p>`:''}</div>`
 	}
 function currentTowerId(){return currentTowerData ? Number(currentTowerData.id||0) : 0}
 function closeDrawer(){document.getElementById('drawer').classList.remove('open'); currentTowerData=null;}
@@ -5046,7 +7254,9 @@ async function loadAnomalyTable(){
 async function loadAdmin(){const q=document.getElementById('adminSearch').value.trim(); const data=await api('/api/towers?limit=5000&q='+encodeURIComponent(q)+'&include_ignored=1'); adminTableItems=data.items; renderTowerTable('adminTable',adminTableItems,true)}
 function sortValue(t,key){
   if(key==='count') return Number(t.total_observation_count??t.count??-Infinity);
-  if(key==='bayes_post_p'||key==='rule_score'||key==='tac_lac'||key==='cell_id'||key==='pci'||key==='earfcn') return Number(t[key]??-Infinity);
+  if(key==='location') return Number(t.center_lat??t.weird_center_lat??-Infinity);
+  if(key==='local_novelty_state') return String(((t.features||{}).local_novelty_state)||'').toLowerCase();
+  if(key==='bayes_post_p'||key==='rule_score'||key==='tac_lac'||key==='cell_id'||key==='pci'||key==='earfcn'||key==='first_seen_ts'||key==='last_seen_ts') return Number(t[key]??-Infinity);
   if(key==='has_note') return t[key]?1:0;
   if(key==='known'||key==='ignored') return t[key]?1:0;
   return String(t[key]??'').toLowerCase();
@@ -5066,7 +7276,7 @@ function sortHeader(tableId,key,label){
 }
 function setTowerSort(tableId,key){
   const s=tableSort[tableId]||{key,dir:1};
-  tableSort[tableId]={key,dir:s.key===key?-s.dir:((key==='bayes_post_p'||key==='rule_score'||key==='count')?-1:1)};
+  tableSort[tableId]={key,dir:s.key===key?-s.dir:((key==='bayes_post_p'||key==='rule_score'||key==='count'||key==='first_seen_ts'||key==='last_seen_ts')?-1:1)};
   if(tableId==='anomalyTable') renderAnomalyTable();
   else renderTowerTable(tableId,tableId==='adminTable'?adminTableItems:towerTableItems,tableId==='adminTable');
 }
@@ -5085,12 +7295,16 @@ async function showTowerOnMap(id,event){
 }
 function renderTowerTable(id,items,admin){
   const sorted=sortTowerItems(items,id);
+  const showSeenDates=id==='towerTable';
   const headers=[
     '<th>Map</th>',
     sortHeader(id,'bayes_post_p','Bayes'),
     sortHeader(id,'rule_score','Rules'),
     sortHeader(id,'count','Seen'),
-    sortHeader(id,'location_quality','Location'),
+    sortHeader(id,'local_novelty_state','Local evidence'),
+    sortHeader(id,'location','Location'),
+    showSeenDates?sortHeader(id,'first_seen_ts','First seen'):'',
+    showSeenDates?sortHeader(id,'last_seen_ts','Last seen'):'',
     sortHeader(id,'operator','Operator'),
     sortHeader(id,'rat','RAT'),
     sortHeader(id,'tac_lac','TAC/LAC'),
@@ -5103,7 +7317,7 @@ function renderTowerTable(id,items,admin){
     sortHeader(id,'ignored','Ignored'),
     admin?'<th>Delete</th>':''
   ].join('');
-  document.getElementById(id).innerHTML=`<tr>${headers}</tr>`+sorted.map(t=>`<tr><td><button class="ghost" onclick="showTowerOnMap(${t.id},event)">Show</button></td><td class="score">${pct(t.bayes_post_p)}</td><td class="score">${Number(t.rule_score||0).toFixed(2)}</td><td>${t.total_observation_count??t.count}</td><td>${locationQualityHtml(t)}</td><td>${esc(t.operator)}</td><td>${esc(t.rat)}</td><td><code>${esc(t.tac_lac)}</code></td><td><code>${esc(t.cell_id)}</code></td><td><code>${esc(t.pci)}</code></td><td><code>${esc(t.earfcn)}</code></td><td>${analysisTagHtml(t.analysis_status)}</td><td>${noteIndicatorHtml(t.notes)}</td><td onclick="event.stopPropagation()"><input type="checkbox" ${t.known?'checked':''} onchange="patchTower(${t.id},{known:this.checked})" title="Known tower"></td><td onclick="event.stopPropagation()"><input type="checkbox" ${t.ignored?'checked':''} onchange="patchTower(${t.id},{ignored:this.checked})" title="Ignored tower"></td>${admin?`<td onclick="event.stopPropagation()"><button class="ghost" onclick="deleteTower(${t.id})">Delete</button></td>`:''}</tr>`).join('');
+  document.getElementById(id).innerHTML=`<tr>${headers}</tr>`+sorted.map(t=>`<tr><td><button class="ghost" onclick="showTowerOnMap(${t.id},event)">Show</button></td><td class="score">${pct(t.bayes_post_p)}</td><td class="score">${Number(t.rule_score||0).toFixed(2)}</td><td>${t.total_observation_count??t.count}</td><td>${dwellEvidenceHtml(t)}</td><td>${towerLocationHtml(t)}</td>${showSeenDates?`<td>${seenDateHtml(t.first_seen_ts)}</td><td>${seenDateHtml(t.last_seen_ts)}</td>`:''}<td>${esc(t.operator)}</td><td>${esc(t.rat)}</td><td><code>${esc(t.tac_lac)}</code></td><td><code>${esc(t.cell_id)}</code></td><td><code>${esc(t.pci)}</code></td><td><code>${esc(t.earfcn)}</code></td><td>${analysisTagHtml(t.analysis_status)}</td><td>${noteIndicatorHtml(t.notes)}</td><td onclick="event.stopPropagation()"><input type="checkbox" ${t.known?'checked':''} onchange="patchTower(${t.id},{known:this.checked})" title="Known tower"></td><td onclick="event.stopPropagation()"><input type="checkbox" ${t.ignored?'checked':''} onchange="patchTower(${t.id},{ignored:this.checked})" title="Ignored tower"></td>${admin?`<td onclick="event.stopPropagation()"><button class="ghost" onclick="deleteTower(${t.id})">Delete</button></td>`:''}</tr>`).join('');
 }
 function renderAnomalyTable(){
   const id='anomalyTable', sorted=sortTowerItems(anomalyTableItems,id);
@@ -5112,14 +7326,15 @@ function renderAnomalyTable(){
     sortHeader(id,'bayes_post_p','Bayes'),
     sortHeader(id,'rule_score','Rules'),
     sortHeader(id,'count','Seen'),
-    sortHeader(id,'location_quality','Location'),
+    sortHeader(id,'local_novelty_state','Local evidence'),
+    sortHeader(id,'location','Location'),
     sortHeader(id,'operator','Operator'),
     sortHeader(id,'rat','RAT'),
     sortHeader(id,'tac_lac','TAC/LAC'),
     sortHeader(id,'cell_id','Cell ID'),
     '<th>Triggered anomalies</th>'
   ].join('');
-  document.getElementById(id).innerHTML=`<tr>${headers}</tr>`+sorted.map(t=>`<tr><td><button class="ghost" onclick="showTowerOnMap(${t.id},event)">Show</button></td><td class="score">${pct(t.bayes_post_p)}</td><td class="score">${Number(t.rule_score||0).toFixed(2)}</td><td>${t.total_observation_count??t.count}</td><td>${locationQualityHtml(t)}</td><td>${esc(t.operator)}</td><td>${esc(t.rat)}</td><td><code>${esc(t.tac_lac)}</code></td><td><code>${esc(t.cell_id)}</code></td><td><div class="pillbar">${(t.triggered_anomalies||[]).map(m=>`<span class="tag-badge" title="${esc(m.why||'')}">${esc(m.label)} <code>+${Number(m.delta_logodds||0).toFixed(2)}</code></span>`).join('')}</div></td></tr>`).join('');
+  document.getElementById(id).innerHTML=`<tr>${headers}</tr>`+sorted.map(t=>`<tr><td><button class="ghost" onclick="showTowerOnMap(${t.id},event)">Show</button></td><td class="score">${pct(t.bayes_post_p)}</td><td class="score">${Number(t.rule_score||0).toFixed(2)}</td><td>${t.total_observation_count??t.count}</td><td>${dwellEvidenceHtml(t)}</td><td>${towerLocationHtml(t)}</td><td>${esc(t.operator)}</td><td>${esc(t.rat)}</td><td><code>${esc(t.tac_lac)}</code></td><td><code>${esc(t.cell_id)}</code></td><td><div class="pillbar">${(t.triggered_anomalies||[]).map(m=>`<span class="tag-badge" title="${esc(m.why||'')}">${esc(m.label)} <code>+${Number(m.delta_logodds||0).toFixed(2)}</code></span>`).join('')}</div></td></tr>`).join('');
 }
 function setTowerMetaStatus(kind,text){
   const el=document.getElementById('towerMetaStatus'); if(!el) return;
@@ -5470,7 +7685,7 @@ def create_app(db_path: str):
             clauses.append("COALESCE(f.bayes_post_p,0) >= 0.001")
         if last_seen_from:
             from_ts = dt.datetime.combine(last_seen_from, dt.time.min, tzinfo=dt.timezone.utc).timestamp()
-            clauses.append("f.last_seen_ts >= ?")
+            clauses.append("COALESCE(lq.last_observation_ts,f.last_seen_ts) >= ?")
             params.append(from_ts)
         if last_seen_to:
             through_ts = dt.datetime.combine(
@@ -5478,7 +7693,7 @@ def create_app(db_path: str):
                 dt.time.min,
                 tzinfo=dt.timezone.utc,
             ).timestamp()
-            clauses.append("f.last_seen_ts < ?")
+            clauses.append("COALESCE(lq.last_observation_ts,f.last_seen_ts) < ?")
             params.append(through_ts)
         if q:
             like = f"%{q}%"
