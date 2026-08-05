@@ -171,7 +171,7 @@ def load_status_snapshot(path: str, *, limit: int) -> Dict[str, Any]:
         seen_loc = entry.get("seen_location") or {}
         towers.append({
             "id": entry.get("key") or tower_identity_text(entry),
-            "operator": ((payload.get("network") or {}).get("cops_current") or {}).get("operator") or "",
+            "operator": extract_operator(payload, entry),
             "rat": entry.get("rat"),
             "tac_lac": entry.get("tac_lac"),
             "cell_id": entry.get("cell_id"),
@@ -337,9 +337,9 @@ def load_jsonl_snapshot(path: str, *, limit: int, tail_lines: int) -> Dict[str, 
     for index, row in enumerate(rows):
         ts_text = row.get("timestamp_utc") or row.get("timestamp_local")
         ts_epoch = parse_ts_epoch(ts_text)
-        operator = extract_operator(row)
         loc = row.get("location") or {}
         for cell in iter_observed_cells(row):
+            operator = extract_operator(row, cell)
             key = tower_key_from_cell(operator, cell)
             identity = tower_identity_text({
                 "rat": key.rat,
