@@ -706,16 +706,29 @@ class TowerIntelTests(unittest.TestCase):
         self.assertEqual(result["new_towers"], 1)
 
     def test_wigle_enrichment_infers_tesco_o2_plmn_and_filters_exact_match(self):
+        self.assertEqual(intel.operator_display_name("23002"), "O2 Czech Republic (230-02)")
+        self.assertEqual(
+            intel.operator_display_name("TESCO Mobile TESCO Mobile"),
+            "O2 Czech Republic (230-02; legacy record)",
+        )
+        self.assertEqual(
+            intel.operator_display_name("Orange SK TESCO Mobile"),
+            "Orange SK TESCO Mobile",
+        )
         rows = [{
             "timestamp_utc": "2027-01-01T00:00:00Z",
             "location": {"lat": 50.0, "lon": 14.0},
-            "network": {"cops_current": {"operator": "TESCO Mobile TESCO mobile"}},
-            "towers": [{"rat": "LTE", "tac_lac": 1137, "cell_id": 154762598, "pci": 228, "earfcn": 1404}],
+            "network": {
+                "cops_current": {"format": 0, "operator": "TESCO Mobile TESCO mobile"},
+                "cops_current_numeric": {"format": 2, "operator": "23002"},
+            },
+            "towers": [{"rat": "LTE", "plmn": "230-02", "mcc": 230, "mnc": 2, "tac_lac": 1137, "cell_id": 154762598, "pci": 228, "earfcn": 1404}],
         }]
         write_jsonl(self.log, rows)
         intel.ingest_files(self.db, [str(self.log)])
         with intel.connect_db(self.db) as con:
             tower_id = con.execute("SELECT id FROM towers").fetchone()["id"]
+            self.assertEqual(con.execute("SELECT operator FROM towers WHERE id=?", (tower_id,)).fetchone()["operator"], "23002")
 
         response_payload = {
             "success": True,
