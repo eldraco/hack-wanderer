@@ -155,7 +155,7 @@ An external NMEA GPS receiver (defaults to `/dev/ttyACM0`) is sampled alongside 
 - Modem info: manufacturer, model, firmware revision, IMEI
 - SIM info: SIM status, ICCID, IMSI, basic SIM file reads via `AT+CRSM`
 - SIM PIN state and optional unlock using a configured PIN
-- Network status: signal quality, registration status (2G/3G/4G), current operator
+- Network status: signal quality, registration status (2G/3G/4G), and numeric registered PLMN
 - Operator scan: available nearby operators (`AT+COPS=?`)
 - Optional vendor-specific data (if supported): band, serving cell, neighbor cell
 - Optional GPS info (if supported)
@@ -164,6 +164,11 @@ An external NMEA GPS receiver (defaults to `/dev/ttyACM0`) is sampled alongside 
 ## Notes
 
 - `AT+COPS=?` can take a long time. It is disabled by default; enable with `--operator-scan`.
+- Tower operator identity uses the cell's broadcast MCC/MNC (numeric PLMN), not
+  the alphanumeric `AT+COPS?` name. That name can be supplied by SIM EONS/SPN
+  data and may identify an MVNO such as Tesco Mobile rather than the radio
+  network. For a serving registration that lacks per-cell MCC/MNC, the numeric
+  registered PLMN is used as a fallback.
 - `auto_register: true` now retries `AT+COPS=0` only when the modem is unregistered, and it is throttled by `timeouts.auto_register_retry_s` so wardrive mode does not force network reselection every loop.
 - SIM file reads are limited to a small list of common EF files. Full SIM exploration requires APDU workflows (e.g., `AT+CSIM`), which are not implemented yet.
 - GPS commands are queried only (no power-on commands are issued).
@@ -237,7 +242,14 @@ Run `python hack-wanderer.py --help` for the full list. Key flags:
   sudo systemctl enable --now hack-wanderer-status-http.service
   sudo systemctl enable --now hack-wanderer-display.service
   ```
-  This starts a tiny local web server on `http://127.0.0.1:8800/` and opens it in kiosk mode. It assumes `chromium-browser` is installed, `DISPLAY=:0`, and `.Xauthority` is in `/home/pi`.
+  This starts a tiny web server on port 8800, bound to all IPv4 network
+  interfaces, and opens it locally in kiosk mode. From another device on the
+  same network, such as your phone, open `http://<pi-ip-address>:8800/`. Find
+  the Pi's address with `hostname -I`. If a firewall is enabled on the Pi,
+  allow incoming TCP traffic on port 8800. The page has no authentication, so
+  expose this port only on a trusted network. The kiosk setup assumes
+  `chromium-browser` is installed, `DISPLAY=:0`, and `.Xauthority` is in
+  `/home/pi`.
 
 ## Realtime tower CLI
 
