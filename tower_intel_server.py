@@ -141,6 +141,23 @@ WIGLE_OPERATOR_ALIASES = {
     "tesco mobile": "23002",
     "o2 czech": "23002",
 }
+PLMN_OPERATOR_NAMES = {
+    "23002": "O2 Czech Republic",
+}
+
+
+def operator_display_name(operator: Any) -> str:
+    raw = str(operator or "").strip()
+    compact = re.sub(r"\D", "", raw)
+    if compact in PLMN_OPERATOR_NAMES:
+        plmn = f"{compact[:3]}-{compact[3:]}"
+        return f"{PLMN_OPERATOR_NAMES[compact]} ({plmn})"
+    # Existing databases may contain this old SIM/EONS-derived value. This
+    # exact legacy case is known to be Tesco on O2's Czech PLMN; do not apply
+    # the alias to roaming strings such as "Orange SK TESCO Mobile".
+    if raw.casefold() == "tesco mobile tesco mobile":
+        return "O2 Czech Republic (230-02; legacy record)"
+    return raw
 
 # SQLite allows only one writer. Imports and recompute are write-heavy, so we
 # serialize them at the app layer to avoid "database is locked" crashes.
@@ -4468,9 +4485,9 @@ def ingest_files(
                         """,
                         (sample_uid, content_hash, import_id, line_no, ts, ts_iso, lat, lon, alt_m, gps_source, gps_status, hdop, bad_gps, place_id, json_dumps(obj)),
                     )
-                    operator = extract_operator(obj)
                     obs_count = 0
                     for cell in iter_observed_cells(obj):
+                        operator = extract_operator(obj, cell)
                         key = tower_key_from_cell(operator, cell)
                         if key.cell_id is None and key.tac_lac is None and key.pci is None and key.earfcn is None:
                             continue
@@ -5891,6 +5908,7 @@ def tower_payload(row: sqlite3.Row, *, enrich_methods: bool = False) -> Dict[str
         "known": bool(row["known"]),
         "ignored": bool(row["ignored"]),
         "operator": row["operator"],
+        "operator_display": operator_display_name(row["operator"]),
         "rat": row["rat"],
         "tac_lac": row["tac_lac"],
         "cell_id": row["cell_id"],
@@ -5991,7 +6009,8 @@ def export_markdown(con: sqlite3.Connection, tower_id: int) -> str:
         "",
         "## Identity",
         f"- ID: `{tower_id}`",
-        f"- Operator: `{payload['operator']}`",
+        f"- Broadcast network / PLMN: `{payload.get('operator_display') or payload['operator']}`",
+        f"- Stored operator key: `{payload['operator']}`",
         f"- RAT: `{payload['rat']}`",
         f"- TAC/LAC: `{payload['tac_lac']}`",
         f"- Cell ID: `{payload['cell_id']}`",
@@ -6194,7 +6213,8 @@ def export_docx(con: sqlite3.Connection, tower_id: int) -> bytes:
     children.append(_w_table(
         [
             ["Field", "Value", "Meaning"],
-            ["Operator", payload.get("operator"), "Network/operator string from the modem."],
+            ["Broadcast network / PLMN", payload.get("operator_display") or payload.get("operator"), "Numeric cell PLMN with a known operator label when available."],
+            ["Stored operator key", payload.get("operator"), "Stable numeric PLMN for new captures; older records may contain a legacy modem label."],
             ["RAT", payload.get("rat"), VARIABLE_GLOSSARY["rat"]],
             ["TAC/LAC", payload.get("tac_lac"), VARIABLE_GLOSSARY["tac_lac"]],
             ["Cell ID", payload.get("cell_id"), VARIABLE_GLOSSARY["cell_id"]],
@@ -7027,7 +7047,7 @@ function renderMapTowers(fit){
         <span id="towerMetaStatus" class="small">${t.has_note?'Stored note present.':'No note stored.'}</span>
       </div>
     </div>
-    <h3>Identity and location quality</h3><div class="grid2">${['operator','rat','tac_lac','cell_id','pci','earfcn','location_quality','total_observation_count','valid_gps_count','weird_gps_count','unlocated_count'].map(k=>`<div><b>${k}</b><br><code>${esc(t[k])}</code></div>`).join('')}</div>
+	    <h3>Identity and location quality</h3><div class="grid2"><div><b>broadcast network / PLMN</b><br><code>${esc(t.operator_display||t.operator)}</code></div><div><b>stored operator key</b><br><code>${esc(t.operator)}</code></div>${['rat','tac_lac','cell_id','pci','earfcn','location_quality','total_observation_count','valid_gps_count','weird_gps_count','unlocated_count'].map(k=>`<div><b>${k}</b><br><code>${esc(t[k])}</code></div>`).join('')}</div>
     <h3>Important feature values</h3>${renderFeatureTable(t.features)}
     ${renderAltitudeView(t.altitude_view)}
       <h3>Observations</h3>
@@ -7305,7 +7325,7 @@ function renderTowerTable(id,items,admin){
     sortHeader(id,'location','Location'),
     showSeenDates?sortHeader(id,'first_seen_ts','First seen'):'',
     showSeenDates?sortHeader(id,'last_seen_ts','Last seen'):'',
-    sortHeader(id,'operator','Operator'),
+    sortHeader(id,'operator','Network / PLMN'),
     sortHeader(id,'rat','RAT'),
     sortHeader(id,'tac_lac','TAC/LAC'),
     sortHeader(id,'cell_id','Cell ID'),
@@ -7317,7 +7337,7 @@ function renderTowerTable(id,items,admin){
     sortHeader(id,'ignored','Ignored'),
     admin?'<th>Delete</th>':''
   ].join('');
-  document.getElementById(id).innerHTML=`<tr>${headers}</tr>`+sorted.map(t=>`<tr><td><button class="ghost" onclick="showTowerOnMap(${t.id},event)">Show</button></td><td class="score">${pct(t.bayes_post_p)}</td><td class="score">${Number(t.rule_score||0).toFixed(2)}</td><td>${t.total_observation_count??t.count}</td><td>${dwellEvidenceHtml(t)}</td><td>${towerLocationHtml(t)}</td>${showSeenDates?`<td>${seenDateHtml(t.first_seen_ts)}</td><td>${seenDateHtml(t.last_seen_ts)}</td>`:''}<td>${esc(t.operator)}</td><td>${esc(t.rat)}</td><td><code>${esc(t.tac_lac)}</code></td><td><code>${esc(t.cell_id)}</code></td><td><code>${esc(t.pci)}</code></td><td><code>${esc(t.earfcn)}</code></td><td>${analysisTagHtml(t.analysis_status)}</td><td>${noteIndicatorHtml(t.notes)}</td><td onclick="event.stopPropagation()"><input type="checkbox" ${t.known?'checked':''} onchange="patchTower(${t.id},{known:this.checked})" title="Known tower"></td><td onclick="event.stopPropagation()"><input type="checkbox" ${t.ignored?'checked':''} onchange="patchTower(${t.id},{ignored:this.checked})" title="Ignored tower"></td>${admin?`<td onclick="event.stopPropagation()"><button class="ghost" onclick="deleteTower(${t.id})">Delete</button></td>`:''}</tr>`).join('');
+  document.getElementById(id).innerHTML=`<tr>${headers}</tr>`+sorted.map(t=>`<tr><td><button class="ghost" onclick="showTowerOnMap(${t.id},event)">Show</button></td><td class="score">${pct(t.bayes_post_p)}</td><td class="score">${Number(t.rule_score||0).toFixed(2)}</td><td>${t.total_observation_count??t.count}</td><td>${dwellEvidenceHtml(t)}</td><td>${towerLocationHtml(t)}</td>${showSeenDates?`<td>${seenDateHtml(t.first_seen_ts)}</td><td>${seenDateHtml(t.last_seen_ts)}</td>`:''}<td>${esc(t.operator_display||t.operator)}</td><td>${esc(t.rat)}</td><td><code>${esc(t.tac_lac)}</code></td><td><code>${esc(t.cell_id)}</code></td><td><code>${esc(t.pci)}</code></td><td><code>${esc(t.earfcn)}</code></td><td>${analysisTagHtml(t.analysis_status)}</td><td>${noteIndicatorHtml(t.notes)}</td><td onclick="event.stopPropagation()"><input type="checkbox" ${t.known?'checked':''} onchange="patchTower(${t.id},{known:this.checked})" title="Known tower"></td><td onclick="event.stopPropagation()"><input type="checkbox" ${t.ignored?'checked':''} onchange="patchTower(${t.id},{ignored:this.checked})" title="Ignored tower"></td>${admin?`<td onclick="event.stopPropagation()"><button class="ghost" onclick="deleteTower(${t.id})">Delete</button></td>`:''}</tr>`).join('');
 }
 function renderAnomalyTable(){
   const id='anomalyTable', sorted=sortTowerItems(anomalyTableItems,id);
@@ -7328,13 +7348,13 @@ function renderAnomalyTable(){
     sortHeader(id,'count','Seen'),
     sortHeader(id,'local_novelty_state','Local evidence'),
     sortHeader(id,'location','Location'),
-    sortHeader(id,'operator','Operator'),
+    sortHeader(id,'operator','Network / PLMN'),
     sortHeader(id,'rat','RAT'),
     sortHeader(id,'tac_lac','TAC/LAC'),
     sortHeader(id,'cell_id','Cell ID'),
     '<th>Triggered anomalies</th>'
   ].join('');
-  document.getElementById(id).innerHTML=`<tr>${headers}</tr>`+sorted.map(t=>`<tr><td><button class="ghost" onclick="showTowerOnMap(${t.id},event)">Show</button></td><td class="score">${pct(t.bayes_post_p)}</td><td class="score">${Number(t.rule_score||0).toFixed(2)}</td><td>${t.total_observation_count??t.count}</td><td>${dwellEvidenceHtml(t)}</td><td>${towerLocationHtml(t)}</td><td>${esc(t.operator)}</td><td>${esc(t.rat)}</td><td><code>${esc(t.tac_lac)}</code></td><td><code>${esc(t.cell_id)}</code></td><td><div class="pillbar">${(t.triggered_anomalies||[]).map(m=>`<span class="tag-badge" title="${esc(m.why||'')}">${esc(m.label)} <code>+${Number(m.delta_logodds||0).toFixed(2)}</code></span>`).join('')}</div></td></tr>`).join('');
+  document.getElementById(id).innerHTML=`<tr>${headers}</tr>`+sorted.map(t=>`<tr><td><button class="ghost" onclick="showTowerOnMap(${t.id},event)">Show</button></td><td class="score">${pct(t.bayes_post_p)}</td><td class="score">${Number(t.rule_score||0).toFixed(2)}</td><td>${t.total_observation_count??t.count}</td><td>${dwellEvidenceHtml(t)}</td><td>${towerLocationHtml(t)}</td><td>${esc(t.operator_display||t.operator)}</td><td>${esc(t.rat)}</td><td><code>${esc(t.tac_lac)}</code></td><td><code>${esc(t.cell_id)}</code></td><td><div class="pillbar">${(t.triggered_anomalies||[]).map(m=>`<span class="tag-badge" title="${esc(m.why||'')}">${esc(m.label)} <code>+${Number(m.delta_logodds||0).toFixed(2)}</code></span>`).join('')}</div></td></tr>`).join('');
 }
 function setTowerMetaStatus(kind,text){
   const el=document.getElementById('towerMetaStatus'); if(!el) return;
