@@ -118,6 +118,55 @@ class HackWandererStatusTests(unittest.TestCase):
 
         self.assertTrue(hack_wanderer.network_is_registered(network))
         self.assertNotIn("AT+COPS=0", at.commands)
+        self.assertIn("AT+COPS=3,2", at.commands)
+        self.assertEqual(network["cops_current_numeric"]["operator"], "21670")
+
+    def test_parse_numeric_cops_without_optional_access_technology(self):
+        parsed = hack_wanderer.parse_cops_current(['+COPS: 0,2,"23002"', "OK"])
+
+        self.assertEqual(parsed["operator"], "23002")
+        self.assertEqual(parsed["format"], 2)
+        self.assertIsNone(parsed["act"])
+
+    def test_tower_snapshot_uses_numeric_plmn_not_sim_brand(self):
+        network = {
+            "cereg": {
+                "stat_code": 1,
+                "stat_text": "registered_home",
+                "rat": "LTE",
+                "act": 7,
+                "lac_tac": 481,
+                "cell_id": 153825646,
+            },
+            "cops_current": {"format": 0, "operator": "TESCO Mobile TESCO Mobile"},
+            "cops_current_numeric": {"format": 2, "operator": "23002"},
+        }
+
+        towers = hack_wanderer.build_towers_snapshot(network, {})
+
+        self.assertEqual(towers[0]["plmn"], "23002")
+        self.assertEqual(towers[0]["mcc"], 230)
+        self.assertEqual(towers[0]["mnc"], 2)
+        self.assertNotIn("TESCO", json.dumps(towers))
+
+    def test_cpsi_cell_plmn_overrides_registered_network_fallback(self):
+        network = {
+            "cops_current_numeric": {"format": 2, "operator": "23002"},
+        }
+        vendor = {"cpsi": {
+            "system_mode": "LTE",
+            "scell_id": 42,
+            "tac": 7,
+            "pcell_id": 3,
+            "plmn": "262-01",
+            "mcc": 262,
+            "mnc": 1,
+        }}
+
+        towers = hack_wanderer.build_towers_snapshot(network, vendor)
+
+        self.assertEqual(towers[0]["plmn"], "262-01")
+        self.assertEqual((towers[0]["mcc"], towers[0]["mnc"]), (262, 1))
 
     def test_collect_network_throttles_auto_register_retries_while_searching(self):
         at = FakeAT({
