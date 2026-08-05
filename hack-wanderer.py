@@ -886,13 +886,13 @@ def parse_cops_current(lines):
         if line.startswith("+COPS:"):
             payload = line.split(":", 1)[1].strip()
             parts = split_fields(payload)
-            if len(parts) >= 4:
+            if len(parts) >= 3:
                 operator = strip_quotes(parts[2])
                 return {
                     "mode": safe_int(parts[0]),
                     "format": safe_int(parts[1]),
                     "operator": operator,
-                    "act": safe_int(parts[3]),
+                    "act": safe_int(parts[3]) if len(parts) >= 4 else None,
                 }
     return {}
 
@@ -904,6 +904,17 @@ def split_mcc_mnc(numeric):
     if len(digits) < 5:
         return None, None
     return safe_int(digits[:3]), safe_int(digits[3:])
+
+
+def numeric_plmn(network):
+    """Return the registered numeric PLMN, never an alphanumeric SIM/network label."""
+    for key in ("cops_current_numeric", "cops_current"):
+        cops = network.get(key) or {}
+        operator = cops.get("operator")
+        digits = "".join(ch for ch in str(operator or "") if ch.isdigit())
+        if len(digits) in (5, 6) and (cops.get("format") == 2 or digits == str(operator)):
+            return digits
+    return None
 
 
 def parse_cops_scan(lines):
@@ -1135,7 +1146,8 @@ def parse_qeng_neighborcell(lines):
 def build_towers_snapshot(network, vendor):
     towers = []
     reg = best_registration(network)
-    mcc, mnc = split_mcc_mnc((network.get("cops_current") or {}).get("operator"))
+    registered_plmn = numeric_plmn(network)
+    mcc, mnc = split_mcc_mnc(registered_plmn)
     if reg:
         reg_entry = {
             "source": "registration",
@@ -1144,6 +1156,9 @@ def build_towers_snapshot(network, vendor):
             "cell_id": reg.get("cell_id"),
             "tac_lac": reg.get("lac_tac"),
             "stat": reg.get("stat_text"),
+            "plmn": registered_plmn,
+            "mcc": mcc,
+            "mnc": mnc,
         }
         towers.append(reg_entry)
     cpsi = vendor.get("cpsi") or {}
@@ -1160,15 +1175,22 @@ def build_towers_snapshot(network, vendor):
             "rsrq": cpsi.get("rsrq"),
             "rssi": cpsi.get("rssi"),
             "rssnr": cpsi.get("rssnr"),
+            "plmn": cpsi.get("plmn") or registered_plmn,
+            "mcc": cpsi.get("mcc") if cpsi.get("mcc") is not None else mcc,
+            "mnc": cpsi.get("mnc") if cpsi.get("mnc") is not None else mnc,
         })
     qeng_serving = parse_qeng_servingcell(vendor.get("qeng_servingcell", []))
     qeng_neighbor = parse_qeng_neighborcell(vendor.get("qeng_neighborcell", []))
-    # Enrich QENG entries with fallback MCC/MNC from operator if missing.
+    # Enrich QENG entries with the registered numeric PLMN only when the modem
+    # omitted MCC/MNC. Never infer tower ownership from the alphanumeric COPS
+    # label because SIM/EONS branding can report an MVNO such as Tesco Mobile.
     for entry in qeng_serving + qeng_neighbor:
         if entry.get("mcc") is None and mcc is not None:
             entry["mcc"] = mcc
         if entry.get("mnc") is None and mnc is not None:
             entry["mnc"] = mnc
+        if entry.get("plmn") is None and entry.get("mcc") is not None and entry.get("mnc") is not None:
+            entry["plmn"] = "{}{}".format(entry["mcc"], str(entry["mnc"]).zfill(2))
         if entry.get("rat") in ("LTE", "CAT-M1", "CAT-NB1", "NB-IOT") and entry.get("cell_id") is not None:
             eci = entry["cell_id"]
             entry["eci"] = eci
@@ -1753,7 +1775,12 @@ def collect_network(at, config):
             network["cgreg"] = parse_reg(at.send("AT+CGREG?")["lines"], "CGREG")
             network["cereg"] = parse_reg(at.send("AT+CEREG?")["lines"], "CEREG")
 
-    network["cops_current"] = parse_cops_current(at.send("AT+COPS?")["lines"])
+    # Ask for the numeric PLMN used by the registered network. Long/short
+    # alphanumeric COPS names may come from SIM EONS/SPN data and therefore can
+    # name an MVNO rather than the network broadcasting the Cell ID.
+    at.send("AT+COPS=3,2")
+    network["cops_current_numeric"] = parse_cops_current(at.send("AT+COPS?")["lines"])
+    network["cops_current"] = network["cops_current_numeric"]
 
     if config["features"].get("operator_scan"):
         scan = at.send("AT+COPS=?", timeout_s=config["timeouts"]["operator_scan_s"])
