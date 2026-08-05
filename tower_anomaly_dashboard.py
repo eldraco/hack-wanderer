@@ -986,10 +986,38 @@ def normalize_rat(value: Any) -> str:
     return str(value).strip()
 
 
-def extract_operator(obj: Dict[str, Any]) -> str:
-    cops = (obj.get("network") or {}).get("cops_current") or {}
+def _numeric_plmn(value: Any) -> str:
+    text = str(value or "").strip()
+    digits = "".join(ch for ch in text if ch.isdigit())
+    if len(digits) in (5, 6):
+        return digits
+    return ""
+
+
+def extract_operator(obj: Dict[str, Any], cell: Optional[Dict[str, Any]] = None) -> str:
+    """Return the cell PLMN, avoiding SIM-provided alphanumeric carrier names."""
+    cell = cell or {}
+    plmn = _numeric_plmn(cell.get("plmn"))
+    if plmn:
+        return plmn
+    mcc = safe_int(cell.get("mcc"))
+    mnc = safe_int(cell.get("mnc"))
+    if mcc is not None and mnc is not None:
+        return f"{mcc}{mnc:02d}"
+
+    network = obj.get("network") or {}
+    for name in ("cops_current_numeric", "cops_current"):
+        cops = network.get(name) or {}
+        plmn = _numeric_plmn(cops.get("operator"))
+        if plmn and (cops.get("format") == 2 or name == "cops_current_numeric"):
+            return plmn
+
+    # Compatibility for old imported/test data that did not record the COPS
+    # format. Explicit format 0/1 names are deliberately rejected because they
+    # may be SIM/EONS branding rather than the cell network owner.
+    cops = network.get("cops_current") or {}
     op = cops.get("operator")
-    if isinstance(op, str) and op.strip():
+    if cops.get("format") is None and isinstance(op, str) and op.strip():
         return op.strip()
     return ""
 
@@ -4228,8 +4256,8 @@ def main() -> int:
         if args.max_places and args.max_places > 0 and place_id not in places and len(places) >= int(args.max_places):
             place_id = None
 
-        operator = extract_operator(obj)
         for cell in iter_observed_cells(obj):
+            operator = extract_operator(obj, cell)
             key = tower_key_from_cell(operator, cell)
             if key.cell_id is None and key.tac_lac is None:
                 continue
