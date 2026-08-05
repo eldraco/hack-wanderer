@@ -380,8 +380,12 @@ Useful endpoints:
 The tower drawer has a **Check WiGLE** button. Set `WIGLE_API_NAME` and `WIGLE_API_TOKEN`
 in `.env` to enable it. Successful lookups are stored in SQLite and shown automatically
 when the tower drawer is reopened. Use **Refresh WiGLE** to explicitly ask WiGLE again.
-The credentials stay on the server; the browser receives only the lookup result. Tesco
-Mobile and O2 Czech operator labels are mapped to PLMN `23002`.
+The credentials stay on the server; the browser receives only the lookup result. New
+captures key towers by the cell's numeric PLMN rather than an alphanumeric `AT+COPS?`
+label, because that label may contain SIM/EONS branding. PLMN `23002` is displayed as
+O2 Czech Republic. The exact legacy label `TESCO Mobile TESCO Mobile` is also displayed
+as O2/`230-02`, while mixed roaming labels are left unchanged because they cannot be
+safely migrated without historical numeric MCC/MNC data.
 
 Stored WiGLE checks also feed two editable Bayes/XAI methods:
 
