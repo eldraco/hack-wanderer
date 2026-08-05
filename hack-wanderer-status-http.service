@@ -7,7 +7,7 @@ Wants=hack-wanderer.service
 Type=simple
 User=pi
 WorkingDirectory=/home/pi/code/hack-wanderer/status
-ExecStart=/usr/bin/env python -m http.server 8800
+ExecStart=/usr/bin/env python -m http.server 8800 --bind 0.0.0.0
 Restart=always
 RestartSec=2
 
