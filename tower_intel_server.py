@@ -6469,6 +6469,363 @@ def export_docx(con: sqlite3.Connection, tower_id: int) -> bytes:
     return out.getvalue()
 
 
+HELP_TERMINOLOGY: List[Tuple[str, str]] = [
+    ("AT command", "A text command sent over the modem's serial control port. AT originally meant attention. The modem returns structured lines, OK, or an error."),
+    ("Observation", "One association between a captured sample and one reported cell fingerprint at a specific time and, when valid, a GPS position."),
+    ("Sample", "One timestamped wardriving snapshot. A sample may contain several cell observations because the modem can report a serving cell and neighbor cells."),
+    ("Serving cell", "The radio cell currently providing service to the modem."),
+    ("Neighbor cell", "A nearby cell reported by the modem as a candidate for measurement or reselection. Neighbor detail depends strongly on modem support."),
+    ("PLMN", "Public Land Mobile Network identifier, formed from MCC and MNC. It identifies the broadcast mobile network; it is not the SIM's marketing brand and does not always prove physical site ownership."),
+    ("MCC", "Mobile Country Code, the country portion of a PLMN."),
+    ("MNC", "Mobile Network Code, the network portion of a PLMN."),
+    ("RAT", "Radio Access Technology, such as GSM/2G, UMTS/3G, LTE/4G, or NR/5G."),
+    ("TAC / LAC", "Tracking Area Code in LTE/NR or Location Area Code in GSM/UMTS. It groups cells into a mobility-management area."),
+    ("Cell ID", "A network-assigned cell identifier. It is useful but not globally unique and can be reused."),
+    ("PCI", "Physical Cell Identity, a short LTE/NR radio-layer identifier reused geographically. It helps distinguish radio sectors but is not globally unique."),
+    ("EARFCN", "E-UTRA Absolute Radio Frequency Channel Number, an LTE channel number that identifies the carrier frequency."),
+    ("Fingerprint", "The dashboard's full identity tuple: PLMN/operator, RAT, TAC/LAC, Cell ID, PCI, and EARFCN."),
+    ("Coarse identity", "PLMN/operator, RAT, TAC/LAC, and Cell ID, deliberately excluding PCI and EARFCN so their changes can be measured."),
+    ("RSRP", "Reference Signal Received Power, an LTE reference-signal strength measurement, normally expressed in dBm."),
+    ("RSRQ", "Reference Signal Received Quality, an LTE quality measurement influenced by signal and interference."),
+    ("RSSI", "Received Signal Strength Indicator. Its exact meaning and units depend on the modem and RAT."),
+    ("SINR / RSSNR", "Signal-to-interference-plus-noise ratio. Larger values generally mean a cleaner radio link."),
+    ("NMEA", "A line-oriented format emitted by many GPS receivers. This project parses GGA, RMC, GSA, GSV, and GLL sentences."),
+    ("GPS fix", "A receiver solution for position. Validity is checked using NMEA status, fix quality/type, or modem fix status."),
+    ("Place bucket", "A small map tile used to build local context. Import uses zoom 17; dwell/visit analysis consolidates context at zoom 16."),
+    ("Stationary segment", "At least 60 seconds of valid positions remaining within 25 m of an anchor, with implied speed at most 1.0 m/s and reported speed at most 1.2 m/s."),
+    ("Opportunity window", "A fixed 10-minute interval in which comparable same-source, same-PLMN, same-RAT coverage existed. Multiple polls inside one window do not create independent evidence."),
+    ("Visit", "A group of local observations separated from another visit by more than six hours. Visits prevent one long stay from pretending to be repeated independent returns."),
+    ("Feature", "A numerical or categorical summary computed from raw observations, such as days seen, GPS spread, detection rate, or PCI change rate."),
+    ("Gate", "A minimum-data or logical requirement that must be satisfied before a method can contribute evidence."),
+    ("clamp(x, 0, 1)", "Limit x to the interval from zero to one. Values below zero become zero and values above one become one."),
+    ("Normalized strength (norm01)", "A method's evidence strength on a zero-to-one scale after gates and any altitude/family adjustment."),
+    ("Median", "The middle value after sorting. It is less sensitive to extreme values than the arithmetic mean."),
+    ("MAD", "Median absolute deviation: median(|xᵢ − median(x)|). It is a robust measure of spread."),
+    ("Robust z-score", "A value's distance from a dataset median measured in MAD-based scale units. It compares a tower with the observed dataset baseline."),
+    ("Prior probability", "The score assigned before tower-specific evidence. The current default is 0.0001, or 0.01%."),
+    ("Odds", "p/(1−p), an alternative representation of probability p."),
+    ("Logit / log-odds", "log(p/(1−p)). Evidence is added in log-odds space, where positive values raise and negative values lower suspicion."),
+    ("Evidence family", "A group of correlated methods, such as location/GPS methods. A family cap prevents several descriptions of the same behavior from being counted as independent proof."),
+    ("Shadow method", "A method that is evaluated and explained but disabled, so its contribution to the live score is exactly zero."),
+    ("Posterior score", "The probability-like ranking value after adding enabled, capped evidence to the prior. It is a review priority, not a validated probability that a cell is malicious."),
+    ("False positive", "A normal cell ranked as suspicious."),
+    ("Cell-site simulator", "Equipment that impersonates or emulates cellular infrastructure. These AT-level summaries alone cannot prove that a cell is a simulator."),
+]
+
+
+METHOD_EDUCATIONAL_NOTES: Dict[str, str] = {
+    "new_in_well_covered_place": "The method asks a counterfactual question: if this Cell ID were a normal established local cell, why was it absent during comparable earlier coverage? Prior absence and repeated current presence are multiplied, so weakness in either part limits the result.",
+    "disappears_despite_coverage": "This legacy rule scales later raw row count between two thresholds. Because fast polling and long stays manufacture rows, it is disabled and retained only for comparison with the visit-aware replacement.",
+    "new_area_code_in_well_covered_place": "This legacy rule multiplies the amount of earlier local coverage by the dominance of the earlier TAC/LAC. Raw counts and mixed modem encodings can exaggerate it, so it is disabled.",
+    "multi_location_stationary": "The separation between the two largest stationary-only clusters is mapped from zero at the start threshold to one at the full threshold. Stationary filtering makes ordinary device travel a less plausible explanation.",
+    "multi_location": "The same calculation is applied to all valid GPS observations. It is weaker than the stationary-only version because a moving route, cell-ID reuse, or directional coverage can form separated clusters naturally.",
+    "gps_spread": "The median distance of retained observations from the robust center is scaled between the configured start and full distances. It measures inconsistency of observation geometry, not the physical radius of the tower.",
+    "center_drift": "Observations are divided into weekly bins, a robust center is estimated for each bin, and the largest distance between weekly centers is normalized. Drift can reflect reuse or route changes as well as a real network change.",
+    "signal_distance_mismatch": "A robust Theil–Sen model predicts signal from log₁₀(distance+1). The fraction of residuals at least four MAD from the residual median is normalized; enough model points are required first.",
+    "stationary_signal_mad": "The tower's stationary signal MAD is compared with the distribution across towers. Its robust z-score is normalized from the configured start z to full z, after a minimum stationary sample gate.",
+    "stationary_jump_rate": "Within each stationary segment, the method counts consecutive signal changes of at least eight dB-like units. The resulting rate is compared with the dataset baseline through a robust z-score.",
+    "stationary_pci_churn": "For one coarse identity, the fraction of stationary observations that change PCI is compared with other towers. The full fingerprint is intentionally not used here, because PCI is the value being tested for change.",
+    "stationary_earfcn_churn": "This mirrors PCI churn but tests LTE frequency-channel changes. It is contextual evidence because legitimate carrier aggregation, reselection, or modem reporting can also change EARFCN.",
+    "ephemeral_stationary_opportunity": "This legacy ratio compares the tower's stationary span with a wall-clock opportunity span. It is disabled because duration and polling density are not independent trials; the fixed-window transient method is preferred.",
+    "place_change_correlation": "This legacy rule measures how concentrated a tower is in place buckets whose overall radio behavior changed. Shared network changes can repeat this evidence across many cells, so it is disabled.",
+    "transient_activation_v2": "Four bounded components are multiplied: earlier coverage, density of a fixed short activation burst, later coverage, and a conservative burst-to-later detection-rate drop. Multiple visits and fixed windows prevent scan frequency from dominating.",
+    "visit_aware_disappearance_v2": "A reliable earlier detection rate is estimated first. The method then asks how surprising zero detections are in later comparable windows using a beta posterior-predictive probability, while requiring genuinely later visits.",
+    "local_tac_novelty_v2": "Earlier visits must establish one dominant local TAC/LAC. A different TAC/LAC must then repeat in enough current windows and occupy enough current opportunities. Only one representative cell scores a shared new-TAC episode.",
+    "per_cell_visit_change_v2": "Fixed earlier and recent visit phases are compared. The median change among comparable peer cells is subtracted, leaving a cell-specific residual; detection-rate and signal evidence compete via their maximum rather than being double-counted.",
+    "rat_transition_surprise": "A smoothed transition model learns usual RAT changes in each place. Average negative log-probability is higher for unusual transitions, then normalized between the configured surprise thresholds.",
+    "non_lte_when_mostly_lte": "This contributes a fixed small amount only when the candidate is GSM/2G and at least 80% of the dataset is LTE. It is deliberately weak because legitimate 2G remains deployed in some networks.",
+    "wigle_absent": "After an explicit lookup, failure to find an exact PLMN/TAC-LAC/Cell-ID match contributes a fixed amount. Database incompleteness prevents absence from being treated as proof.",
+    "wigle_historical_presence": "Two normality terms are multiplied: how old the earliest exact record is and how recent the latest record is. The contribution is negative, so long, recent external history lowers suspicion.",
+    "dwell_stability": "Stable detection across independent 10-minute windows, days, and revisits creates bounded normality credit with diminishing returns. Repeated raw polls in one window add no credit.",
+    "stability": "A composite stability bonus rewards multi-day, stationary, geographically compact behavior. The bonus is divided by 1.5 and clamped before its negative weight is applied.",
+    "many_days": "Distinct days seen are scaled from no credit at the start threshold to full normality credit at the full threshold. Many samples on one day do not substitute for multiple days.",
+}
+
+
+EVIDENCE_FAMILY_DESCRIPTIONS: Dict[str, str] = {
+    "cell_lifecycle": "appearance, novelty, burst, and disappearance over independent local coverage",
+    "location_gps": "geographic spread, clustering, center drift, and signal-versus-distance consistency",
+    "radio_stability": "signal or per-cell radio behavior while stationary or across visits",
+    "network_identity": "RAT, PCI, and EARFCN identity consistency",
+    "place_context": "how the cell relates to radio behavior learned for the same place",
+    "external": "explicit WiGLE lookup evidence",
+    "normality": "repeated stable history that lowers suspicion",
+    "manual": "operator review decisions",
+}
+
+
+def build_help_guide_html(methods: Sequence[Dict[str, Any]], app_config: Dict[str, Any]) -> str:
+    """Build the dashboard's self-contained, implementation-matched tutorial."""
+
+    esc = lambda value: html.escape(str(value if value is not None else ""))
+    registry_order = {item["id"]: index for index, item in enumerate(METHOD_REGISTRY)}
+    ordered_methods = sorted(methods, key=lambda item: registry_order.get(item.get("id"), 10_000))
+    family_order = ["cell_lifecycle", "location_gps", "radio_stability", "network_identity", "place_context", "external", "normality"]
+    grouped: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for method in ordered_methods:
+        grouped[METHOD_EVIDENCE_FAMILIES.get(str(method.get("id") or ""), "other")].append(method)
+
+    method_parts: List[str] = []
+    method_number = 0
+    for family in family_order + [name for name in grouped if name not in family_order]:
+        family_methods = grouped.get(family) or []
+        if not family_methods:
+            continue
+        method_parts.append(
+            f'<h3>{esc(family.replace("_", " ").title())}</h3>'
+            f'<p>{esc(EVIDENCE_FAMILY_DESCRIPTIONS.get(family, "Related evidence methods."))}. '
+            'Methods in this family are capped together during ensemble scoring.</p>'
+        )
+        for method in family_methods:
+            method_number += 1
+            enabled = bool(method.get("enabled"))
+            direction = str(method.get("direction") or "up")
+            spec = METHOD_XAI_SPECS.get(str(method.get("id") or ""), {})
+            threshold_rows = "".join(
+                '<tr>'
+                f'<td><code>{esc(key)}</code></td><td><code>{esc(json.dumps(value, ensure_ascii=False))}</code></td>'
+                f'<td>{esc(glossary_definition(str(key)))}</td></tr>'
+                for key, value in (method.get("thresholds") or {}).items()
+            ) or '<tr><td colspan="3">This method has no editable numeric threshold.</td></tr>'
+            variable_rows = "".join(
+                f'<tr><td><code>{esc(name)}</code></td><td>{esc(glossary_definition(str(name)))}</td></tr>'
+                for name in (method.get("variables") or [])
+            )
+            state_text = "Active: contributes when its gates pass" if enabled else "Disabled/shadow: computed, but contributes zero"
+            method_parts.append(f"""
+            <article class="card help-method" id="method-{esc(method.get('id'))}">
+              <h3>{method_number}. {esc(method.get('label'))}</h3>
+              <div class="help-method-meta">
+                <span class="help-chip {'active' if enabled else 'inactive'}">{esc(state_text)}</span>
+                <span class="help-chip {esc(direction)}">Direction: {esc(direction)}</span>
+                <span class="help-chip">Family: {esc(family)}</span>
+                <span class="help-chip">Weight: {esc(method.get('weight'))}</span>
+              </div>
+              <p>{esc(method.get('help'))}</p>
+              <p><strong>Decision gate.</strong> {esc(spec.get('trigger_summary') or 'The method contributes only after its required inputs and configured thresholds are satisfied.')}</p>
+              <span class="help-equation">{esc(method.get('equation'))}</span>
+              <p><strong>How to read the equation.</strong> {esc(METHOD_EDUCATIONAL_NOTES.get(str(method.get('id') or ''), method_equation_note(str(method.get('equation') or ''))))}</p>
+              <p>After the equation produces a strength from 0 to 1, the uncapped contribution is <code>Δ = {'−' if direction == 'down' else '+'} weight × norm01</code>. A disabled method always has effective <code>Δ = 0</code>.</p>
+              <details><summary>Configured thresholds and gates</summary><table><tr><th>Name</th><th>Current value</th><th>Meaning</th></tr>{threshold_rows}</table></details>
+              <details><summary>Input variables used by this method</summary><table><tr><th>Variable</th><th>Definition</th></tr>{variable_rows}</table></details>
+            </article>""")
+
+    config_rows = "".join(
+        f'<tr><td><code>{esc(key)}</code></td><td><code>{esc(value)}</code></td><td>{esc(GLOBAL_CONFIG_HELP.get(key, ""))}</td></tr>'
+        for key, value in app_config.items()
+    )
+    terminology = "".join(
+        f'<div class="help-definition"><dt>{esc(term)}</dt><dd>{esc(definition)}</dd></div>'
+        for term, definition in HELP_TERMINOLOGY
+    )
+    variables = "".join(
+        f'<tr><td><code>{esc(name)}</code></td><td>{esc(definition)}</td></tr>'
+        for name, definition in sorted(VARIABLE_GLOSSARY.items())
+    )
+    family_caps = "".join(
+        f'<tr><td><code>{esc(family)}</code></td><td>{esc(direction)}</td><td>{esc(cap)}</td><td>{esc(EVIDENCE_FAMILY_DESCRIPTIONS.get(family, ""))}</td></tr>'
+        for (family, direction), cap in EVIDENCE_FAMILY_CAPS.items()
+    )
+
+    return f"""
+    <article class="help-guide">
+      <h1>How Hack-Wanderer turns modem readings into reviewable tower anomalies</h1>
+      <p class="help-lead">This guide starts at the serial cable and follows one observation through capture, GPS validation, database import, feature engineering, anomaly methods, ensemble scoring, and human review. Every threshold and equation below describes the implementation currently running in this dashboard.</p>
+
+      <div class="help-callout warning"><strong>What the result means.</strong> The dashboard ranks cellular fingerprints that are unusual or inconsistent with this dataset. It does not prove that a cell is malicious, identify a cell-site simulator, or attribute equipment to police, a government, an operator, or any other actor. Typical USB modems expose summaries through AT commands; they do not provide the complete NAS/RRC/SIB and ciphering-event evidence used by specialized cellular-security sensors.</div>
+
+      <nav class="help-toc" aria-label="Help contents">
+        <a href="#help-overview">1. Complete pipeline</a>
+        <a href="#help-capture">2. Cellular data capture and AT commands</a>
+        <a href="#help-gps">3. GPS capture and validation</a>
+        <a href="#help-import">4. Import, cleaning, and normalization</a>
+        <a href="#help-identity">5. Identities, places, windows, and visits</a>
+        <a href="#help-features">6. Feature engineering</a>
+        <a href="#help-methods">7. Every anomaly and normality method</a>
+        <a href="#help-ensemble">8. Ensemble decision and equations</a>
+        <a href="#help-review">9. How to investigate a result</a>
+        <a href="#help-dictionary">10. Dictionary of terminology</a>
+      </nav>
+
+      <section id="help-overview">
+        <h2>1. The complete pipeline</h2>
+        <p>The unit of collection is a timestamped <em>sample</em>. Each sample combines the modem's cellular reports with the best available GPS fix. A sample can contain multiple <em>observations</em>: usually a serving cell and, when supported, neighbor cells. The import process preserves the raw JSON, creates normalized database rows, and connects every cell observation to the sample that supplied its time and position.</p>
+        <div class="help-flow" role="img" aria-label="Pipeline from modem to human review">
+          <div class="help-flow-step"><strong>1. Modem</strong><br>AT commands and vendor responses</div><div class="help-flow-arrow">→</div>
+          <div class="help-flow-step"><strong>2. Snapshot</strong><br>Cellular fields + GPS + UTC time</div><div class="help-flow-arrow">→</div>
+          <div class="help-flow-step"><strong>3. JSONL</strong><br>One immutable JSON object per polling cycle</div><div class="help-flow-arrow">→</div>
+          <div class="help-flow-step"><strong>4. SQLite</strong><br>Samples, cells, observations, metadata</div><div class="help-flow-arrow">→</div>
+          <div class="help-flow-step"><strong>5. Features</strong><br>Geometry, time, radio, lifecycle</div><div class="help-flow-arrow">→</div>
+          <div class="help-flow-step"><strong>6. Evidence</strong><br>Gated methods normalized to 0…1</div><div class="help-flow-arrow">→</div>
+          <div class="help-flow-step"><strong>7. Review</strong><br>Capped ensemble score + explanations</div>
+        </div>
+        <p>The raw observations are the evidence record. Recompute changes derived features and scores but does not rewrite those observations. This separation lets you tune thresholds without silently changing what was captured.</p>
+      </section>
+
+      <section id="help-capture">
+        <h2>2. Cellular data capture and AT commands</h2>
+        <h3>2.1 Opening and initializing the modem</h3>
+        <p><code>hack-wanderer.py</code> opens a serial AT-control port. When the configured port is missing or set to automatic, it probes stable Linux device aliases and common USB serial paths by sending <code>AT</code> and looking for <code>OK</code>. Initialization disables command echo with <code>ATE0</code> and enables verbose modem errors with <code>AT+CMEE=2</code>. Manufacturer, model, firmware revision, and IMEI are diagnostic metadata; they are not tower evidence.</p>
+
+        <h3>2.2 SIM data is kept separate from tower identity</h3>
+        <p><code>AT+CPIN?</code> checks whether the SIM is ready, <code>AT+CCID</code> reads the SIM-card identifier, and <code>AT+CIMI</code> reads the subscriber identity. These values describe the subscriber and SIM. They must not be used as the owner of a Cell ID. In particular, an alphanumeric operator name can be supplied by SIM EONS/SPN branding. The collector therefore requests numeric <code>AT+COPS</code> format and uses the numeric PLMN as the network identity fallback.</p>
+        <div class="help-callout"><strong>Example.</strong> A Tesco Mobile SIM may show Tesco branding while it is served by O2 Czech Republic. The tower key should use broadcast PLMN <code>230-02</code>, not the SIM marketing name.</div>
+
+        <h3>2.3 Standard registration and signal commands</h3>
+        <table>
+          <tr><th>Command</th><th>What it supplies</th><th>How the dashboard uses it</th></tr>
+          <tr><td><code>AT+CREG=2</code>, <code>AT+CREG?</code></td><td>Detailed circuit-switched/GSM registration, including status and sometimes LAC/Cell ID.</td><td>Fallback registration identity for 2G/3G-capable modem reports.</td></tr>
+          <tr><td><code>AT+CGREG=2</code>, <code>AT+CGREG?</code></td><td>Packet/GPRS registration status and sometimes LAC/Cell ID.</td><td>Fallback when a richer EPS registration is unavailable.</td></tr>
+          <tr><td><code>AT+CEREG=2</code>, <code>AT+CEREG?</code></td><td>EPS/LTE registration status, TAC, Cell ID, and access-technology code when the modem reports them.</td><td>Preferred standard serving-registration record.</td></tr>
+          <tr><td><code>AT+COPS=3,2</code>, <code>AT+COPS?</code></td><td>The currently registered network in numeric PLMN form plus RAT code.</td><td>Serving-cell PLMN fallback. Alphanumeric SIM branding is deliberately not treated as tower ownership.</td></tr>
+          <tr><td><code>AT+CSQ</code></td><td>Coarse RSSI index and bit-error rate.</td><td>Fallback signal when no per-cell metric is available.</td></tr>
+          <tr><td><code>AT+COPS=?</code></td><td>A slow scan of available networks.</td><td>Optional context only; disabled by default because it can take a long time and is not a Cell-ID scan.</td></tr>
+        </table>
+
+        <h3>2.4 Vendor-specific serving and neighbor detail</h3>
+        <p>AT standards do not guarantee the same cell detail on every modem. The collector therefore makes best-effort vendor queries. On SIMCom devices, <code>AT+CPSI?</code> can supply RAT, PLMN, TAC/LAC, serving Cell ID, PCI, band, EARFCN, bandwidth, RSRP, RSRQ, RSSI, and RSSNR. <code>AT+CNSMOD?</code> supplies the current system mode. On Quectel devices, <code>AT+QNWINFO</code>, <code>AT+QCSQ</code>, <code>AT+QENG=&quot;servingcell&quot;</code>, and <code>AT+QENG=&quot;neighbourcell&quot;</code> can provide richer network, channel, signal, serving-cell, and neighbor-cell records.</p>
+        <p>An <code>ERROR</code> from an unsupported vendor command means that field is unavailable; it does not invalidate fields obtained through other commands. A neighbor report may omit Cell ID or PLMN. Missing data remains missing unless the registered numeric PLMN is a defensible serving-network fallback. The pipeline never invents PCI, EARFCN, Cell ID, or signal measurements.</p>
+
+        <h3>2.5 What one wardriving snapshot contains</h3>
+        <p>Each polling cycle records UTC and local timestamps, timezone, standard network registration, numeric PLMN, vendor responses, modem GPS, external GPS, the chosen location, scan activity, and normalized tower entries. A tower entry can contain source, RAT, PLMN/MCC/MNC, TAC/LAC, Cell ID, PCI, EARFCN, band, and available signal metrics. The snapshot is appended as one JSON line to a per-run file and is also written to the live status page.</p>
+        <div class="help-callout warning"><strong>Measurement boundary.</strong> These fields describe what the modem reports from its current radio context. They do not expose every broadcast system-information block, identity request, authentication exchange, ciphering choice, or handover message. Absence of such low-level evidence must not be interpreted as evidence that an anomaly is safe or malicious.</div>
+      </section>
+
+      <section id="help-gps">
+        <h2>3. GPS capture and validation</h2>
+        <h3>3.1 Location sources</h3>
+        <p>The preferred source is an external serial NMEA receiver. The parser combines <code>RMC</code> for validity, time, position, speed, and course; <code>GGA</code> for fix quality, satellites, HDOP, and altitude; <code>GSA</code> for fix type and dilution; <code>GSV</code> for satellites in view; and <code>GLL</code> as another position/status source. If the external receiver has no position, modem GNSS from commands such as <code>AT+CGNSINF</code> is used. The chosen location is explicitly labeled <code>gps_device</code> or <code>lte_modem</code>.</p>
+
+        <h3>3.2 Valid-fix checks</h3>
+        <p>An external fix is considered valid when NMEA status is <code>A</code>, fix quality is greater than zero, or fix type is at least two-dimensional. A modem fix requires a positive modem fix-status value. If the selected source explicitly reports no fix, its coordinates are retained for audit when present but marked bad and excluded from reliable geographic inference.</p>
+
+        <h3>3.3 Impossible-jump cleaning</h3>
+        <p>For consecutive valid positions, the importer computes great-circle distance with the haversine equation and divides by elapsed time. If implied speed exceeds 60 m/s, the later point is marked <code>bad_gps</code>. The point is preserved so the user can inspect it, but it cannot establish a robust tower center, a local baseline, stationary evidence, or visit-aware novelty.</p>
+        <span class="help-equation">a = sin²(Δφ/2) + cos(φ₁)cos(φ₂)sin²(Δλ/2)
+d = 2R·asin(√a)
+v = d / Δt</span>
+        <p>Here <code>φ</code> is latitude in radians, <code>λ</code> is longitude, <code>R</code> is Earth's mean radius, <code>d</code> is distance in metres, and <code>v</code> is implied speed.</p>
+
+        <h3>3.4 Stationary detection</h3>
+        <p>A stationary segment must remain within 25 m of its anchor for at least 60 seconds. Consecutive implied speed must be at most 1.0 m/s, and direct receiver speed, when available, must be at most 1.2 m/s. A failed condition starts a new candidate segment. Stationary evidence is valuable because it removes much of the variation caused by the receiver moving through a cell's coverage area.</p>
+
+        <h3>3.5 Altitude correction</h3>
+        <p>A high floor or overlook can legitimately reveal distant cells. Raw sea-level altitude is therefore not compared across the whole dataset. Within each place bucket, the importer rejects abnormally low altitude values below <code>Q1 − k·IQR</code>, then uses the minimum retained altitude as a local floor. Relative altitude is the observation altitude minus that floor.</p>
+        <span class="help-equation">relative_altitude = max(0, altitude − local_floor)
+altitude_factor = max(min_confidence, 0.5^((relative_altitude − no_discount_height) / half_value_height))</span>
+        <p>The factor is one below the no-discount height. Above it, evidence halves once per configured half-value height and never falls below the configured minimum. Geographic and stationary radio methods multiply their strength by this factor; observations are softened rather than erased.</p>
+        <table><tr><th>Altitude setting</th><th>Current value</th><th>Meaning</th></tr>{config_rows}</table>
+      </section>
+
+      <section id="help-import">
+        <h2>4. Import, cleaning, and database normalization</h2>
+        <p>The importer streams JSONL one line at a time. Malformed lines increment an error count instead of stopping the entire file. Each file is identified by resolved path, byte size, modification time, and SHA-256 digest. Each sample and observation also receives a deterministic identifier, so importing the same unchanged file again is idempotent: it does not duplicate evidence.</p>
+        <h3>4.1 Preserved and normalized data</h3>
+        <p><code>raw_samples</code> stores timestamp, chosen coordinates, valid altitude, GPS metadata, bad-GPS flag, place bucket, and the complete raw JSON. <code>towers</code> stores one row per full fingerprint. <code>tower_observations</code> connects a sample to a tower with signal metric, observation source, stationary state, raw cell JSON, and location-quality state. <code>import_files</code> records provenance and counts.</p>
+        <h3>4.2 Cleaning is exclusion with traceability</h3>
+        <p>Missing identifiers remain null. Invalid/no-fix and impossible-jump coordinates are not used for geographic scoring, yet their observations remain queryable and appear in the weird-GPS warning layer. Ignored observations and ignored towers remain stored but are omitted from baseline construction. This design makes cleaning reversible and inspectable.</p>
+        <h3>4.3 Signal selection</h3>
+        <p>The pipeline prefers a per-cell signal in this order: RSRP, RSSI dBm, RSSI, RSSNR, then RSRQ. If none exists, it falls back to sample-level <code>AT+CSQ</code> RSSI dBm. Signal comparisons are kept source-, metric-, and EARFCN-aware where required because unlike quantities or modem encodings should not be mixed.</p>
+      </section>
+
+      <section id="help-identity">
+        <h2>5. Identities, places, windows, and visits</h2>
+        <h3>5.1 Full and coarse tower identities</h3>
+        <span class="help-equation">full fingerprint = (PLMN, RAT, TAC/LAC, Cell ID, PCI, EARFCN)
+coarse identity = (PLMN, RAT, TAC/LAC, Cell ID)</span>
+        <p>The full fingerprint separates observed radio configurations. The coarse identity groups those variants so the system can ask whether PCI or EARFCN changed. Neither identity is a globally guaranteed physical-site identifier: networks reuse identifiers and a sector is not necessarily a whole mast.</p>
+
+        <h3>5.2 Local place context</h3>
+        <p>Valid coordinates are converted to zoom-17 map tiles for fine local context. Visit-aware dwell analysis uses zoom-16 venues to avoid splitting one real location across very small tile boundaries. A place baseline is always learned from this dataset; the model does not assume that every city or route has the same radio environment.</p>
+
+        <h3>5.3 Independent opportunity windows</h3>
+        <p>Raw polling rows are correlated. Ten polls taken while standing still are not ten independent confirmations. The pipeline therefore divides time into fixed 10-minute windows. A window is comparable only when the same observation source, PLMN/operator, and RAT were being measured. A Cell ID's detection rate is:</p>
+        <span class="help-equation">detection_rate = windows_containing_the_cell / comparable_opportunity_windows</span>
+        <p>Neighbor, CPSI, and registration sources remain separate because they expose different subsets of cells and can encode TAC/LAC differently.</p>
+
+        <h3>5.4 Independent visits</h3>
+        <p>Observations in the same venue belong to one visit until a gap exceeds six hours. Crossing midnight does not create a new visit. Multiple completed visits are stronger than one long dwell because they represent independent returns to the location.</p>
+      </section>
+
+      <section id="help-features">
+        <h2>6. Feature engineering</h2>
+        <p>A feature is a reproducible summary derived from observations. Methods do not score raw JSON directly; they score features after checking whether enough evidence exists.</p>
+
+        <h3>6.1 Robust center and geographic spread</h3>
+        <p>The center starts at median latitude/longitude. Distances from that center are computed, points beyond <code>median(distance) + 3.5·MAD(distance)</code> are trimmed, and a mildly signal-weighted trimmed mean produces the final center. The reported spread is the median distance of retained points from that center. This point is an observation center, not a claimed antenna coordinate.</p>
+        <span class="help-equation">MAD(x) = median(|xᵢ − median(x)|)
+gps_spread = median(distance(retained_pointᵢ, robust_center))</span>
+
+        <h3>6.2 Clusters and time drift</h3>
+        <p>A dependency-free greedy clusterer assigns a point to the nearest cluster center within 400 m or starts a new cluster. The distance between the two largest clusters becomes a multi-location feature. The same calculation is repeated with stationary-only points. Separately, points are grouped into seven-day bins and the maximum distance between robust weekly centers measures temporal drift.</p>
+
+        <h3>6.3 Signal-versus-distance residuals</h3>
+        <p>With at least 12 signal-bearing points, a Theil–Sen robust slope models signal against <code>log10(distance+1)</code>. The intercept is the median residual offset. A residual is an outlier when its distance from the residual median is at least four residual MAD. The feature is the fraction of such outliers.</p>
+        <span class="help-equation">signalᵢ ≈ a + b·log₁₀(distanceᵢ + 1)
+outlier_fraction = count(|residualᵢ − median(residual)| ≥ 4·MAD(residual)) / n</span>
+
+        <h3>6.4 Dataset-relative radio stability</h3>
+        <p>Stationary signal MAD, large-jump rate, PCI-change rate, and EARFCN-change rate are computed per tower or coarse identity. Each is compared with the distribution across eligible towers using a robust z-score. The dashboard therefore asks whether a cell is unstable relative to what this modem observed in this dataset, rather than applying one universal radio threshold.</p>
+        <span class="help-equation">robust_z = (candidate_value − dataset_median) / dataset_MAD_scale</span>
+
+        <h3>6.5 Lifecycle and local-context features</h3>
+        <p>Window and visit features describe prior absence, current repetition, fixed activation bursts, later absence, dominant local TAC/LAC, and peer-adjusted changes. These features use only compatible sources and independent windows. They also select one primary coarse identity when several PCI/EARFCN variants describe the same event, preventing duplicated evidence.</p>
+
+        <h3>6.6 Normality features</h3>
+        <p>The system calculates evidence against suspicion as well as evidence for it. Distinct days, independent visits, stable windows, compact geography, and repeatable detection lower the final score. This is essential: a detector that only adds suspicion will inevitably rank frequently observed normal infrastructure too highly.</p>
+      </section>
+
+      <section id="help-methods">
+        <h2>7. Every anomaly and normality method</h2>
+        <p>Every method first applies gates, then calculates a normalized evidence strength <code>norm01</code> between zero and one. An <strong>up</strong> method raises suspicion; a <strong>down</strong> method supplies normality evidence. The state shown below comes from the current database settings. A disabled method is still computed for explanation and candidate review, but its effective score contribution is exactly zero.</p>
+        {''.join(method_parts)}
+      </section>
+
+      <section id="help-ensemble">
+        <h2>8. How the methods become one decision score</h2>
+        <h3>8.1 Normalize, weight, and set direction</h3>
+        <p>Most continuous methods use the same ramp. Evidence is zero at or below a start threshold, increases linearly, and reaches one at the full threshold. Logical and sample-size gates must also pass.</p>
+        <span class="help-equation">norm01 = clamp((value − start) / (full − start), 0, 1)
+raw Δlogodds = direction × weight × norm01 × altitude_factor</span>
+        <p><code>direction</code> is +1 for suspicious evidence and −1 for normality evidence. Disabled methods replace the effective delta with zero. Because weights are heuristic rather than calibrated likelihood ratios from labeled ground truth, the final number is a ranking score with probability-like presentation.</p>
+
+        <h3>8.2 Cap correlated evidence families</h3>
+        <p>Several methods can describe the same underlying behavior. For example, GPS spread, multi-location clusters, and center drift may all rise because of one route pattern. Within each family and direction, raw absolute deltas are summed. If the sum exceeds the family cap, every contribution in that group is multiplied by the same scale:</p>
+        <span class="help-equation">family_scale = min(1, family_cap / Σ|raw Δᵢ|)
+effective Δᵢ = raw Δᵢ × family_scale</span>
+        <table><tr><th>Family</th><th>Direction</th><th>Cap in log-odds</th><th>What it groups</th></tr>{family_caps}</table>
+
+        <h3>8.3 Add evidence in log-odds space</h3>
+        <p>The default prior is <code>p₀ = 0.0001</code>. Probability is converted to log-odds, effective deltas are added, and the logistic function converts the result back:</p>
+        <span class="help-equation">logit(p) = ln(p / (1 − p))
+Lposterior = logit(p₀) + Σ effective Δᵢ − 4·I(ignored)
+posterior = 1 / (1 + e^(−Lposterior))</span>
+        <p>Marking a tower known adds manual <code>Δ = −2</code> before the total is computed. Marking it ignored applies an additional <code>−4</code> adjustment and excludes it from normal map views and baseline-building paths. The drawer shows each method's raw delta, family scale, effective delta, odds multiplier <code>e^Δ</code>, and the running before/after score.</p>
+
+        <h3>8.4 Bayes score versus Rules score</h3>
+        <p>The Bayes score is the posterior formula above and includes suspicious evidence, normality evidence, caps, and manual adjustments. The Rules score is the sum of the magnitudes of triggered positive effective deltas. It is useful for seeing how much positive evidence fired, but it does not represent a probability and does not subtract normality evidence.</p>
+        <div class="help-callout warning"><strong>Do not use a single cutoff as a verdict.</strong> A high score means “review this fingerprint and its observations first.” It does not mean “this is an IMSI catcher.” The prior and method weights have not been calibrated against a representative labeled population of benign towers and confirmed simulators.</div>
+      </section>
+
+      <section id="help-review">
+        <h2>9. How to investigate a result</h2>
+        <p>Start with the tower drawer rather than the score alone. Confirm that the PLMN, RAT, TAC/LAC, Cell ID, PCI, EARFCN, and observation source make sense. Check location quality and exclude conclusions supported mainly by weird GPS. Read every triggered method's gate values and equation inputs. Then inspect its raw and stationary points, place buckets, clusters, first/last timestamps, and independent visits.</p>
+        <p>Look for alternative explanations before labeling the result: identifier reuse, network sharing, roaming, a network retune, modem firmware differences, mixed registration/CPSI encodings, indoor attenuation, an elevated observation point, a changed route, sparse earlier coverage, or incomplete WiGLE coverage. Compare peer cells from the same source, PLMN, RAT, place, metric, and channel. A shared shift is more consistent with environment or network-wide change than with one anomalous Cell ID.</p>
+        <p>Use manual metadata to record what was checked. Mark a tower <em>known</em> only after verification; use notes and analysis tags to preserve reasoning. Export the report when sharing a candidate so the identity, equations, thresholds, features, and uncertainty travel with the conclusion.</p>
+      </section>
+
+      <section id="help-dictionary">
+        <h2>10. Dictionary of terminology</h2>
+        <dl class="help-dictionary">{terminology}</dl>
+        <details><summary>Complete feature and threshold variable dictionary</summary>
+          <p>This table defines the implementation-level names shown in method explanations and exports.</p>
+          <table><tr><th>Variable</th><th>Definition</th></tr>{variables}</table>
+        </details>
+      </section>
+    </article>
+    """
+
+
 def index_html() -> str:
     return r"""<!doctype html>
 <html>
@@ -6481,12 +6838,12 @@ def index_html() -> str:
   <style>
     :root{--bg:#0f172a;--panel:#111827;--card:#ffffff;--muted:#64748b;--line:#e5e7eb;--accent:#2563eb;--good:#16a34a;--bad:#dc2626;--warn:#d97706;--drawer-width:min(760px,92vw);--drawer-font-size:16px}
     *{box-sizing:border-box} body{margin:0;font-family:Inter,system-ui,-apple-system,Segoe UI,sans-serif;color:#0f172a;background:#f8fafc}
-    .app{display:grid;grid-template-columns:82px 1fr;height:100vh;overflow:hidden}.nav{background:var(--bg);color:#cbd5e1;display:flex;flex-direction:column;gap:8px;padding:14px 8px}
+    .app{display:grid;grid-template-columns:82px 1fr;height:100vh;height:100dvh;overflow:hidden}.nav{background:var(--bg);color:#cbd5e1;display:flex;flex-direction:column;gap:8px;padding:14px 8px}
     .nav button{background:transparent;border:0;color:inherit;border-radius:14px;padding:10px 6px;cursor:pointer;font-weight:700}.nav button.active,.nav button:hover{background:#1e293b;color:#fff}
-    .main{position:relative;overflow:hidden}.view{display:none;height:100%;overflow:auto}.view.active{display:block}.toolbar{display:flex;gap:10px;align-items:center;padding:12px 16px;border-bottom:1px solid var(--line);background:white;flex-wrap:wrap}
+    .main{position:relative;min-width:0;min-height:0;overflow:hidden}.view{display:none;height:100%;overflow:auto}.view.active{display:block}.toolbar{display:flex;gap:10px;align-items:center;padding:12px 16px;border-bottom:1px solid var(--line);background:white;flex-wrap:wrap}
     input,select,textarea,button{font:inherit} input,select,textarea{border:1px solid #cbd5e1;border-radius:10px;padding:8px 10px;background:white} button.primary{background:var(--accent);color:white;border:0;border-radius:10px;padding:9px 12px;font-weight:800;cursor:pointer}
     button.ghost{background:white;border:1px solid #cbd5e1;border-radius:10px;padding:8px 10px;cursor:pointer}.small{font-size:12px;color:var(--muted)}.badge{display:inline-block;border-radius:999px;padding:3px 8px;font-weight:800;background:#e0f2fe}
-    #map{height:calc(100vh - 58px);width:100%}.drawer{position:absolute;right:18px;top:76px;bottom:18px;width:var(--drawer-width);max-width:95vw;min-width:420px;background:white;border:1px solid var(--line);border-radius:18px;box-shadow:0 18px 60px #0003;z-index:900;display:none;overflow:hidden;font-size:var(--drawer-font-size)}
+    #mapView.view.active{display:flex;flex-direction:column;overflow:hidden}#mapView>.toolbar{flex:0 0 auto}#map{height:auto;min-height:0;flex:1 1 auto;width:100%}.drawer{position:absolute;right:18px;top:76px;bottom:18px;width:var(--drawer-width);max-width:95vw;min-width:420px;background:white;border:1px solid var(--line);border-radius:18px;box-shadow:0 18px 60px #0003;z-index:900;display:none;overflow:hidden;font-size:var(--drawer-font-size)}
     .drawer.open{display:block}.drawer-scroll{position:absolute;inset:0;overflow:auto}.drawer header{position:sticky;top:0;background:white;padding:16px;border-bottom:1px solid var(--line);z-index:20}.drawer .body{padding:16px}.drawer .body h3{margin-top:14px}.drawer-top{display:flex;gap:12px;justify-content:space-between;align-items:flex-start}.drawer-tools{display:flex;gap:8px;flex-wrap:wrap;align-items:center;justify-content:flex-end}.drawer-resizer{position:absolute;left:0;top:0;bottom:0;width:14px;cursor:ew-resize;z-index:30;touch-action:none}.drawer-resizer:before{content:'';position:absolute;left:4px;top:50%;transform:translateY(-50%);width:4px;height:72px;border-radius:999px;background:#cbd5e1}
     .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:14px;padding:16px}
     .card{background:white;border:1px solid var(--line);border-radius:16px;padding:14px;box-shadow:0 1px 2px #0000000a}.card h3{margin:0 0 8px}.grid2{display:grid;grid-template-columns:1fr 1fr;gap:10px}.grid3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}
@@ -6496,7 +6853,7 @@ def index_html() -> str:
     .term-table-wrap{overflow-x:auto;max-width:100%;border:1px solid var(--line);border-radius:12px}.term table{min-width:760px;table-layout:fixed}.term td,.term th{word-break:break-word;overflow-wrap:anywhere}.mini-json{margin:0;max-height:260px;overflow:auto;white-space:pre-wrap;word-break:break-word;background:#f8fafc;border:1px solid #e5e7eb;border-radius:8px;padding:8px;font-size:12px}.value-lines{white-space:pre-wrap;line-height:1.35}
     .feature-table{table-layout:fixed}.feature-table td,.feature-table th{overflow-wrap:anywhere;word-break:break-word}.feature-table code{display:inline-block;max-width:100%}
     .score-filter{display:flex;align-items:center;gap:6px;border:1px solid var(--line);border-radius:12px;padding:6px 8px;background:#f8fafc}.score-filter input[type=range]{width:180px}.score-filter input[type=number]{width:82px;padding:5px 7px}
-    .help{max-width:1100px;padding:22px}.method-row textarea{width:100%;min-height:70px;font-family:ui-monospace,monospace}.pillbar{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0}
+    .help{max-width:1200px;padding:22px 28px 64px;line-height:1.65}.help h1{font-size:34px;line-height:1.15;margin:0 0 10px}.help h2{font-size:25px;margin:42px 0 12px;padding-top:8px;border-top:2px solid #dbeafe;scroll-margin-top:12px}.help h3{margin:24px 0 8px}.help h4{margin:18px 0 6px}.help p{max-width:95ch}.help-lead{font-size:18px;color:#334155}.help-callout{border-left:5px solid var(--accent);background:#eff6ff;border-radius:10px;padding:12px 16px;margin:16px 0}.help-callout.warning{border-left-color:var(--warn);background:#fffbeb}.help-toc{columns:2;column-gap:32px;border:1px solid var(--line);border-radius:14px;padding:14px 20px;background:white}.help-toc a{display:block;color:#1d4ed8;text-decoration:none;padding:3px 0;break-inside:avoid}.help-flow{display:flex;align-items:stretch;gap:8px;overflow-x:auto;padding:8px 0 14px}.help-flow-step{min-width:145px;flex:1;border:1px solid #bfdbfe;border-radius:12px;padding:10px;background:#eff6ff}.help-flow-arrow{align-self:center;color:#2563eb;font-size:22px;font-weight:900}.help-equation{display:block;max-width:100%;overflow-x:auto;background:#0f172a;color:#e2e8f0;border-radius:10px;padding:12px 14px;margin:10px 0;font-family:ui-monospace,SFMono-Regular,monospace;white-space:pre-wrap}.help-method{margin:14px 0;padding:16px 18px}.help-method h3{margin:0 0 8px}.help-method-meta{display:flex;flex-wrap:wrap;gap:7px;margin:8px 0}.help-chip{display:inline-flex;border-radius:999px;padding:3px 9px;background:#e2e8f0;color:#334155;font-size:12px;font-weight:800}.help-chip.active{background:#dcfce7;color:#166534}.help-chip.inactive{background:#fef3c7;color:#92400e}.help-chip.up{background:#fee2e2;color:#991b1b}.help-chip.down{background:#dcfce7;color:#166534}.help details{margin:10px 0}.help summary{cursor:pointer;font-weight:800;color:#1e3a8a}.help table{font-size:14px}.help td code{white-space:normal}.help-dictionary{columns:2;column-gap:24px}.help-definition{break-inside:avoid;border-bottom:1px solid var(--line);padding:8px 0}.help-definition dt{font-weight:800}.help-definition dd{margin:2px 0;color:#475569}.method-row textarea{width:100%;min-height:70px;font-family:ui-monospace,monospace}.pillbar{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0}
     .imports-shell{padding:16px;display:flex;flex-direction:column;gap:14px}.imports-grid{display:grid;grid-template-columns:minmax(420px,2.2fr) minmax(340px,1.5fr) minmax(280px,1fr);gap:14px;align-items:start}.span-all{grid-column:1/-1}
     .status-line{border:1px solid var(--line);border-radius:14px;padding:12px 14px;background:white;font-weight:600}.status-line.idle{color:#334155}.status-line.working{background:#eff6ff;border-color:#bfdbfe;color:#1d4ed8}.status-line.success{background:#ecfdf5;border-color:#bbf7d0;color:#15803d}.status-line.warn{background:#fffbeb;border-color:#fde68a;color:#a16207}.status-line.error{background:#fef2f2;border-color:#fecaca;color:#b91c1c}
     .inline-actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}.upload-stack{display:flex;flex-direction:column;gap:10px}.upload-stack input[type=file]{width:100%;max-width:100%}
@@ -6507,7 +6864,7 @@ def index_html() -> str:
     .meta-editor{border:1px solid var(--line);border-radius:14px;padding:14px;background:#f8fafc}.meta-editor textarea{width:100%;min-height:120px;resize:vertical}.meta-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px}.meta-grid label{display:flex;gap:8px;align-items:center}.note-indicator{font-weight:700}.note-indicator.yes{color:#1d4ed8}.note-indicator.no{color:#64748b}.tag-badge{display:inline-flex;align-items:center;border:1px solid #cbd5e1;border-radius:999px;padding:3px 8px;background:#f8fafc;font-size:12px;font-weight:700}.leaflet-tooltip.point-raw-tooltip,.leaflet-popup.point-raw-tooltip{max-width:min(720px,92vw);min-width:min(320px,92vw);white-space:normal}.point-tooltip{max-width:min(700px,92vw)}.point-tooltip pre{margin:6px 0 0;max-height:180px;overflow:auto;white-space:pre-wrap;word-break:break-word;background:#f8fafc;border:1px solid #e5e7eb;border-radius:8px;padding:8px;font-size:11px}.obs-table td,.obs-table th{vertical-align:top}.obs-table tr.obs-ignored{background:#f8fafc}.obs-table tr.obs-bad{background:#fff7ed}
     .area-legend{background:#fffffff2;border:1px solid #cbd5e1;border-radius:10px;box-shadow:0 2px 12px #0002;padding:9px 10px;min-width:130px;max-width:220px}.area-legend-title{display:flex;align-items:center;justify-content:space-between;gap:10px;font-size:12px;font-weight:800;margin-bottom:6px}.area-legend-close{border:0;background:transparent;color:#64748b;cursor:pointer;font-size:18px;line-height:14px;padding:0 1px}.area-legend-close:hover{color:#0f172a}.area-legend-items{display:flex;flex-direction:column;gap:4px;max-height:240px;overflow:auto}.area-legend-row{display:flex;align-items:center;gap:7px;font-size:12px;white-space:nowrap}.area-legend-swatch{width:12px;height:12px;border:1px solid #fff;border-radius:50%;box-shadow:0 0 0 1px #0003;flex:0 0 auto}.area-legend-count{color:#64748b;margin-left:auto;padding-left:8px}
     @media (max-width: 1180px){.imports-grid{grid-template-columns:1fr 1fr}.imports-grid .stats-card-col,.imports-grid .span-all{grid-column:1/-1}}
-    @media (max-width: 860px){.imports-grid{grid-template-columns:1fr}.imports-grid > *{grid-column:1/-1}.toolbar-note{margin-left:0}}
+    @media (max-width: 860px){.imports-grid{grid-template-columns:1fr}.imports-grid > *{grid-column:1/-1}.toolbar-note{margin-left:0}.help{padding:18px 16px 48px}.help-toc,.help-dictionary{columns:1}.help-flow-arrow{display:none}.help-flow{flex-wrap:wrap}.help-flow-step{min-width:210px}}
   </style>
 </head>
 <body>
@@ -7348,13 +7705,15 @@ function renderAnomalyTable(){
     sortHeader(id,'count','Seen'),
     sortHeader(id,'local_novelty_state','Local evidence'),
     sortHeader(id,'location','Location'),
+    sortHeader(id,'first_seen_ts','First seen'),
+    sortHeader(id,'last_seen_ts','Last seen'),
     sortHeader(id,'operator','Network / PLMN'),
     sortHeader(id,'rat','RAT'),
     sortHeader(id,'tac_lac','TAC/LAC'),
     sortHeader(id,'cell_id','Cell ID'),
     '<th>Triggered anomalies</th>'
   ].join('');
-  document.getElementById(id).innerHTML=`<tr>${headers}</tr>`+sorted.map(t=>`<tr><td><button class="ghost" onclick="showTowerOnMap(${t.id},event)">Show</button></td><td class="score">${pct(t.bayes_post_p)}</td><td class="score">${Number(t.rule_score||0).toFixed(2)}</td><td>${t.total_observation_count??t.count}</td><td>${dwellEvidenceHtml(t)}</td><td>${towerLocationHtml(t)}</td><td>${esc(t.operator_display||t.operator)}</td><td>${esc(t.rat)}</td><td><code>${esc(t.tac_lac)}</code></td><td><code>${esc(t.cell_id)}</code></td><td><div class="pillbar">${(t.triggered_anomalies||[]).map(m=>`<span class="tag-badge" title="${esc(m.why||'')}">${esc(m.label)} <code>+${Number(m.delta_logodds||0).toFixed(2)}</code></span>`).join('')}</div></td></tr>`).join('');
+  document.getElementById(id).innerHTML=`<tr>${headers}</tr>`+sorted.map(t=>`<tr><td><button class="ghost" onclick="showTowerOnMap(${t.id},event)">Show</button></td><td class="score">${pct(t.bayes_post_p)}</td><td class="score">${Number(t.rule_score||0).toFixed(2)}</td><td>${t.total_observation_count??t.count}</td><td>${dwellEvidenceHtml(t)}</td><td>${towerLocationHtml(t)}</td><td>${seenDateHtml(t.first_seen_ts)}</td><td>${seenDateHtml(t.last_seen_ts)}</td><td>${esc(t.operator_display||t.operator)}</td><td>${esc(t.rat)}</td><td><code>${esc(t.tac_lac)}</code></td><td><code>${esc(t.cell_id)}</code></td><td><div class="pillbar">${(t.triggered_anomalies||[]).map(m=>`<span class="tag-badge" title="${esc(m.why||'')}">${esc(m.label)} <code>+${Number(m.delta_logodds||0).toFixed(2)}</code></span>`).join('')}</div></td></tr>`).join('');
 }
 function setTowerMetaStatus(kind,text){
   const el=document.getElementById('towerMetaStatus'); if(!el) return;
@@ -7516,7 +7875,7 @@ async function uploadImport(){
 }
 async function loadStats(){renderStatsBox(await api('/api/stats'))}
 async function loadImports(){const d=await api('/api/imports?limit=500'); renderImportsHistory(d.items||[])}
-async function loadHelp(){const h=await api('/api/help'); window.__helpGlossary=h.glossary||window.__helpGlossary||{}; const cfgRows=Object.entries(h.app_config||{}).map(([k,v])=>`<tr><td><code>${esc(k)}</code></td><td>${typeof v==='number'?Number(v).toFixed(3):esc(v)}</td><td>${esc((h.app_config_help||{})[k]||'')}</td></tr>`).join(''); document.getElementById('helpBox').innerHTML=`<h1>Help</h1><p>${esc(h.summary)}</p><h2>Bayes score</h2><p><code>${esc(h.bayes_equation)}</code></p><h2>Altitude discount model</h2><p>Sea-level altitude is not used directly. The dashboard estimates a local ground/floor altitude per place bucket using a robust minimum, then discounts geo-heavy evidence based on height above that local baseline. With the default settings, about 10 m above local ground gives roughly half evidence.</p><table><tr><th>Config</th><th>Value</th><th>Meaning</th></tr>${cfgRows}</table><h2>Glossary</h2><table><tr><th>Term</th><th>Meaning</th></tr>${Object.entries(h.glossary).map(([k,v])=>`<tr><td><code>${esc(k)}</code></td><td>${esc(v)}</td></tr>`).join('')}</table><h2>Methods</h2>${h.methods.map(m=>`<div class="card"><h3>${esc(m.label)}</h3><p>${esc(m.help)}</p><p><code>${esc(m.equation)}</code></p><p>Variables: ${m.variables.map(v=>`<code>${esc(v)}</code>`).join(' ')}</p></div>`).join('')}`}
+async function loadHelp(){const h=await api('/api/help'); window.__helpGlossary=h.glossary||window.__helpGlossary||{}; document.getElementById('helpBox').innerHTML=h.guide_html||`<h1>Help unavailable</h1><p>${esc(h.summary||'The help guide could not be loaded.')}</p>`}
 document.querySelectorAll('.nav button').forEach(b=>b.onclick=()=>{document.querySelectorAll('.nav button').forEach(x=>x.classList.remove('active')); b.classList.add('active'); document.querySelectorAll('.view').forEach(v=>v.classList.remove('active')); document.getElementById(b.dataset.view).classList.add('active'); setTimeout(()=>map&&map.invalidateSize(),50);});
 document.getElementById('uploadFiles').addEventListener('change',e=>{const files=[...(e.target.files||[])]; document.getElementById('uploadSelection').textContent=files.length?files.map(f=>`${f.name} (${formatBytes(f.size)})`).join(' · '):'No files selected.'});
 renderImportResult(null);
@@ -8068,6 +8427,7 @@ def create_app(db_path: str):
             "methods": methods,
             "app_config": app_config,
             "app_config_help": GLOBAL_CONFIG_HELP,
+            "guide_html": build_help_guide_html(methods, app_config),
             "analysis_status_values": [v for v in ANALYSIS_STATUS_VALUES if v],
             "docs": ["TOWER_INTEL_APP.md", "TOWER_ANOMALY_METHODS.md"],
         }
