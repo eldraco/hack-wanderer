@@ -1022,12 +1022,111 @@ def extract_operator(obj: Dict[str, Any], cell: Optional[Dict[str, Any]] = None)
     return ""
 
 
+def normalize_legacy_registration_cell(
+    cell: Dict[str, Any],
+    sibling_cells: Iterable[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Repair legacy decimalized 3GPP hex fields only with cross-source proof.
+
+    Old collector versions lost the original CREG/CGREG/CEREG token, so an
+    integer alone cannot reveal whether its source text contained A-F. CPSI or
+    QENG from the same sample provides an independent identifier. We therefore
+    reinterpret a field as hexadecimal only when that exact candidate equals a
+    sibling modem source. A TAC that cannot be reconstructed after the Cell ID
+    is proven is cleared from identity use and retained only as audit metadata.
+    """
+    source = str(cell.get("source") or "").lower()
+    if source not in {"registration", "cereg", "cgreg", "creg"}:
+        return cell
+    # Fresh collector output has raw tokens and is fully trustworthy. Legacy
+    # repairs are re-evaluated because a previous pass may have corrected only
+    # one field while the other remained ambiguous.
+    if cell.get("identifier_encoding") == "3gpp_hex" and not cell.get("identifier_repair"):
+        return cell
+
+    sibling_ids = set()
+    sibling_tacs = set()
+    for sibling in sibling_cells:
+        if not isinstance(sibling, dict) or sibling is cell:
+            continue
+        sibling_source = str(sibling.get("source") or "").lower()
+        if sibling_source not in {"cpsi", "qeng_servingcell"}:
+            continue
+        sibling_id = safe_int(
+            sibling.get("cell_id")
+            if "cell_id" in sibling
+            else sibling.get("scell_id")
+        )
+        sibling_tac = safe_int(
+            sibling.get("tac_lac")
+            if "tac_lac" in sibling
+            else sibling.get("tac")
+        )
+        if sibling_id is not None:
+            sibling_ids.add(sibling_id)
+        if sibling_tac is not None:
+            sibling_tacs.add(sibling_tac)
+
+    repaired = dict(cell)
+    changed = []
+    proven = []
+    ambiguous = []
+    for field, peers, raw_field in (
+        ("cell_id", sibling_ids, "cell_id_raw"),
+        ("tac_lac", sibling_tacs, "lac_tac_raw"),
+    ):
+        old = safe_int(cell.get(field))
+        if old is None or old < 0:
+            continue
+        if old in peers:
+            proven.append(field)
+            continue
+        # The legacy buggy value is an integer created from a digit-only
+        # source token. Rebuild that token and parse it as hexadecimal.
+        candidate = int(str(old), 16)
+        if candidate in peers:
+            repaired[field] = candidate
+            repaired[raw_field] = str(old)
+            changed.append(field)
+            proven.append(field)
+
+    # If the Cell ID is independently proven to refer to the same serving
+    # cell, but neither possible TAC interpretation agrees with the vendor
+    # source, the lost token cannot be reconstructed. Do not expose the old
+    # decimalized value as a real TAC or use it for anomaly evidence.
+    old_cell = safe_int(cell.get("cell_id"))
+    candidate_cell = int(str(old_cell), 16) if old_cell is not None and old_cell >= 0 else None
+    cell_is_proven = old_cell in sibling_ids or candidate_cell in sibling_ids
+    old_tac = safe_int(cell.get("tac_lac"))
+    if cell_is_proven and sibling_tacs and old_tac is not None and old_tac >= 0:
+        candidate_tac = int(str(old_tac), 16)
+        if old_tac not in sibling_tacs and candidate_tac not in sibling_tacs:
+            repaired["tac_lac"] = None
+            repaired["lac_tac_legacy_value"] = old_tac
+            ambiguous.append("tac_lac")
+
+    if changed or ambiguous:
+        repaired["identifier_encoding"] = "3gpp_hex" if not ambiguous else "partial_3gpp_hex"
+        repaired["identifier_encodings"] = {
+            field: ("3gpp_hex" if field in proven else "ambiguous")
+            for field in ("cell_id", "tac_lac")
+            if field in proven or field in ambiguous
+        }
+        repaired["identifier_repair"] = {
+            "version": 1,
+            "method": "same_sample_cross_source_exact_match",
+            "fields": changed,
+            "ambiguous_fields_cleared": ambiguous,
+        }
+    return repaired
+
+
 def iter_observed_cells(obj: Dict[str, Any]) -> Iterable[Dict[str, Any]]:
     towers = obj.get("towers")
     if isinstance(towers, list) and towers:
         for t in towers:
             if isinstance(t, dict):
-                yield t
+                yield normalize_legacy_registration_cell(t, towers)
         return
 
     # Fallback: registration entries
