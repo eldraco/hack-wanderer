@@ -1,4 +1,5 @@
 import datetime as dt
+import html
 import json
 import os
 import sqlite3
@@ -68,6 +69,40 @@ class TowerIntelTests(unittest.TestCase):
         self.assertIn("function setAreaLegendVisible(show,persist=true)", page)
         self.assertIn("towerShowAreaLegend", page)
 
+    def test_map_toolbar_stays_visible_without_view_scrolling(self):
+        page = intel.index_html()
+        self.assertIn("height:100dvh", page)
+        self.assertIn("#mapView.view.active{display:flex;flex-direction:column;overflow:hidden}", page)
+        self.assertIn("#mapView>.toolbar{flex:0 0 auto}", page)
+        self.assertIn("#map{height:auto;min-height:0;flex:1 1 auto;width:100%}", page)
+        self.assertNotIn("#map{height:calc(100vh - 58px)", page)
+
+    def test_help_page_teaches_complete_pipeline_and_every_method(self):
+        intel.init_db(self.db)
+        with intel.connect_db(self.db) as con:
+            methods = list(intel.get_method_settings(con).values())
+            guide = intel.build_help_guide_html(methods, intel.get_app_config(con))
+
+        self.assertEqual(len(methods), len(intel.METHOD_REGISTRY))
+        for phrase in (
+            "The complete pipeline",
+            "Cellular data capture and AT commands",
+            "AT+CEREG?",
+            "GPS capture and validation",
+            "Import, cleaning, and database normalization",
+            "Feature engineering",
+            "Every anomaly and normality method",
+            "How the methods become one decision score",
+            "family_scale",
+            "Dictionary of terminology",
+        ):
+            self.assertIn(phrase, guide)
+        for method in intel.METHOD_REGISTRY:
+            self.assertEqual(guide.count(f'id="method-{method["id"]}"'), 1)
+            self.assertIn(html.escape(method["equation"]), guide)
+        self.assertIn("Disabled/shadow: computed, but contributes zero", guide)
+        self.assertIn("Active: contributes when its gates pass", guide)
+
     def test_map_has_explicit_weird_gps_tower_layer_and_warning(self):
         page = intel.index_html()
         self.assertIn("weirdTowerLayer", page)
@@ -82,6 +117,16 @@ class TowerIntelTests(unittest.TestCase):
         self.assertIn("sortHeader(id,'location','Location')", page)
         self.assertIn("sortHeader(id,'first_seen_ts','First seen')", page)
         self.assertIn("sortHeader(id,'last_seen_ts','Last seen')", page)
+
+    def test_anomalies_table_shows_sortable_first_and_last_seen_dates(self):
+        page = intel.index_html()
+        anomaly_renderer = page.split("function renderAnomalyTable(){", 1)[1].split(
+            "function setTowerMetaStatus", 1
+        )[0]
+        self.assertIn("sortHeader(id,'first_seen_ts','First seen')", anomaly_renderer)
+        self.assertIn("sortHeader(id,'last_seen_ts','Last seen')", anomaly_renderer)
+        self.assertIn("seenDateHtml(t.first_seen_ts)", anomaly_renderer)
+        self.assertIn("seenDateHtml(t.last_seen_ts)", anomaly_renderer)
 
     def test_identity_and_jsonl_import_are_idempotent(self):
         write_jsonl(self.log, self.make_rows())
