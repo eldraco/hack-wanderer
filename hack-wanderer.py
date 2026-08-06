@@ -935,11 +935,40 @@ def parse_reg(lines, prefix):
             if len(parts) == 1:
                 stat = safe_int(parts[0])
                 return build_reg_entry(stat, None, None, None)
-            stat = safe_int(parts[1]) if len(parts) >= 2 else safe_int(parts[0])
-            lac = parse_hex_or_int(parts[2]) if len(parts) >= 3 else None
-            ci = parse_hex_or_int(parts[3]) if len(parts) >= 4 else None
-            act = safe_int(parts[4]) if len(parts) >= 5 else None
-            return build_reg_entry(stat, lac, ci, act)
+            # Read responses are <n>,<stat>,<area>,<ci>,<AcT>; unsolicited
+            # result codes omit <n>. Quoted second fields, or numeric values
+            # outside the registration-status range, identify the URC form.
+            second = str(parts[1]).strip() if len(parts) >= 2 else ""
+            second_int = safe_int(parts[1]) if len(parts) >= 2 else None
+            unsolicited = bool(
+                second.startswith('"')
+                or second_int is None
+                or second_int < 0
+                or second_int > 10
+            )
+            stat_index = 0 if unsolicited else 1
+            area_index = stat_index + 1
+            cell_index = stat_index + 2
+            act_index = stat_index + 3
+            stat = safe_int(parts[stat_index])
+            # 3GPP TS 27.007 defines <lac>/<tac> and <ci> in CREG, CGREG,
+            # and CEREG as hexadecimal *strings*.  A token containing only
+            # decimal digits is still hexadecimal: e.g. "1389509" means
+            # 0x1389509 (20485385), not decimal 1389509.
+            lac_raw = identifier_token(parts[area_index]) if len(parts) > area_index else None
+            ci_raw = identifier_token(parts[cell_index]) if len(parts) > cell_index else None
+            lac = parse_hex_string(lac_raw)
+            ci = parse_hex_string(ci_raw)
+            act = safe_int(parts[act_index]) if len(parts) > act_index else None
+            return build_reg_entry(
+                stat,
+                lac,
+                ci,
+                act,
+                lac_raw=lac_raw,
+                ci_raw=ci_raw,
+                source=prefix.lower(),
+            )
     return {}
 
 
@@ -1003,11 +1032,24 @@ def parse_cpsi(lines):
         # +CPSI: LTE,Online,<MCC>-<MNC>,<TAC>,<ScellID>,<PcellID>,<Frequency Band>,<earfcn>,
         #        <dlbw>,<ulbw>,<RSRQ>,<RSRP>,<RSSI>,<RSSNR>
         if system_mode == "LTE" and len(parts) >= 14:
+            tac_raw = identifier_token(parts[3])
+            scell_id_raw = identifier_token(parts[4])
+            pcell_id_raw = identifier_token(parts[5])
             entry.update(
                 {
-                    "tac": parse_hex_or_int(parts[3]),
-                    "scell_id": parse_hex_or_int(parts[4]),
-                    "pcell_id": parse_hex_or_int(parts[5]),
+                    # SIMCom CPSI is a mixed-base response. In observed and
+                    # documented output TAC commonly carries a 0x prefix,
+                    # while ScellID and PcellID are decimal. Do not force the
+                    # whole response to one base.
+                    "tac": parse_hex_or_int(tac_raw),
+                    "tac_raw": tac_raw,
+                    "tac_encoding": numeric_token_encoding(tac_raw),
+                    "scell_id": parse_hex_or_int(scell_id_raw),
+                    "scell_id_raw": scell_id_raw,
+                    "scell_id_encoding": numeric_token_encoding(scell_id_raw),
+                    "pcell_id": parse_hex_or_int(pcell_id_raw),
+                    "pcell_id_raw": pcell_id_raw,
+                    "pcell_id_encoding": numeric_token_encoding(pcell_id_raw),
                     "band": strip_quotes(parts[6]),
                     "earfcn": safe_int(parts[7]),
                     "dlbw": strip_quotes(parts[8]),
@@ -1020,10 +1062,18 @@ def parse_cpsi(lines):
             )
         # GSM/WCDMA/TDS formats vary a lot; keep best-effort common identifiers.
         elif system_mode in ("GSM", "WCDMA", "TDS") and len(parts) >= 6:
+            lac_raw = identifier_token(parts[3])
+            cell_id_raw = identifier_token(parts[4])
             entry.update(
                 {
-                    "lac": parse_hex_or_int(parts[3]),
-                    "cell_id": parse_hex_or_int(parts[4]),
+                    # SIMCom documents CPSI LAC as hexadecimal digits but the
+                    # service Cell ID as a normal numeric field.
+                    "lac": parse_hex_string(lac_raw),
+                    "lac_raw": lac_raw,
+                    "lac_encoding": "hex",
+                    "cell_id": parse_hex_or_int(cell_id_raw),
+                    "cell_id_raw": cell_id_raw,
+                    "cell_id_encoding": numeric_token_encoding(cell_id_raw),
                 }
             )
         return entry
@@ -1069,11 +1119,11 @@ def parse_crsm(lines):
 def parse_qeng_servingcell(lines):
     towers = []
     for line in lines:
-        if not line.startswith('+QENG: "servingcell"'):
+        if not line.startswith("+QENG:"):
             continue
         payload = line.split(":", 1)[1].strip()
         parts = split_fields(payload)
-        if len(parts) < 6:
+        if len(parts) < 6 or strip_quotes(parts[0]) != "servingcell":
             continue
         # Expected patterns vary; parse best-effort for LTE/NR and GSM/UMTS.
         mode = strip_quotes(parts[1]) if len(parts) > 1 else None
@@ -1084,29 +1134,42 @@ def parse_qeng_servingcell(lines):
             "rat": rat,
             "raw": line,
         }
-        # Common LTE format: mode, rat, fdd/tdd, mcc, mnc, cellid, pci, earfcn, band, bw, rsrp, rsrq, rssi, sinr
-        if rat in ("LTE", "CAT-M1", "CAT-NB1", "NB-IOT", "NR5G"):
+        # Quectel LTE format:
+        # state,rat,FDD/TDD,mcc,mnc,cellid,pci,earfcn,band,ul_bw,dl_bw,
+        # tac,rsrp,rsrq,rssi,sinr[,srxlev...]
+        # Quectel defines cellid and LAC as hexadecimal, and reports LTE TAC
+        # in the same hexadecimal identifier form. Digit-only tokens must not
+        # fall back to decimal.
+        if rat in ("LTE", "CAT-M", "CAT-M1", "CAT-NB", "CAT-NB1", "NB-IOT"):
+            cell_id_raw = identifier_token(parts[6]) if len(parts) > 6 else None
+            tac_raw = identifier_token(parts[12]) if len(parts) > 12 else None
             entry.update({
                 "duplex": strip_quotes(parts[3]) if len(parts) > 3 else None,
                 "mcc": safe_int(parts[4]) if len(parts) > 4 else None,
                 "mnc": safe_int(parts[5]) if len(parts) > 5 else None,
-                "cell_id": parse_hex_or_int(parts[6]) if len(parts) > 6 else None,
+                "cell_id": parse_hex_string(cell_id_raw),
+                "cell_id_raw": cell_id_raw,
+                "cell_id_encoding": "hex",
                 "pci": safe_int(parts[7]) if len(parts) > 7 else None,
                 "earfcn": safe_int(parts[8]) if len(parts) > 8 else None,
                 "band": strip_quotes(parts[9]) if len(parts) > 9 else None,
-                "bandwidth": strip_quotes(parts[10]) if len(parts) > 10 else None,
-                "rsrp": safe_int(parts[11]) if len(parts) > 11 else None,
-                "rsrq": safe_int(parts[12]) if len(parts) > 12 else None,
-                "rssi": safe_int(parts[13]) if len(parts) > 13 else None,
-                "sinr": safe_int(parts[14]) if len(parts) > 14 else None,
+                "ul_bandwidth": strip_quotes(parts[10]) if len(parts) > 10 else None,
+                "dl_bandwidth": strip_quotes(parts[11]) if len(parts) > 11 else None,
+                "bandwidth": strip_quotes(parts[11]) if len(parts) > 11 else None,
+                "tac_lac": parse_hex_string(tac_raw),
+                "tac_raw": tac_raw,
+                "tac_encoding": "hex",
+                "rsrp": safe_int(parts[13]) if len(parts) > 13 else None,
+                "rsrq": safe_int(parts[14]) if len(parts) > 14 else None,
+                "rssi": safe_int(parts[15]) if len(parts) > 15 else None,
+                "sinr": safe_int(parts[16]) if len(parts) > 16 else None,
+                "srxlev": safe_int(parts[17]) if len(parts) > 17 else None,
             })
         else:
-            # Fallback: just capture mcc/mnc/cell if present.
-            entry.update({
-                "mcc": safe_int(parts[3]) if len(parts) > 3 else None,
-                "mnc": safe_int(parts[4]) if len(parts) > 4 else None,
-                "cell_id": parse_hex_or_int(parts[5]) if len(parts) > 5 else None,
-            })
+            # Other RAT layouts differ substantially by modem family. Keep
+            # their raw response instead of manufacturing identifiers from
+            # guessed offsets.
+            entry["layout_supported"] = False
         towers.append(entry)
     return towers
 
@@ -1114,13 +1177,15 @@ def parse_qeng_servingcell(lines):
 def parse_qeng_neighborcell(lines):
     towers = []
     for line in lines:
-        if not line.startswith('+QENG: "neighbourcell'):
+        if not line.startswith("+QENG:"):
             continue
         payload = line.split(":", 1)[1].strip()
         parts = split_fields(payload)
         if len(parts) < 3:
             continue
         category = strip_quotes(parts[0]) if parts else None
+        if not str(category or "").startswith("neighbourcell"):
+            continue
         rat = strip_quotes(parts[1]) if len(parts) > 1 else None
         entry = {
             "source": "qeng_neighborcell",
@@ -1128,17 +1193,35 @@ def parse_qeng_neighborcell(lines):
             "rat": rat,
             "raw": line,
         }
-        # LTE neighbor: rat, mcc, mnc, earfcn, pci, rsrq, rsrp, rssi, sinr
-        entry.update({
-            "mcc": safe_int(parts[2]) if len(parts) > 2 else None,
-            "mnc": safe_int(parts[3]) if len(parts) > 3 else None,
-            "earfcn": safe_int(parts[4]) if len(parts) > 4 else None,
-            "pci": safe_int(parts[5]) if len(parts) > 5 else None,
-            "rsrq": safe_int(parts[6]) if len(parts) > 6 else None,
-            "rsrp": safe_int(parts[7]) if len(parts) > 7 else None,
-            "rssi": safe_int(parts[8]) if len(parts) > 8 else None,
-            "sinr": safe_int(parts[9]) if len(parts) > 9 else None,
-        })
+        if category in ("neighbourcell intra", "neighbourcell inter") and rat in (
+            "LTE", "CAT-M", "CAT-M1", "CAT-NB", "CAT-NB1", "NB-IOT"
+        ):
+            # LTE intra/inter format has no MCC/MNC or Cell ID:
+            # category,rat,earfcn,pci,rsrq,rsrp,rssi,sinr,...
+            entry.update({
+                "earfcn": safe_int(parts[2]) if len(parts) > 2 else None,
+                "pci": safe_int(parts[3]) if len(parts) > 3 else None,
+                "rsrq": safe_int(parts[4]) if len(parts) > 4 else None,
+                "rsrp": safe_int(parts[5]) if len(parts) > 5 else None,
+                "rssi": safe_int(parts[6]) if len(parts) > 6 else None,
+                "sinr": safe_int(parts[7]) if len(parts) > 7 else None,
+                "srxlev": safe_int(parts[8]) if len(parts) > 8 else None,
+            })
+        elif category == "neighbourcell" and rat == "LTE":
+            # Inter-RAT LTE neighbor reported while camped on WCDMA:
+            # category,rat,earfcn,cellid,rsrp,rsrq,s_rxlev
+            cell_id_raw = identifier_token(parts[3]) if len(parts) > 3 else None
+            entry.update({
+                "earfcn": safe_int(parts[2]) if len(parts) > 2 else None,
+                "cell_id": parse_hex_string(cell_id_raw),
+                "cell_id_raw": cell_id_raw,
+                "cell_id_encoding": "hex",
+                "rsrp": safe_int(parts[4]) if len(parts) > 4 else None,
+                "rsrq": safe_int(parts[5]) if len(parts) > 5 else None,
+                "srxlev": safe_int(parts[6]) if len(parts) > 6 else None,
+            })
+        else:
+            entry["layout_supported"] = False
         towers.append(entry)
     return towers
 
@@ -1154,7 +1237,10 @@ def build_towers_snapshot(network, vendor):
             "rat": reg.get("rat"),
             "rat_code": reg.get("act"),
             "cell_id": reg.get("cell_id"),
+            "cell_id_raw": reg.get("cell_id_raw"),
             "tac_lac": reg.get("lac_tac"),
+            "lac_tac_raw": reg.get("lac_tac_raw"),
+            "identifier_encoding": reg.get("identifier_encoding"),
             "stat": reg.get("stat_text"),
             "plmn": registered_plmn,
             "mcc": mcc,
@@ -1305,7 +1391,7 @@ def summarize_response(cmd, lines):
     return "No response lines."
 
 
-def build_reg_entry(stat, lac, ci, act):
+def build_reg_entry(stat, lac, ci, act, lac_raw=None, ci_raw=None, source=None):
     entry = {
         "stat_code": stat,
         "stat_text": REG_STATUS.get(stat, "unknown") if stat is not None else None,
@@ -1314,6 +1400,14 @@ def build_reg_entry(stat, lac, ci, act):
         "act": act,
         "rat": ACT_RAT.get(act) if act is not None else None,
     }
+    if lac_raw is not None or ci_raw is not None:
+        entry.update({
+            "lac_tac_raw": lac_raw,
+            "cell_id_raw": ci_raw,
+            "identifier_encoding": "3gpp_hex",
+        })
+    if source:
+        entry["source"] = source
     return entry
 
 
@@ -1361,6 +1455,39 @@ def parse_hex_or_int(value):
         return int(text)
     except ValueError:
         return None
+
+
+def identifier_token(value):
+    """Return a modem identifier token without quotes, preserving its digits."""
+    if value is None:
+        return None
+    text = str(value).strip().strip('"').strip()
+    return text or None
+
+
+def parse_hex_string(value):
+    """Parse a protocol field defined as hexadecimal, including digit-only text."""
+    text = identifier_token(value)
+    if text is None or text == "-":
+        return None
+    if text.lower().startswith("0x"):
+        text = text[2:]
+    if not text or any(ch not in "0123456789abcdefABCDEF" for ch in text):
+        return None
+    try:
+        return int(text, 16)
+    except ValueError:
+        return None
+
+
+def numeric_token_encoding(value):
+    """Describe the base selected by parse_hex_or_int for auditability."""
+    text = identifier_token(value)
+    if text is None:
+        return None
+    if text.lower().startswith("0x") or any(ch in "abcdefABCDEF" for ch in text):
+        return "hex"
+    return "decimal"
 
 
 def strip_quotes(value):
