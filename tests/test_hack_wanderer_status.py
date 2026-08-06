@@ -128,6 +128,98 @@ class HackWandererStatusTests(unittest.TestCase):
         self.assertEqual(parsed["format"], 2)
         self.assertIsNone(parsed["act"])
 
+    def test_registration_digit_only_identifiers_are_hexadecimal(self):
+        parsed = hack_wanderer.parse_reg(
+            ['+CEREG: 2,5,"3345","1389509",7', "OK"],
+            "CEREG",
+        )
+
+        self.assertEqual(parsed["lac_tac"], 0x3345)
+        self.assertEqual(parsed["cell_id"], 0x1389509)
+        self.assertEqual(parsed["lac_tac_raw"], "3345")
+        self.assertEqual(parsed["cell_id_raw"], "1389509")
+        self.assertEqual(parsed["identifier_encoding"], "3gpp_hex")
+
+    def test_registration_unsolicited_layout_without_n_is_parsed(self):
+        parsed = hack_wanderer.parse_reg(
+            ['+CEREG: 5,"3345","1389509",7'],
+            "CEREG",
+        )
+
+        self.assertEqual(parsed["stat_code"], 5)
+        self.assertEqual(parsed["lac_tac"], 0x3345)
+        self.assertEqual(parsed["cell_id"], 0x1389509)
+        self.assertEqual(parsed["act"], 7)
+
+    def test_registration_and_cpsi_identify_same_real_cell(self):
+        registration = hack_wanderer.parse_reg(
+            ['+CEREG: 2,5,"334C","1389509",7', "OK"],
+            "CEREG",
+        )
+        cpsi = hack_wanderer.parse_cpsi([
+            "+CPSI: LTE,Online,310-260,0x334C,20485385,284,LTE BAND 2,900,5,5,-120,-991,-733,111",
+            "OK",
+        ])
+
+        self.assertEqual(registration["lac_tac"], 0x334C)
+        self.assertEqual(registration["cell_id"], 20485385)
+        self.assertEqual(registration["cell_id"], cpsi["scell_id"])
+        self.assertEqual(registration["lac_tac"], cpsi["tac"])
+        self.assertEqual(cpsi["scell_id_encoding"], "decimal")
+        self.assertEqual(cpsi["tac_encoding"], "hex")
+
+    def test_cpsi_lac_is_hex_but_cell_id_is_decimal(self):
+        parsed = hack_wanderer.parse_cpsi([
+            "+CPSI: WCDMA,Online,460-01,1829,11122855,WCDMA IMT 2000,279,10663,0,1.5,62,33,52,500",
+            "OK",
+        ])
+
+        self.assertEqual(parsed["lac"], 0x1829)
+        self.assertEqual(parsed["cell_id"], 11122855)
+        self.assertEqual(parsed["lac_encoding"], "hex")
+        self.assertEqual(parsed["cell_id_encoding"], "decimal")
+
+    def test_qeng_lte_uses_hex_ids_and_correct_field_offsets(self):
+        parsed = hack_wanderer.parse_qeng_servingcell([
+            '+QENG:"servingcell","LIMSRV","LTE","FDD",460,11,6935932,30,1825,3,4,4,6934,-115,-13,-83,13,0',
+            "OK",
+        ])[0]
+
+        self.assertEqual(parsed["cell_id"], 0x6935932)
+        self.assertEqual(parsed["tac_lac"], 0x6934)
+        self.assertEqual(parsed["cell_id_raw"], "6935932")
+        self.assertEqual(parsed["tac_raw"], "6934")
+        self.assertEqual(parsed["ul_bandwidth"], "4")
+        self.assertEqual(parsed["dl_bandwidth"], "4")
+        self.assertEqual(parsed["rsrp"], -115)
+        self.assertEqual(parsed["rsrq"], -13)
+        self.assertEqual(parsed["rssi"], -83)
+        self.assertEqual(parsed["sinr"], 13)
+
+    def test_qeng_lte_neighbor_uses_documented_offsets(self):
+        parsed = hack_wanderer.parse_qeng_neighborcell([
+            '+QENG:"neighbourcell intra","LTE",38950,276,-3,-88,-65,0,37,7,16,6,44',
+            "OK",
+        ])[0]
+
+        self.assertEqual(parsed["earfcn"], 38950)
+        self.assertEqual(parsed["pci"], 276)
+        self.assertEqual(parsed["rsrq"], -3)
+        self.assertEqual(parsed["rsrp"], -88)
+        self.assertEqual(parsed["rssi"], -65)
+        self.assertEqual(parsed["sinr"], 0)
+        self.assertNotIn("mcc", parsed)
+        self.assertNotIn("mnc", parsed)
+
+    def test_qeng_unknown_layout_does_not_guess_identifiers(self):
+        parsed = hack_wanderer.parse_qeng_servingcell([
+            '+QENG: "servingcell","NOCONN","NR5G-SA","FDD",310,260,1C11E6001,77,3A6900,126490,71,1,-96,-11,14,0,-',
+            "OK",
+        ])[0]
+
+        self.assertFalse(parsed["layout_supported"])
+        self.assertNotIn("cell_id", parsed)
+
     def test_tower_snapshot_uses_numeric_plmn_not_sim_brand(self):
         network = {
             "cereg": {
