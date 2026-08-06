@@ -51,7 +51,9 @@ python3 tower_intel_server.py recompute
 python3 tower_intel_server.py serve
 ```
 
-Then open `http://127.0.0.1:8890`.
+Then open `http://<raspberry-pi-ip>:8890` from any device on the same network, or
+`http://127.0.0.1:8890` on the Raspberry Pi itself. The server binds to all
+interfaces by default; do not expose port 8890 directly to the public internet.
 
 `recompute` now skips the expensive stationary-flag rebuild by default because ingest already refreshes those flags. Use `python3 tower_intel_server.py recompute --refresh-stationary` only when you explicitly need a full stationary rebuild.
 
