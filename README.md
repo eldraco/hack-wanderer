@@ -59,6 +59,8 @@ interfaces by default; do not expose port 8890 directly to the public internet.
 
 The dashboard stores raw samples and tower observations in `tower_intel.sqlite`, including valid GPS altitude, lets you tune anomaly thresholds, softens geo-heavy anomaly methods when observations came from elevated positions, shows per-tower XAI explanations, and exports tower reports as Markdown or DOCX. Imports now report live progress in both the CLI and the web UI. See `TOWER_INTEL_APP.md`.
 
+The dashboard is intentionally lazy for large databases: the initial map loads a compact sample and offers **Load all map markers** when needed; Towers, Anomalies, and Admin load only when opened and use 250-row pages. Open a tower for its full feature/method explanation, and use the explicit observation buttons when you need point-level data. This keeps the first view responsive without limiting access to the stored SQLite data.
+
 ## Configuration
 
 All settings can be provided via CLI flags or a YAML file. CLI flags override the YAML values.
