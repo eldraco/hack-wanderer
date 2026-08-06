@@ -5936,6 +5936,57 @@ def tower_payload(row: sqlite3.Row, *, enrich_methods: bool = False) -> Dict[str
     }
 
 
+# The map and list views only need a small subset of the feature document.  Keeping
+# the full method explanations in every row makes a 5,000-tower response needlessly
+# large; the drawer fetches the complete payload on demand via /api/towers/{id}.
+_COMPACT_FEATURE_KEYS = {
+    "local_novelty_state", "local_novelty_triggered", "local_novelty_prior_visits",
+    "local_novelty_prior_windows", "local_novelty_current_windows", "dwell_normality_credit",
+    "effective_observation_windows", "gps_spread_m", "transient_activation_triggered",
+    "disappearance_triggered", "local_tac_triggered", "visit_change_triggered",
+}
+
+
+def compact_tower_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Trim a tower response used for map/table summaries."""
+    payload["features"] = {
+        key: value for key, value in (payload.get("features") or {}).items()
+        if key in _COMPACT_FEATURE_KEYS
+    }
+    payload["methods"] = []
+    payload["bayes"] = {}
+    return payload
+
+
+def observation_quality_for_towers(con: sqlite3.Connection, tower_ids: Sequence[int]) -> Dict[int, Dict[str, Any]]:
+    """Aggregate observation quality for a bounded set of towers.
+
+    Chunks the ``IN`` list so this remains compatible with SQLite builds that
+    use the traditional 999-variable limit.
+    """
+    result: Dict[int, Dict[str, Any]] = {}
+    ids = [int(tower_id) for tower_id in tower_ids]
+    for start in range(0, len(ids), 500):
+        chunk = ids[start:start + 500]
+        placeholders = ",".join("?" for _ in chunk)
+        rows = con.execute(
+            f"""SELECT tower_id,
+            COUNT(*) AS total_observation_count,
+            SUM(CASE WHEN bad_gps=0 AND lat IS NOT NULL AND lon IS NOT NULL THEN 1 ELSE 0 END) AS valid_gps_count,
+            SUM(CASE WHEN bad_gps=1 AND lat IS NOT NULL AND lon IS NOT NULL THEN 1 ELSE 0 END) AS weird_gps_count,
+            SUM(CASE WHEN lat IS NULL OR lon IS NULL THEN 1 ELSE 0 END) AS unlocated_count,
+            MIN(ts) AS first_observation_ts, MAX(ts) AS last_observation_ts,
+            AVG(CASE WHEN bad_gps=1 AND lat IS NOT NULL AND lon IS NOT NULL THEN lat END) AS weird_center_lat,
+            AVG(CASE WHEN bad_gps=1 AND lat IS NOT NULL AND lon IS NOT NULL THEN lon END) AS weird_center_lon
+            FROM tower_observations
+            WHERE COALESCE(ignored,0)=0 AND tower_id IN ({placeholders})
+            GROUP BY tower_id""",
+            chunk,
+        ).fetchall()
+        result.update({int(row["tower_id"]): dict(row) for row in rows})
+    return result
+
+
 def altitude_view_payload(methods: Sequence[Dict[str, Any]], features: Dict[str, Any], config: Dict[str, Any]) -> Dict[str, Any]:
     affected = []
     for method in methods:
@@ -6899,17 +6950,18 @@ def index_html() -> str:
         <label><input id="showKnown" type="checkbox" checked onchange="renderMapTowers(false)"> known</label>
         <label><input id="showIgnored" type="checkbox" onchange="renderMapTowers(false)"> ignored</label>
         <label><input id="showAreaLegend" type="checkbox" checked onchange="toggleAreaLegend()"> TAC/LAC legend</label>
+        <button id="mapLoadAll" class="ghost" onclick="loadTowers(true)" style="display:none">Load all map markers</button>
         <button class="ghost" onclick="loadTowers()">Refresh</button>
         <span id="mapStatus" class="small"></span>
       </div>
       <div id="map"></div>
       <aside id="drawer" class="drawer"><div class="drawer-resizer" title="Drag to resize"></div><div class="drawer-scroll"><header><div class="drawer-top"><div><button class="ghost" onclick="closeDrawer()">Close</button><h2 id="drawerTitle"></h2><div id="drawerSub" class="small"></div></div><div class="drawer-tools"><button class="ghost" onclick="changeDrawerFont(-1)">A−</button><button class="ghost" onclick="resetDrawerFont()">A</button><button class="ghost" onclick="changeDrawerFont(1)">A+</button><span id="drawerFontLabel" class="small"></span></div></div></header><div class="body" id="drawerBody"></div></div></aside>
     </section>
-    <section id="towersView" class="view"><div class="toolbar"><input id="towerSearch" placeholder="Search identifiers, notes, tags"><button class="ghost" onclick="loadTowerTable()">Search</button></div><div class="table-wrap"><table id="towerTable"></table></div></section>
-    <section id="anomaliesView" class="view"><div class="toolbar"><input id="anomalySearch" placeholder="Search identifiers, notes, tags"><select id="anomalyMethod" onchange="loadAnomalyTable()"><option value="">All triggered anomalies</option></select><label><input id="anomalyIgnored" type="checkbox" onchange="loadAnomalyTable()"> include ignored</label><button class="ghost" onclick="loadAnomalyTable()">Search</button><span id="anomalyStatus" class="small"></span></div><div class="table-wrap"><table id="anomalyTable"></table></div></section>
+    <section id="towersView" class="view"><div class="toolbar"><input id="towerSearch" placeholder="Search identifiers, notes, tags"><button class="ghost" onclick="loadTowerTable()">Search</button><span id="towerTableStatus" class="small"></span></div><div class="table-wrap"><table id="towerTable"></table></div><div id="towerPager" class="toolbar"></div></section>
+    <section id="anomaliesView" class="view"><div class="toolbar"><input id="anomalySearch" placeholder="Search identifiers, notes, tags"><select id="anomalyMethod" onchange="loadAnomalyTable()"><option value="">All triggered anomalies</option></select><label><input id="anomalyIgnored" type="checkbox" onchange="loadAnomalyTable()"> include ignored</label><button class="ghost" onclick="loadAnomalyTable()">Search</button><span id="anomalyStatus" class="small"></span></div><div class="table-wrap"><table id="anomalyTable"></table></div><div id="anomalyPager" class="toolbar"></div></section>
     <section id="methodsView" class="view"><div class="toolbar"><button class="primary" onclick="saveMethods()">Save settings</button><button class="ghost" onclick="saveAppConfig()">Save altitude config</button><button class="ghost" onclick="recompute('methods')">Recompute scores</button><span class="small">Method thresholds and altitude discount settings are editable for experiments.</span><span id="methodsStatus" class="small toolbar-note"></span></div><div class="cards"><div class="card span-all"><h3>Altitude discount configuration</h3><p class="small">These settings control how much elevated positions soften geo-heavy evidence. Ground-level points remain full strength; higher positions are discounted using local ground/floor baselines per place bucket.</p><div id="appConfigBox" class="config-grid"></div><div id="appConfigCurve" class="table-wrap compact" style="margin-top:12px"><table id="appConfigCurveTable"></table></div></div></div><div id="methodsList" class="cards"></div></section>
     <section id="importsView" class="view"><div class="imports-shell"><div id="importsStatus" class="status-line idle">Ready to import JSONL files.</div><div id="importsProgressMeta" class="small toolbar-note" style="margin:8px 0 14px 0"></div><div class="imports-grid"><div class="card"><h3>Import by path</h3><p class="small">Local server reads files from this machine. Separate multiple paths with newlines.</p><textarea id="importPaths" style="width:100%;min-height:140px" placeholder="logs/14-5-2026.jsonl"></textarea><div class="inline-actions"><button class="primary" onclick="doImport()">Import</button><button class="ghost" onclick="recompute('imports')">Recompute</button></div></div><div class="card"><h3>Upload JSONL</h3><div class="upload-stack"><input id="uploadFiles" type="file" multiple><div id="uploadSelection" class="small">No files selected.</div><button class="primary" onclick="uploadImport()">Upload + import</button></div></div><div class="card stats-card-col"><h3>DB Stats</h3><div class="inline-actions" style="margin-top:0"><button class="ghost" onclick="loadStats()">Refresh stats</button></div><div id="statsBox" class="stats-grid" style="margin-top:12px"></div><div id="statsMeta" class="small" style="margin-top:10px"></div></div><div class="card span-all"><h3>Last import result</h3><p class="small">Every import shows a compact status line plus per-file counts. No popup windows; results stay here for review.</p><div id="importSummaryMetrics" class="stats-grid" style="margin-top:12px"></div><div class="table-wrap compact" style="margin-top:12px"><table id="importResultTable"></table></div></div><div class="card span-all"><h3>Imported files history</h3><p class="small">Persistent list from the SQLite <code>import_files</code> table. Manual path imports and browser uploads both appear here.</p><div class="inline-actions" style="margin-top:0"><button class="ghost" onclick="loadImports()">Refresh imported files</button></div><div class="table-wrap compact" style="margin-top:12px"><table id="importsTable"></table></div></div></div></div></section>
-    <section id="adminView" class="view"><div class="toolbar"><input id="adminSearch" placeholder="Search DB, notes, tags"><button class="ghost" onclick="loadAdmin()">Search</button></div><div class="table-wrap"><table id="adminTable"></table></div></section>
+    <section id="adminView" class="view"><div class="toolbar"><input id="adminSearch" placeholder="Search DB, notes, tags"><button class="ghost" onclick="loadAdmin()">Search</button><span id="adminTableStatus" class="small"></span></div><div class="table-wrap"><table id="adminTable"></table></div><div id="adminPager" class="toolbar"></div></section>
     <section id="helpView" class="view"><div class="help" id="helpBox"></div></section>
   </main>
 </div>
@@ -6917,6 +6969,11 @@ def index_html() -> str:
 let map, towerLayer, weirdTowerLayer, estimateLayer, pointLayer, clusterLayer, badLayer, placeLayer, centerLayer, areaLegend;
 let allTowers=[];
 let towerTableItems=[], anomalyTableItems=[], adminTableItems=[];
+const TABLE_PAGE_SIZE=250;
+let towerTablePage=0, anomalyTablePage=0, adminTablePage=0;
+let towerTableTotal=0, anomalyTableTotal=0, adminTableTotal=0;
+let mapTotal=0, mapLoadedAll=false;
+let lazyViewsLoaded=new Set();
 let tableSort={towerTable:{key:'bayes_post_p',dir:-1},anomalyTable:{key:'bayes_post_p',dir:-1},adminTable:{key:'bayes_post_p',dir:-1}};
 let appConfig={}, appConfigHelp={};
 let currentTowerData=null, drawerShowAllMethods=false;
@@ -7272,14 +7329,19 @@ function syncScoreFilter(source){
   if(source==='slider') num.value=slider.value; else slider.value=num.value;
   renderMapTowers(false);
 }
-async function loadTowers(){
+async function loadTowers(loadAll=false){
   const q=document.getElementById('mapSearch').value.trim();
   const lastSeenFrom=document.getElementById('lastSeenFrom').value;
   const lastSeenTo=document.getElementById('lastSeenTo').value;
-  const params=new URLSearchParams({limit:5000,q,include_ignored:1});
+  // A targeted search/date filter is expected to show every matching tower;
+  // only the unfiltered initial map uses the lightweight sample.
+  mapLoadedAll=Boolean(loadAll || q || lastSeenFrom || lastSeenTo);
+  const params=new URLSearchParams({limit:mapLoadedAll?5000:1000,q,include_ignored:1,compact:1});
   if(lastSeenFrom) params.set('last_seen_from',lastSeenFrom);
   if(lastSeenTo) params.set('last_seen_to',lastSeenTo);
-  const data=await api('/api/towers?'+params); allTowers=data.items; renderMapTowers(true);
+  const data=await api('/api/towers?'+params); allTowers=data.items; mapTotal=Number(data.total||allTowers.length); renderMapTowers(true);
+  const allButton=document.getElementById('mapLoadAll');
+  if(allButton){allButton.style.display=mapTotal>allTowers.length?'':'none'; allButton.textContent=`Load all map markers (${mapTotal.toLocaleString()})`;}
 }
 function clearLastSeenFilter(){
   document.getElementById('lastSeenFrom').value='';
@@ -7344,7 +7406,8 @@ function renderMapTowers(fit){
   updateAreaLegend(areaGroups);
   const from=document.getElementById('lastSeenFrom').value, to=document.getElementById('lastSeenTo').value;
   const dateStatus=(from||to)?` · last seen ${from||'any date'} to ${to||'any date'} UTC`:'';
-  document.getElementById('mapStatus').textContent=`${shown}/${allTowers.length} mapped · valid GPS ${exactShown} · weird GPS ${weirdShown} · unlocated ${unlocated} · v2 shadow ${shadowShown} · normal ${counts.normal} · anomalous ${counts.anom} · known ${counts.known} · ignored ${counts.ignored} · min Bayes ${pct(threshold)}${dateStatus}`;
+  const loadedStatus=mapTotal>allTowers.length?` · loaded ${allTowers.length}/${mapTotal} (map is sampled; load all when needed)`:'';
+  document.getElementById('mapStatus').textContent=`${shown}/${allTowers.length} mapped · valid GPS ${exactShown} · weird GPS ${weirdShown} · unlocated ${unlocated} · v2 shadow ${shadowShown} · normal ${counts.normal} · anomalous ${counts.anom} · known ${counts.known} · ignored ${counts.ignored} · min Bayes ${pct(threshold)}${loadedStatus}${dateStatus}`;
   const fitBounds=bounds.length?bounds:weirdBounds;
   if(fit&&fitBounds.length) map.fitBounds(fitBounds,{padding:[30,30],maxZoom:17});
 }
@@ -7574,7 +7637,7 @@ function pointStyleFor(mode, x){
   if(mode==='bad') return {radius:5,color:'#111827',fillColor:'#f59e0b',fillOpacity:.80,weight:1};
   return {radius:4,color:'#2563eb',fillColor:'#2563eb',fillOpacity:.65,weight:1};
 }
-async function showPoints(id,mode){clearOverlays(); resetObsMarkers(); currentPointsMode=String(mode||''); const p=await api(`/api/towers/${id}/points?kind=${mode}`);
+async function showPoints(id,mode){clearOverlays(); resetObsMarkers(); currentPointsMode=String(mode||''); const pointLimit=mode==='raw'?2000:5000; const raw=mode==='raw'?1:0; const p=await api(`/api/towers/${id}/points?kind=${mode}&limit=${pointLimit}&raw=${raw}`);
   if(mode==='bad'){(p.bad_gps||[]).forEach(x=>{const layer=L.circleMarker([x.lat,x.lon], pointStyleFor('bad',x)).addTo(badLayer); if(x&&x.obs_uid) obsMarkers.set(String(x.obs_uid), {layer, point:x}); bindPointTooltip(layer,x,'bad');})}
   else if(mode==='clusters'){(p.clusters||[]).forEach(c=>L.circle([c.lat,c.lon],{radius:Math.max(25,Math.sqrt(c.n)*18),color:'#7c3aed',fillOpacity:.08}).addTo(clusterLayer).bindTooltip(`cluster n=${c.n}`));(p.stationary_clusters||[]).forEach(c=>L.circle([c.lat,c.lon],{radius:Math.max(25,Math.sqrt(c.n)*18),color:'#16a34a',fillOpacity:.12}).addTo(clusterLayer).bindTooltip(`stationary cluster n=${c.n}`))}
 	  else if(mode==='places'){(p.place_buckets||[]).forEach(b=>{if(!b.bounds)return; L.rectangle([[b.bounds.south,b.bounds.west],[b.bounds.north,b.bounds.east]],{color:'#2563eb',weight:1,fillOpacity:.05}).addTo(placeLayer).bindTooltip(`place bucket ${b.place_id} · n=${b.count}`)})}
@@ -7623,20 +7686,42 @@ async function showPoints(id,mode){clearOverlays(); resetObsMarkers(); currentPo
 	    updateObsListLocal(String(r.obs_uid||obs_uid), r.ignored ? 1 : 0);
 	  }
 	}
-async function loadTowerTable(){const q=document.getElementById('towerSearch').value.trim(); const data=await api('/api/towers?limit=5000&q='+encodeURIComponent(q)+'&include_ignored=1'); towerTableItems=data.items; renderTowerTable('towerTable',towerTableItems,false)}
-async function loadAnomalyTable(){
+function renderPager(id,page,total,loader,statusId){
+  const box=document.getElementById(id); if(!box) return;
+  const pages=Math.max(1,Math.ceil(Number(total||0)/TABLE_PAGE_SIZE));
+  const shown=total?`${page*TABLE_PAGE_SIZE+1}-${Math.min((page+1)*TABLE_PAGE_SIZE,total)} of ${total}`:'0 results';
+  box.innerHTML=`<span class="small">${shown}</span><button class="ghost" ${page<=0?'disabled':''} onclick="${loader}(${Math.max(0,page-1)})">Previous</button><button class="ghost" ${page+1>=pages?'disabled':''} onclick="${loader}(${page+1})">Next</button>`;
+  if(statusId){const status=document.getElementById(statusId); if(status) status.textContent=shown;}
+}
+async function loadTowerTable(page=0){
+  const q=document.getElementById('towerSearch').value.trim();
+  towerTablePage=Math.max(0,Number(page)||0);
+  const sort=tableSort.towerTable||{key:'bayes_post_p',dir:-1};
+  const data=await api('/api/towers?limit='+TABLE_PAGE_SIZE+'&offset='+(towerTablePage*TABLE_PAGE_SIZE)+'&compact=1&sort='+encodeURIComponent(sort.key)+'&sort_dir='+sort.dir+'&q='+encodeURIComponent(q)+'&include_ignored=1');
+  towerTableItems=data.items||[]; towerTableTotal=Number(data.total||towerTableItems.length);
+  renderTowerTable('towerTable',towerTableItems,false); renderPager('towerPager',towerTablePage,towerTableTotal,'loadTowerTable','towerTableStatus');
+}
+async function loadAnomalyTable(page=0){
   const q=document.getElementById('anomalySearch').value.trim();
   const method=document.getElementById('anomalyMethod').value;
   const includeIgnored=document.getElementById('anomalyIgnored').checked?1:0;
-  const data=await api('/api/anomaly-towers?q='+encodeURIComponent(q)+'&method_id='+encodeURIComponent(method)+'&include_ignored='+includeIgnored);
-  anomalyTableItems=data.items;
+  anomalyTablePage=Math.max(0,Number(page)||0);
+  const data=await api('/api/anomaly-towers?limit='+TABLE_PAGE_SIZE+'&offset='+(anomalyTablePage*TABLE_PAGE_SIZE)+'&q='+encodeURIComponent(q)+'&method_id='+encodeURIComponent(method)+'&include_ignored='+includeIgnored);
+  anomalyTableItems=data.items||[]; anomalyTableTotal=Number(data.total||anomalyTableItems.length);
   const select=document.getElementById('anomalyMethod'), selected=select.value;
   select.innerHTML='<option value="">All triggered anomalies</option>'+(data.available_methods||[]).map(m=>`<option value="${esc(m.id)}">${esc(m.label)} (${m.count})</option>`).join('');
   select.value=selected;
-  document.getElementById('anomalyStatus').textContent=`${data.items.length} tower${data.items.length===1?'':'s'} with triggered anomalies`;
+  document.getElementById('anomalyStatus').textContent=`${anomalyTableTotal} tower${anomalyTableTotal===1?'':'s'} with triggered anomalies`;
   renderAnomalyTable();
+  renderPager('anomalyPager',anomalyTablePage,anomalyTableTotal,'loadAnomalyTable');
 }
-async function loadAdmin(){const q=document.getElementById('adminSearch').value.trim(); const data=await api('/api/towers?limit=5000&q='+encodeURIComponent(q)+'&include_ignored=1'); adminTableItems=data.items; renderTowerTable('adminTable',adminTableItems,true)}
+async function loadAdmin(page=0){
+  const q=document.getElementById('adminSearch').value.trim(); adminTablePage=Math.max(0,Number(page)||0);
+  const sort=tableSort.adminTable||{key:'bayes_post_p',dir:-1};
+  const data=await api('/api/towers?limit='+TABLE_PAGE_SIZE+'&offset='+(adminTablePage*TABLE_PAGE_SIZE)+'&compact=1&sort='+encodeURIComponent(sort.key)+'&sort_dir='+sort.dir+'&q='+encodeURIComponent(q)+'&include_ignored=1');
+  adminTableItems=data.items||[]; adminTableTotal=Number(data.total||adminTableItems.length);
+  renderTowerTable('adminTable',adminTableItems,true); renderPager('adminPager',adminTablePage,adminTableTotal,'loadAdmin','adminTableStatus');
+}
 function sortValue(t,key){
   if(key==='count') return Number(t.total_observation_count??t.count??-Infinity);
   if(key==='location') return Number(t.center_lat??t.weird_center_lat??-Infinity);
@@ -7663,7 +7748,8 @@ function setTowerSort(tableId,key){
   const s=tableSort[tableId]||{key,dir:1};
   tableSort[tableId]={key,dir:s.key===key?-s.dir:((key==='bayes_post_p'||key==='rule_score'||key==='count'||key==='first_seen_ts'||key==='last_seen_ts')?-1:1)};
   if(tableId==='anomalyTable') renderAnomalyTable();
-  else renderTowerTable(tableId,tableId==='adminTable'?adminTableItems:towerTableItems,tableId==='adminTable');
+  else if(tableId==='adminTable') loadAdmin(0);
+  else loadTowerTable(0);
 }
 async function showTowerOnMap(id,event){
   if(event) event.stopPropagation();
@@ -7884,12 +7970,22 @@ async function uploadImport(){
 async function loadStats(){renderStatsBox(await api('/api/stats'))}
 async function loadImports(){const d=await api('/api/imports?limit=500'); renderImportsHistory(d.items||[])}
 async function loadHelp(){const h=await api('/api/help'); window.__helpGlossary=h.glossary||window.__helpGlossary||{}; document.getElementById('helpBox').innerHTML=h.guide_html||`<h1>Help unavailable</h1><p>${esc(h.summary||'The help guide could not be loaded.')}</p>`}
-document.querySelectorAll('.nav button').forEach(b=>b.onclick=()=>{document.querySelectorAll('.nav button').forEach(x=>x.classList.remove('active')); b.classList.add('active'); document.querySelectorAll('.view').forEach(v=>v.classList.remove('active')); document.getElementById(b.dataset.view).classList.add('active'); setTimeout(()=>map&&map.invalidateSize(),50);});
+document.querySelectorAll('.nav button').forEach(b=>b.onclick=()=>{
+  document.querySelectorAll('.nav button').forEach(x=>x.classList.remove('active')); b.classList.add('active');
+  document.querySelectorAll('.view').forEach(v=>v.classList.remove('active')); document.getElementById(b.dataset.view).classList.add('active');
+  if(!lazyViewsLoaded.has(b.dataset.view)){
+    lazyViewsLoaded.add(b.dataset.view);
+    if(b.dataset.view==='towersView') loadTowerTable();
+    else if(b.dataset.view==='anomaliesView') loadAnomalyTable();
+    else if(b.dataset.view==='adminView') loadAdmin();
+  }
+  setTimeout(()=>map&&map.invalidateSize(),50);
+});
 document.getElementById('uploadFiles').addEventListener('change',e=>{const files=[...(e.target.files||[])]; document.getElementById('uploadSelection').textContent=files.length?files.map(f=>`${f.name} (${formatBytes(f.size)})`).join(' · '):'No files selected.'});
 renderImportResult(null);
 document.getElementById('mapSearch').addEventListener('keydown',e=>{if(e.key==='Enter')loadTowers()});
 document.getElementById('anomalySearch').addEventListener('keydown',e=>{if(e.key==='Enter')loadAnomalyTable()});
-initMap(); initDrawerUX(); loadTowers(); loadMethods(); loadStats(); loadImports(); loadHelp(); loadTowerTable(); loadAnomalyTable(); loadAdmin(); refreshImportStatus();
+initMap(); initDrawerUX(); loadTowers(); loadMethods(); loadStats(); loadImports(); loadHelp(); refreshImportStatus();
 </script>
 </body></html>"""
 
@@ -8053,6 +8149,8 @@ def create_app(db_path: str):
         limit: int = 500,
         offset: int = 0,
         sort: str = "bayes",
+        sort_dir: int = -1,
+        compact: int = 0,
         include_ignored: int = 0,
         hide_known: int = 0,
         anomaly_only: int = 0,
@@ -8060,6 +8158,7 @@ def create_app(db_path: str):
         last_seen_to: Optional[dt.date] = None,
     ) -> Dict[str, Any]:
         limit = max(1, min(int(limit), 5000))
+        offset = max(0, int(offset))
         clauses = ["1=1"]
         params: List[Any] = []
         if last_seen_from and last_seen_to and last_seen_from > last_seen_to:
@@ -8086,34 +8185,82 @@ def create_app(db_path: str):
             like = f"%{q}%"
             clauses.append("(t.label LIKE ? OR t.operator LIKE ? OR t.rat LIKE ? OR CAST(t.tac_lac AS TEXT) LIKE ? OR CAST(t.cell_id AS TEXT) LIKE ? OR CAST(t.pci AS TEXT) LIKE ? OR CAST(t.earfcn AS TEXT) LIKE ? OR t.notes LIKE ? OR t.analysis_status LIKE ?)")
             params += [like] * 9
-        order = "COALESCE(f.bayes_post_p,0) DESC, COALESCE(f.rule_score,0) DESC"
-        if sort == "count":
-            order = "COALESCE(f.count,0) DESC"
+        direction = "ASC" if int(sort_dir) >= 0 else "DESC"
+        sort_expressions = {
+            "bayes": "COALESCE(f.bayes_post_p,0)",
+            "bayes_post_p": "COALESCE(f.bayes_post_p,0)",
+            "rule_score": "COALESCE(f.rule_score,0)",
+            "count": "COALESCE(f.count,0)",
+            # Feature timestamps can lag immediately after an import.  Use the
+            # observation index for date ordering so newly ingested cells appear.
+            "first_seen_ts": "COALESCE((SELECT MIN(o.ts) FROM tower_observations o WHERE o.tower_id=t.id AND COALESCE(o.ignored,0)=0), f.first_seen_ts)",
+            "last_seen_ts": "COALESCE((SELECT MAX(o.ts) FROM tower_observations o WHERE o.tower_id=t.id AND COALESCE(o.ignored,0)=0), f.last_seen_ts)",
+            "location": "COALESCE(f.center_lat,999)",
+        }
+        order = f"{sort_expressions.get(sort, sort_expressions['bayes'])} {direction}, t.id DESC"
+        # The quality view aggregates every observation.  It is useful for
+        # detailed responses and date filtering, but would make every compact
+        # page scan the whole database.  Compact pages fetch the selected tower
+        # rows first and aggregate quality only for those IDs below.
+        fast_compact = bool(compact and not (last_seen_from or last_seen_to))
+        select_base = (
+            "t.*, f.count, f.center_lat, f.center_lon, f.first_seen_ts, f.last_seen_ts, "
+            "f.rule_score, f.bayes_post_p, f.features_json, f.methods_json, f.bayes_json"
+            if fast_compact else "t.*, f.*"
+        )
+        select_quality = "" if fast_compact else LOCATION_QUALITY_SELECT_SQL
+        joins_quality = "" if fast_compact else "LEFT JOIN tower_location_quality lq ON lq.tower_id=t.id"
+        with_clause = " AND ".join(clauses)
         sql = f"""
-          SELECT t.*, f.*, {LOCATION_QUALITY_SELECT_SQL} FROM towers t
+          SELECT {select_base} {',' if select_quality else ''} {select_quality} FROM towers t
           LEFT JOIN tower_features f ON f.tower_id=t.id
-          LEFT JOIN tower_location_quality lq ON lq.tower_id=t.id
-          WHERE {' AND '.join(clauses)}
+          {joins_quality}
+          WHERE {with_clause}
           ORDER BY {order}
           LIMIT ? OFFSET ?
         """
         with connect_db(db_path) as con:
+            total = con.execute(
+                f"""SELECT COUNT(*) FROM towers t
+                LEFT JOIN tower_features f ON f.tower_id=t.id
+                {joins_quality}
+                WHERE {with_clause}""",
+                tuple(params),
+            ).fetchone()[0]
             rows = con.execute(sql, (*params, limit, int(offset))).fetchall()
-        return {"items": [tower_payload(r) for r in rows], "limit": limit, "offset": offset}
+            row_dicts = [dict(r) for r in rows]
+            if fast_compact and row_dicts:
+                ids = [int(r["id"]) for r in row_dicts]
+                quality_by_id = observation_quality_for_towers(con, ids)
+                for row_dict in row_dicts:
+                    quality = quality_by_id.get(int(row_dict["id"]), {})
+                    row_dict.update(quality)
+                    row_dict["location_quality"] = (
+                        "valid_gps" if row_dict.get("center_lat") is not None and row_dict.get("center_lon") is not None
+                        else "weird_gps" if int(row_dict.get("weird_gps_count") or 0) > 0
+                        else "unlocated"
+                    )
+        items = [tower_payload(r) for r in row_dicts]
+        if compact:
+            items = [compact_tower_payload(item) for item in items]
+        return {"items": items, "limit": limit, "offset": offset, "total": int(total)}
 
     @app.get("/api/anomaly-towers")
     def api_anomaly_towers(
         q: str = "",
         method_id: str = "",
         include_ignored: int = 0,
+        limit: int = 250,
+        offset: int = 0,
     ) -> Dict[str, Any]:
+        limit = max(1, min(int(limit), 1000))
+        offset = max(0, int(offset))
         clauses = ["1=1"]
         if not include_ignored:
             clauses.append("t.ignored=0")
         sql = f"""
-          SELECT t.*, f.*, {LOCATION_QUALITY_SELECT_SQL} FROM towers t
+          SELECT t.*, f.* FROM towers t
           LEFT JOIN tower_features f ON f.tower_id=t.id
-          LEFT JOIN tower_location_quality lq ON lq.tower_id=t.id
           WHERE {' AND '.join(clauses)}
           ORDER BY COALESCE(f.bayes_post_p,0) DESC, COALESCE(f.rule_score,0) DESC
         """
@@ -8122,24 +8269,24 @@ def create_app(db_path: str):
         with connect_db(db_path) as con:
             rows = con.execute(sql).fetchall()
         query = q.strip().lower()
+        candidates: List[Tuple[sqlite3.Row, List[Dict[str, Any]]]] = []
         for row in rows:
-            payload = tower_payload(row)
+            # Inspect the compact stored method JSON first.  Most towers have no
+            # triggered positive anomaly, so avoid decoding their full feature and
+            # metadata payload until they are actually candidates for this table.
+            stored_methods = json_loads(row["methods_json"] if "methods_json" in row.keys() else None, [])
             anomalies = [
-                method for method in payload.get("methods", [])
+                method for method in stored_methods
                 if method.get("triggered")
                 and method.get("direction") == "up"
                 and float(method.get("delta_logodds") or 0.0) > 0.0
             ]
+            if not anomalies:
+                continue
             tower_search_values = [
-                payload.get("label"),
-                payload.get("operator"),
-                payload.get("rat"),
-                payload.get("tac_lac"),
-                payload.get("cell_id"),
-                payload.get("pci"),
-                payload.get("earfcn"),
-                payload.get("notes"),
-                payload.get("analysis_status"),
+                row["label"] or tower_label(row), row["operator"], row["rat"],
+                row["tac_lac"], row["cell_id"], row["pci"], row["earfcn"],
+                row["notes"], row["analysis_status"],
             ]
             anomaly_search_values = [
                 value
@@ -8152,10 +8299,20 @@ def create_app(db_path: str):
                 method_counts[str(method.get("id") or "")] += 1
             if method_id and not any(str(method.get("id") or "") == method_id for method in anomalies):
                 continue
-            if not anomalies:
-                continue
+            candidates.append((row, anomalies))
+        with connect_db(db_path) as con:
+            quality_by_id = observation_quality_for_towers(con, [int(row["id"]) for row, _ in candidates])
+        for row, anomalies in candidates:
+            row_dict = dict(row)
+            row_dict.update(quality_by_id.get(int(row["id"]), {}))
+            row_dict["location_quality"] = (
+                "valid_gps" if row_dict.get("center_lat") is not None and row_dict.get("center_lon") is not None
+                else "weird_gps" if int(row_dict.get("weird_gps_count") or 0) > 0
+                else "unlocated"
+            )
+            payload = tower_payload(row_dict)
             payload["triggered_anomalies"] = anomalies
-            items.append(payload)
+            items.append(compact_tower_payload(payload))
         available_methods = [
             {
                 "id": str(method["id"]),
@@ -8166,22 +8323,30 @@ def create_app(db_path: str):
             if method.get("direction") == "up"
         ]
         available_methods.sort(key=lambda method: (-int(method["count"]), str(method["label"])))
-        return {"items": items, "available_methods": available_methods}
+        total = len(items)
+        return {"items": items[offset:offset + limit], "available_methods": available_methods,
+                "limit": limit, "offset": offset, "total": total}
 
     @app.get("/api/towers/{tower_id}")
     def api_tower(tower_id: int) -> Dict[str, Any]:
         with connect_db(db_path) as con:
             app_config = get_app_config(con)
             row = con.execute(
-                f"""SELECT t.*, f.*, {LOCATION_QUALITY_SELECT_SQL} FROM towers t
+                """SELECT t.*, f.* FROM towers t
                 LEFT JOIN tower_features f ON f.tower_id=t.id
-                LEFT JOIN tower_location_quality lq ON lq.tower_id=t.id
                 WHERE t.id=?""",
                 (tower_id,),
             ).fetchone()
             if not row:
                 return JSONResponse({"error": "not found"}, status_code=404)
-            payload = tower_payload(row, enrich_methods=True)
+            row_dict = dict(row)
+            row_dict.update(observation_quality_for_towers(con, [tower_id]).get(int(tower_id), {}))
+            row_dict["location_quality"] = (
+                "valid_gps" if row_dict.get("center_lat") is not None and row_dict.get("center_lon") is not None
+                else "weird_gps" if int(row_dict.get("weird_gps_count") or 0) > 0
+                else "unlocated"
+            )
+            payload = tower_payload(row_dict, enrich_methods=True)
             payload["app_config"] = app_config
             payload["altitude_view"] = altitude_view_payload(payload.get("methods", []), payload.get("features", {}), app_config)
             payload["wigle_enrichment"] = get_wigle_enrichment(con, tower_id)
@@ -8201,7 +8366,7 @@ def create_app(db_path: str):
             return JSONResponse({"error": "wigle_error", "detail": str(exc)}, status_code=502)
 
     @app.get("/api/towers/{tower_id}/points")
-    def api_points(tower_id: int, kind: str = "all", limit: int = 20000, raw: int = 1) -> Dict[str, Any]:
+    def api_points(tower_id: int, kind: str = "all", limit: int = 5000, raw: int = 0) -> Dict[str, Any]:
         limit = max(1, min(int(limit), 100000))
         include_raw = bool(int(raw))
         with connect_db(db_path) as con:
@@ -8246,16 +8411,24 @@ def create_app(db_path: str):
         for pid, count in place_counts.items():
             places.append({"place_id": pid, "count": count, "bounds": _place_bounds(pid)})
         all_points = [point(r) for r in rows]
-        return {
-            "all": all_points,
-            "points": [point(r) for r in rows if not r["bad_gps"]],
-            "stationary": [point(r) for r in rows if r["stationary"] and not r["bad_gps"]],
-            "bad_gps": [point(r) for r in rows if r["bad_gps"]],
-            "clusters": feats.get("clusters_detail", []),
-            "stationary_clusters": feats.get("stationary_clusters_detail", []),
-            "place_buckets": places,
+        result: Dict[str, Any] = {
             "center": {"lat": frow["center_lat"] if frow else None, "lon": frow["center_lon"] if frow else None},
         }
+        # Return only the collection requested by the overlay.  The default
+        # ``kind=all`` remains backward-compatible for the observation table.
+        if kind in ("all", "raw"):
+            result["all"] = all_points
+            result["points"] = [p for p in all_points if not p["bad_gps"]]
+        if kind in ("all", "stationary"):
+            result["stationary"] = [p for p in all_points if p["stationary"] and not p["bad_gps"]]
+        if kind in ("all", "bad"):
+            result["bad_gps"] = [p for p in all_points if p["bad_gps"]]
+        if kind in ("all", "clusters"):
+            result["clusters"] = feats.get("clusters_detail", [])
+            result["stationary_clusters"] = feats.get("stationary_clusters_detail", [])
+        if kind in ("all", "places"):
+            result["place_buckets"] = places
+        return result
 
     @app.put("/api/admin/observations/{obs_uid}")
     async def api_update_observation(obs_uid: str, request: StarletteRequest) -> Dict[str, Any]:
