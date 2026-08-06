@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import bisect
 import datetime as dt
 import hashlib
 import html
@@ -63,6 +64,7 @@ from tower_anomaly_dashboard import (
     logit,
     mad,
     median,
+    normalize_legacy_registration_cell,
     observation_signal,
     parse_time,
     pick_location,
@@ -76,7 +78,7 @@ from tower_anomaly_dashboard import (
 
 
 DEFAULT_DB = "tower_intel.sqlite"
-DEFAULT_HOST = "127.0.0.1"
+DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 8890
 PLACE_ZOOM = 17
 DWELL_VENUE_ZOOM = 16
@@ -6682,11 +6684,17 @@ def build_help_guide_html(methods: Sequence[Dict[str, Any]], app_config: Dict[st
           <tr><td><code>AT+COPS=?</code></td><td>A slow scan of available networks.</td><td>Optional context only; disabled by default because it can take a long time and is not a Cell-ID scan.</td></tr>
         </table>
 
-        <h3>2.4 Vendor-specific serving and neighbor detail</h3>
+        <h3>2.4 Decimal and hexadecimal fields</h3>
+        <p>A hexadecimal value is base 16: its digits are <code>0–9</code> and <code>A–F</code>. 3GPP defines the LAC/TAC and Cell ID returned by <code>CREG</code>, <code>CGREG</code>, and <code>CEREG</code> as hexadecimal strings. This remains true when a token happens to contain only digits. The conversion is:</p>
+        <span class="help-equation">decimal_value = Σ hex_digit_i × 16^(number_of_digits - 1 - i)</span>
+        <div class="help-callout"><strong>Example.</strong> Registration Cell ID <code>"1389509"</code> means <code>0x1389509 = 20485385</code>; interpreting it as decimal <code>1389509</code> creates a false tower identity. The collector retains both the raw token and its converted integer so the base is auditable.</div>
+        <p>Numeric bases are command-specific, not guessed globally. SIMCom <code>CPSI</code> is mixed-base: its TAC may be prefixed hexadecimal while serving Cell ID and PCI are decimal. Quectel <code>QENG</code> Cell ID and TAC/LAC identifiers are parsed as hexadecimal, while PCI and EARFCN are decimal. A legacy value is repaired only when an independent same-sample vendor field matches exactly, or when the exact identity is observed both before and after a short vendor-query gap. If the lost raw token makes a TAC unrecoverable, the TAC is marked unknown and the legacy value is retained only as audit metadata; it is not used as an identity or anomaly feature.</p>
+
+        <h3>2.5 Vendor-specific serving and neighbor detail</h3>
         <p>AT standards do not guarantee the same cell detail on every modem. The collector therefore makes best-effort vendor queries. On SIMCom devices, <code>AT+CPSI?</code> can supply RAT, PLMN, TAC/LAC, serving Cell ID, PCI, band, EARFCN, bandwidth, RSRP, RSRQ, RSSI, and RSSNR. <code>AT+CNSMOD?</code> supplies the current system mode. On Quectel devices, <code>AT+QNWINFO</code>, <code>AT+QCSQ</code>, <code>AT+QENG=&quot;servingcell&quot;</code>, and <code>AT+QENG=&quot;neighbourcell&quot;</code> can provide richer network, channel, signal, serving-cell, and neighbor-cell records.</p>
         <p>An <code>ERROR</code> from an unsupported vendor command means that field is unavailable; it does not invalidate fields obtained through other commands. A neighbor report may omit Cell ID or PLMN. Missing data remains missing unless the registered numeric PLMN is a defensible serving-network fallback. The pipeline never invents PCI, EARFCN, Cell ID, or signal measurements.</p>
 
-        <h3>2.5 What one wardriving snapshot contains</h3>
+        <h3>2.6 What one wardriving snapshot contains</h3>
         <p>Each polling cycle records UTC and local timestamps, timezone, standard network registration, numeric PLMN, vendor responses, modem GPS, external GPS, the chosen location, scan activity, and normalized tower entries. A tower entry can contain source, RAT, PLMN/MCC/MNC, TAC/LAC, Cell ID, PCI, EARFCN, band, and available signal metrics. The snapshot is appended as one JSON line to a per-run file and is also written to the live status page.</p>
         <div class="help-callout warning"><strong>Measurement boundary.</strong> These fields describe what the modem reports from its current radio context. They do not expose every broadcast system-information block, identity request, authentication exchange, ciphering choice, or handover message. Absence of such low-level evidence must not be interpreted as evidence that an anomaly is safe or malicious.</div>
       </section>
@@ -8467,6 +8475,256 @@ def cli_import_progress_reporter() -> Callable[[Dict[str, Any]], None]:
     return _report
 
 
+def _default_hex_repair_backup_path(db_path: str) -> str:
+    stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    path = Path(db_path)
+    return str(path.with_name(f"{path.name}.pre-hex-repair-{stamp}.bak"))
+
+
+def backup_sqlite_database(db_path: str, backup_path: Optional[str] = None) -> str:
+    """Create a transactionally consistent SQLite backup before identifier repair."""
+    target = str(Path(backup_path or _default_hex_repair_backup_path(db_path)).expanduser().resolve())
+    if Path(target).exists():
+        raise FileExistsError(f"Refusing to overwrite existing backup: {target}")
+    source_uri = f"file:{Path(db_path).expanduser().resolve()}?mode=ro"
+    source = sqlite3.connect(source_uri, uri=True)
+    destination = sqlite3.connect(target)
+    try:
+        source.backup(destination)
+    finally:
+        destination.close()
+        source.close()
+    return target
+
+
+def repair_legacy_hex_identifiers(
+    db_path: str,
+    *,
+    apply: bool = False,
+    backup_path: Optional[str] = None,
+    create_backup: bool = True,
+) -> Dict[str, Any]:
+    """Audit or repair legacy registration fields proven by a sibling source.
+
+    No field is changed merely because it *could* be hexadecimal. A correction
+    is accepted only when parsing the legacy integer's decimal digits as hex
+    exactly matches CPSI/QENG in the same sample, or the exact identity is
+    independently observed immediately before and after a vendor-query gap.
+    """
+    init_db(db_path, seed_reference_data=False)
+    repairs: Dict[int, Tuple[sqlite3.Row, Dict[str, Any]]] = {}
+    paired_rows = 0
+    with connect_db(db_path) as con:
+        rows = con.execute(
+            """
+            SELECT r.id AS obs_id,r.tower_id,r.raw_cell_json,
+                   t.operator,t.rat,t.tac_lac,t.cell_id,t.pci,t.earfcn,
+                   t.known,t.ignored,t.notes,t.analysis_status,
+                   c.raw_cell_json AS sibling_cell_json
+            FROM tower_observations r
+            JOIN towers t ON t.id=r.tower_id
+            JOIN tower_observations c ON c.sample_uid=r.sample_uid
+            WHERE r.observation_source IN ('registration','cereg','cgreg','creg')
+              AND c.observation_source IN ('cpsi','qeng_servingcell')
+            ORDER BY r.id
+            """
+        )
+        for row in rows:
+            paired_rows += 1
+            try:
+                cell = json_loads(row["raw_cell_json"], {})
+                sibling = json_loads(row["sibling_cell_json"], {})
+            except Exception:
+                continue
+            if not isinstance(cell, dict) or not isinstance(sibling, dict):
+                continue
+            previous = repairs.get(int(row["obs_id"]))
+            base_cell = previous[1] if previous else cell
+            repaired = normalize_legacy_registration_cell(base_cell, [base_cell, sibling])
+            if repaired != base_cell:
+                repairs[int(row["obs_id"])] = (row, repaired)
+
+        # Some samples lack a vendor response even though adjacent samples
+        # have it. Accept a second form of proof only when the exact corrected
+        # identity is independently observed both before and after the legacy
+        # row, within a narrow interval. A one-sided nearby match is not enough.
+        independent_times: Dict[Tuple[str, str, Optional[int], Optional[int]], List[float]] = defaultdict(list)
+        for peer in con.execute(
+            """
+            SELECT t.operator,t.rat,t.tac_lac,t.cell_id,o.ts
+            FROM tower_observations o JOIN towers t ON t.id=o.tower_id
+            WHERE o.observation_source IN ('cpsi','qeng_servingcell') AND o.ts IS NOT NULL
+            ORDER BY o.ts
+            """
+        ):
+            independent_times[(
+                str(peer["operator"] or ""),
+                str(peer["rat"] or ""),
+                safe_int(peer["tac_lac"]),
+                safe_int(peer["cell_id"]),
+            )].append(float(peer["ts"]))
+
+        def is_bracketed(identity: Tuple[str, str, Optional[int], Optional[int]], ts: float) -> bool:
+            times = independent_times.get(identity) or []
+            pos = bisect.bisect_left(times, ts)
+            if pos <= 0 or pos >= len(times):
+                return False
+            return (ts - times[pos - 1]) <= 120.0 and (times[pos] - ts) <= 120.0
+
+        for row in con.execute(
+            """
+            SELECT r.id AS obs_id,r.tower_id,r.raw_cell_json,r.ts,
+                   t.operator,t.rat,t.tac_lac,t.cell_id,t.pci,t.earfcn,
+                   t.known,t.ignored,t.notes,t.analysis_status
+            FROM tower_observations r JOIN towers t ON t.id=r.tower_id
+            WHERE r.observation_source IN ('registration','cereg','cgreg','creg')
+              AND r.ts IS NOT NULL
+            """
+        ):
+            obs_id = int(row["obs_id"])
+            if obs_id in repairs:
+                continue
+            cell = json_loads(row["raw_cell_json"], {})
+            if not isinstance(cell, dict) or cell.get("identifier_encoding") == "3gpp_hex":
+                continue
+            old_cell = safe_int(cell.get("cell_id"))
+            old_tac = safe_int(cell.get("tac_lac"))
+            if old_cell is None or old_cell < 0 or old_tac is None or old_tac < 0:
+                continue
+            candidate_cell = int(str(old_cell), 16)
+            candidate_tac = int(str(old_tac), 16)
+            operator = str(row["operator"] or "")
+            rat = str(row["rat"] or cell.get("rat") or "")
+            ts = float(row["ts"])
+            changed = []
+            repaired = dict(cell)
+            both_identity = (operator, rat, candidate_tac, candidate_cell)
+            if candidate_cell != old_cell and candidate_tac != old_tac and is_bracketed(both_identity, ts):
+                repaired["cell_id"] = candidate_cell
+                repaired["cell_id_raw"] = str(old_cell)
+                repaired["tac_lac"] = candidate_tac
+                repaired["lac_tac_raw"] = str(old_tac)
+                changed.extend(["cell_id", "tac_lac"])
+            else:
+                if candidate_cell != old_cell and is_bracketed((operator, rat, old_tac, candidate_cell), ts):
+                    repaired["cell_id"] = candidate_cell
+                    repaired["cell_id_raw"] = str(old_cell)
+                    changed.append("cell_id")
+                if candidate_tac != old_tac and is_bracketed((operator, rat, candidate_tac, old_cell), ts):
+                    repaired["tac_lac"] = candidate_tac
+                    repaired["lac_tac_raw"] = str(old_tac)
+                    changed.append("tac_lac")
+            if changed:
+                repaired["identifier_encoding"] = "3gpp_hex"
+                repaired["identifier_repair"] = {
+                    "version": 1,
+                    "method": "temporally_bracketed_cross_source_exact_match",
+                    "window_s": 120,
+                    "fields": changed,
+                }
+                repairs[obs_id] = (row, repaired)
+
+        field_counts = Counter()
+        ambiguity_counts = Counter()
+        method_counts = Counter()
+        for _row, cell in repairs.values():
+            repair_meta = cell.get("identifier_repair") or {}
+            method_counts[str(repair_meta.get("method") or "unknown")] += 1
+            for field in repair_meta.get("fields") or []:
+                field_counts[str(field)] += 1
+            for field in repair_meta.get("ambiguous_fields_cleared") or []:
+                ambiguity_counts[str(field)] += 1
+
+        result: Dict[str, Any] = {
+            "mode": "apply" if apply else "dry-run",
+            "paired_rows_checked": paired_rows,
+            "observations_to_repair": len(repairs),
+            "field_corrections": dict(field_counts),
+            "ambiguous_fields_cleared": dict(ambiguity_counts),
+            "repair_methods": dict(method_counts),
+            "proof_required": [
+                "same-sample CPSI/QENG exact identifier match",
+                "exact CPSI/QENG identity both before and after within 120 seconds",
+            ],
+            "backup": None,
+            "orphan_towers_removed": 0,
+            "recompute_required": bool(repairs),
+        }
+        if not apply or not repairs:
+            return result
+
+    # Back up outside the write transaction so the backup captures the exact
+    # pre-repair state and the write lock is held for as little time as possible.
+    if create_backup:
+        result["backup"] = backup_sqlite_database(db_path, backup_path)
+
+    affected_old_towers = set()
+    affected_new_towers = set()
+    with connect_db(db_path) as con:
+        for obs_id, (row, repaired_cell) in repairs.items():
+            old_tower_id = int(row["tower_id"])
+            key = TowerKey(
+                operator=str(row["operator"] or ""),
+                rat=str(row["rat"] or repaired_cell.get("rat") or ""),
+                tac_lac=safe_int(repaired_cell.get("tac_lac")),
+                cell_id=safe_int(repaired_cell.get("cell_id")),
+                pci=safe_int(row["pci"]),
+                earfcn=safe_int(row["earfcn"]),
+            )
+            new_tower_id = upsert_tower(con, key)
+            affected_old_towers.add(old_tower_id)
+            affected_new_towers.add(new_tower_id)
+            con.execute(
+                """
+                UPDATE towers
+                SET known=MAX(known,?), ignored=MAX(ignored,?),
+                    notes=CASE WHEN notes='' THEN ? ELSE notes END,
+                    analysis_status=CASE WHEN analysis_status='' THEN ? ELSE analysis_status END
+                WHERE id=?
+                """,
+                (
+                    int(row["known"] or 0),
+                    int(row["ignored"] or 0),
+                    str(row["notes"] or ""),
+                    str(row["analysis_status"] or ""),
+                    new_tower_id,
+                ),
+            )
+            con.execute(
+                """
+                UPDATE tower_observations
+                SET tower_id=?,coarse_identity_key=?,raw_cell_json=?
+                WHERE id=?
+                """,
+                (
+                    new_tower_id,
+                    base_identity_key(BaseKey(key.operator, key.rat, key.tac_lac, key.cell_id)),
+                    json_dumps(repaired_cell),
+                    obs_id,
+                ),
+            )
+
+        affected_ids = affected_old_towers | affected_new_towers
+        if affected_ids:
+            placeholders = ",".join("?" for _ in affected_ids)
+            con.execute(f"DELETE FROM tower_features WHERE tower_id IN ({placeholders})", tuple(affected_ids))
+        con.execute("DELETE FROM dwell_identity_features")
+        before = int(con.execute("SELECT COUNT(*) FROM towers").fetchone()[0])
+        con.execute("DELETE FROM towers WHERE NOT EXISTS (SELECT 1 FROM tower_observations o WHERE o.tower_id=towers.id)")
+        after = int(con.execute("SELECT COUNT(*) FROM towers").fetchone()[0])
+        result["orphan_towers_removed"] = before - after
+        set_app_setting(con, "legacy_hex_identifier_repair_v1", {
+            "completed_at": utc_now(),
+            "observations_repaired": len(repairs),
+            "field_corrections": dict(field_counts),
+            "ambiguous_fields_cleared": dict(ambiguity_counts),
+            "repair_methods": dict(method_counts),
+            "backup": result["backup"],
+        })
+        con.commit()
+    return result
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Persistent local tower intelligence dashboard.")
     parser.add_argument("--db", default=DEFAULT_DB, help=f"SQLite DB path (default: {DEFAULT_DB})")
@@ -8484,6 +8742,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p_recompute.add_argument("--sample-size", type=int, default=2500, help="Per-tower reservoir sample size for derived features (default: 2500)")
     p_recompute.add_argument("--refresh-stationary", action="store_true", help="Rebuild stationary flags before recomputing (usually unnecessary right after ingest).")
     p_recompute.add_argument("--no-backfill-altitudes", action="store_true", help="Skip raw-sample altitude backfill during recompute.")
+
+    p_repair = sub.add_parser(
+        "repair-identifiers",
+        help="Audit/repair legacy decimalized CREG/CGREG/CEREG hexadecimal identifiers",
+    )
+    p_repair.add_argument("--apply", action="store_true", help="Apply proven repairs; default is a read-only dry run")
+    p_repair.add_argument("--backup", default=None, help="Backup path used before --apply (default: timestamped beside DB)")
+    p_repair.add_argument("--no-backup", action="store_true", help="Skip a new backup only when a verified pre-repair backup already exists")
 
     sub.add_parser("stats", help="Show DB summary")
     sub.add_parser("vacuum", help="Run SQLite VACUUM")
@@ -8504,6 +8770,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             ),
             indent=2,
             default=str,
+        ))
+    elif args.cmd == "repair-identifiers":
+        print(json.dumps(
+            repair_legacy_hex_identifiers(
+                args.db,
+                apply=bool(args.apply),
+                backup_path=args.backup,
+                create_backup=not bool(args.no_backup),
+            ),
+            indent=2,
         ))
     elif args.cmd == "stats":
         print(json.dumps(db_stats(args.db), indent=2))
