@@ -69,6 +69,9 @@ class TowerIntelTests(unittest.TestCase):
         self.assertIn("function setAreaLegendVisible(show,persist=true)", page)
         self.assertIn("towerShowAreaLegend", page)
 
+    def test_dashboard_server_defaults_to_all_network_interfaces(self):
+        self.assertEqual(intel.DEFAULT_HOST, "0.0.0.0")
+
     def test_map_toolbar_stays_visible_without_view_scrolling(self):
         page = intel.index_html()
         self.assertIn("height:100dvh", page)
@@ -145,6 +148,181 @@ class TowerIntelTests(unittest.TestCase):
             tower = con.execute("SELECT * FROM towers").fetchone()
             self.assertEqual(tower["operator"], "TestNet")
             self.assertEqual(tower["cell_id"], 456)
+
+    def test_legacy_registration_hex_is_repaired_only_by_exact_sibling_match(self):
+        legacy = {
+            "source": "registration",
+            "rat": "LTE",
+            "tac_lac": 3345,
+            "cell_id": 1389509,
+        }
+        cpsi = {
+            "source": "cpsi",
+            "rat": "LTE",
+            "tac_lac": 0x3345,
+            "cell_id": 0x1389509,
+        }
+
+        repaired = intel.normalize_legacy_registration_cell(legacy, [legacy, cpsi])
+
+        self.assertEqual(repaired["tac_lac"], 0x3345)
+        self.assertEqual(repaired["cell_id"], 0x1389509)
+        self.assertEqual(repaired["identifier_repair"]["fields"], ["cell_id", "tac_lac"])
+        self.assertEqual(repaired["identifier_encoding"], "3gpp_hex")
+
+    def test_legacy_registration_hex_repair_leaves_ambiguous_field_untouched(self):
+        legacy = {
+            "source": "registration",
+            "rat": "LTE",
+            "tac_lac": 3345,
+            "cell_id": 1389509,
+        }
+        unrelated = {
+            "source": "cpsi",
+            "rat": "LTE",
+            "tac_lac": 999,
+            "cell_id": 888,
+        }
+
+        repaired = intel.normalize_legacy_registration_cell(legacy, [legacy, unrelated])
+
+        self.assertEqual(repaired, legacy)
+
+    def test_legacy_registration_clears_unrecoverable_tac_after_cell_is_proven(self):
+        legacy = {
+            "source": "registration",
+            "rat": "LTE",
+            "tac_lac": 3345,
+            "cell_id": 1389509,
+        }
+        cpsi = {
+            "source": "cpsi",
+            "rat": "LTE",
+            "tac_lac": 0x334C,
+            "cell_id": 0x1389509,
+        }
+
+        repaired = intel.normalize_legacy_registration_cell(legacy, [legacy, cpsi])
+
+        self.assertEqual(repaired["cell_id"], 0x1389509)
+        self.assertIsNone(repaired["tac_lac"])
+        self.assertEqual(repaired["lac_tac_legacy_value"], 3345)
+        self.assertEqual(repaired["identifier_encoding"], "partial_3gpp_hex")
+        self.assertEqual(repaired["identifier_repair"]["ambiguous_fields_cleared"], ["tac_lac"])
+
+    def test_ingest_normalizes_proven_legacy_registration_identifiers(self):
+        row = {
+            "timestamp_utc": "2027-01-01T00:00:00Z",
+            "location": {"lat": 50.0, "lon": 14.0},
+            "network": {"cops_current_numeric": {"format": 2, "operator": "310260"}},
+            "towers": [
+                {"source": "registration", "rat": "LTE", "tac_lac": 3345, "cell_id": 1389509},
+                {"source": "cpsi", "rat": "LTE", "tac_lac": 0x3345, "cell_id": 0x1389509, "pci": 284},
+            ],
+        }
+        write_jsonl(self.log, [row])
+
+        intel.ingest_files(self.db, [str(self.log)])
+
+        with intel.connect_db(self.db) as con:
+            reg = con.execute(
+                """SELECT t.tac_lac,t.cell_id,o.raw_cell_json
+                FROM tower_observations o JOIN towers t ON t.id=o.tower_id
+                WHERE o.observation_source='registration'"""
+            ).fetchone()
+        raw_cell = json.loads(reg["raw_cell_json"])
+        self.assertEqual(reg["tac_lac"], 0x3345)
+        self.assertEqual(reg["cell_id"], 0x1389509)
+        self.assertEqual(raw_cell["identifier_repair"]["method"], "same_sample_cross_source_exact_match")
+
+    def test_database_hex_repair_is_dry_run_then_backed_up_apply(self):
+        row = {
+            "timestamp_utc": "2027-01-01T00:00:00Z",
+            "location": {"lat": 50.0, "lon": 14.0},
+            "network": {"cops_current_numeric": {"format": 2, "operator": "310260"}},
+            "towers": [
+                {"source": "registration", "rat": "LTE", "tac_lac": 3345, "cell_id": 1389509},
+                {"source": "cpsi", "rat": "LTE", "tac_lac": 0x3345, "cell_id": 0x1389509, "pci": 284},
+            ],
+        }
+        write_jsonl(self.log, [row])
+        intel.ingest_files(self.db, [str(self.log)])
+
+        # Put the registration observation back into the exact legacy state to
+        # exercise repair of a database created by an older collector.
+        legacy_cell = row["towers"][0]
+        with intel.connect_db(self.db) as con:
+            legacy_key = intel.TowerKey("310260", "LTE", 3345, 1389509, None, None)
+            legacy_tower_id = intel.upsert_tower(con, legacy_key)
+            con.execute(
+                """UPDATE tower_observations
+                SET tower_id=?,coarse_identity_key=?,raw_cell_json=?
+                WHERE observation_source='registration'""",
+                (
+                    legacy_tower_id,
+                    intel.base_identity_key(intel.BaseKey("310260", "LTE", 3345, 1389509)),
+                    intel.json_dumps(legacy_cell),
+                ),
+            )
+            con.commit()
+
+        dry_run = intel.repair_legacy_hex_identifiers(self.db)
+        self.assertEqual(dry_run["mode"], "dry-run")
+        self.assertEqual(dry_run["observations_to_repair"], 1)
+        self.assertEqual(dry_run["field_corrections"], {"cell_id": 1, "tac_lac": 1})
+        backup = str(Path(self.tmp.name) / "before-repair.sqlite")
+        applied = intel.repair_legacy_hex_identifiers(self.db, apply=True, backup_path=backup)
+
+        self.assertEqual(applied["mode"], "apply")
+        self.assertEqual(applied["observations_to_repair"], 1)
+        self.assertEqual(applied["backup"], str(Path(backup).resolve()))
+        self.assertTrue(Path(backup).exists())
+        with intel.connect_db(self.db) as con:
+            repaired = con.execute(
+                """SELECT t.tac_lac,t.cell_id,o.raw_cell_json
+                FROM tower_observations o JOIN towers t ON t.id=o.tower_id
+                WHERE o.observation_source='registration'"""
+            ).fetchone()
+        self.assertEqual(repaired["tac_lac"], 0x3345)
+        self.assertEqual(repaired["cell_id"], 0x1389509)
+        self.assertIn("identifier_repair", repaired["raw_cell_json"])
+
+    def test_database_hex_repair_accepts_only_temporally_bracketed_vendor_proof(self):
+        rows = [
+            {
+                "timestamp_utc": "2027-01-01T00:00:00Z",
+                "location": {"lat": 50.0, "lon": 14.0},
+                "towers": [{"source": "cpsi", "rat": "LTE", "tac_lac": 0x334C, "cell_id": 0x1389509}],
+            },
+            {
+                "timestamp_utc": "2027-01-01T00:00:30Z",
+                "location": {"lat": 50.0, "lon": 14.0},
+                "towers": [{"source": "registration", "rat": "LTE", "tac_lac": 0x334C, "cell_id": 1389509}],
+            },
+            {
+                "timestamp_utc": "2027-01-01T00:01:00Z",
+                "location": {"lat": 50.0, "lon": 14.0},
+                "towers": [{"source": "cpsi", "rat": "LTE", "tac_lac": 0x334C, "cell_id": 0x1389509}],
+            },
+        ]
+        write_jsonl(self.log, rows)
+        intel.ingest_files(self.db, [str(self.log)])
+
+        audit = intel.repair_legacy_hex_identifiers(self.db)
+
+        self.assertEqual(audit["observations_to_repair"], 1)
+        self.assertEqual(audit["field_corrections"], {"cell_id": 1})
+        result = intel.repair_legacy_hex_identifiers(self.db, apply=True, create_backup=False)
+        self.assertIsNone(result["backup"])
+        with intel.connect_db(self.db) as con:
+            cell = json.loads(con.execute(
+                "SELECT raw_cell_json FROM tower_observations WHERE observation_source='registration'"
+            ).fetchone()[0])
+        self.assertEqual(cell["cell_id"], 0x1389509)
+        self.assertEqual(
+            cell["identifier_repair"]["method"],
+            "temporally_bracketed_cross_source_exact_match",
+        )
 
     def test_recompute_excludes_bad_gps_and_exports_report(self):
         rows = self.make_rows()
