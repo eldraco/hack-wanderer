@@ -6957,7 +6957,7 @@ def index_html() -> str:
       <div id="map"></div>
       <aside id="drawer" class="drawer"><div class="drawer-resizer" title="Drag to resize"></div><div class="drawer-scroll"><header><div class="drawer-top"><div><button class="ghost" onclick="closeDrawer()">Close</button><h2 id="drawerTitle"></h2><div id="drawerSub" class="small"></div></div><div class="drawer-tools"><button class="ghost" onclick="changeDrawerFont(-1)">A−</button><button class="ghost" onclick="resetDrawerFont()">A</button><button class="ghost" onclick="changeDrawerFont(1)">A+</button><span id="drawerFontLabel" class="small"></span></div></div></header><div class="body" id="drawerBody"></div></div></aside>
     </section>
-    <section id="towersView" class="view"><div class="toolbar"><input id="towerSearch" placeholder="Search identifiers, notes, tags"><button class="ghost" onclick="loadTowerTable()">Search</button><span id="towerTableStatus" class="small"></span></div><div class="table-wrap"><table id="towerTable"></table></div><div id="towerPager" class="toolbar"></div></section>
+    <section id="towersView" class="view"><div class="toolbar"><input id="towerSearch" placeholder="Search identifiers, notes, tags"><button class="ghost" onclick="loadTowerTable()">Search</button><button id="towerLoadAll" class="ghost" onclick="loadTowerTable(0,true)">Load all rows</button><span id="towerTableStatus" class="small"></span></div><div class="table-wrap"><table id="towerTable"></table></div><div id="towerPager" class="toolbar"></div></section>
     <section id="anomaliesView" class="view"><div class="toolbar"><input id="anomalySearch" placeholder="Search identifiers, notes, tags"><select id="anomalyMethod" onchange="loadAnomalyTable()"><option value="">All triggered anomalies</option></select><label><input id="anomalyIgnored" type="checkbox" onchange="loadAnomalyTable()"> include ignored</label><button class="ghost" onclick="loadAnomalyTable()">Search</button><span id="anomalyStatus" class="small"></span></div><div class="table-wrap"><table id="anomalyTable"></table></div><div id="anomalyPager" class="toolbar"></div></section>
     <section id="methodsView" class="view"><div class="toolbar"><button class="primary" onclick="saveMethods()">Save settings</button><button class="ghost" onclick="saveAppConfig()">Save altitude config</button><button class="ghost" onclick="recompute('methods')">Recompute scores</button><span class="small">Method thresholds and altitude discount settings are editable for experiments.</span><span id="methodsStatus" class="small toolbar-note"></span></div><div class="cards"><div class="card span-all"><h3>Altitude discount configuration</h3><p class="small">These settings control how much elevated positions soften geo-heavy evidence. Ground-level points remain full strength; higher positions are discounted using local ground/floor baselines per place bucket.</p><div id="appConfigBox" class="config-grid"></div><div id="appConfigCurve" class="table-wrap compact" style="margin-top:12px"><table id="appConfigCurveTable"></table></div></div></div><div id="methodsList" class="cards"></div></section>
     <section id="importsView" class="view"><div class="imports-shell"><div id="importsStatus" class="status-line idle">Ready to import JSONL files.</div><div id="importsProgressMeta" class="small toolbar-note" style="margin:8px 0 14px 0"></div><div class="imports-grid"><div class="card"><h3>Import by path</h3><p class="small">Local server reads files from this machine. Separate multiple paths with newlines.</p><textarea id="importPaths" style="width:100%;min-height:140px" placeholder="logs/14-5-2026.jsonl"></textarea><div class="inline-actions"><button class="primary" onclick="doImport()">Import</button><button class="ghost" onclick="recompute('imports')">Recompute</button></div></div><div class="card"><h3>Upload JSONL</h3><div class="upload-stack"><input id="uploadFiles" type="file" multiple><div id="uploadSelection" class="small">No files selected.</div><button class="primary" onclick="uploadImport()">Upload + import</button></div></div><div class="card stats-card-col"><h3>DB Stats</h3><div class="inline-actions" style="margin-top:0"><button class="ghost" onclick="loadStats()">Refresh stats</button></div><div id="statsBox" class="stats-grid" style="margin-top:12px"></div><div id="statsMeta" class="small" style="margin-top:10px"></div></div><div class="card span-all"><h3>Last import result</h3><p class="small">Every import shows a compact status line plus per-file counts. No popup windows; results stay here for review.</p><div id="importSummaryMetrics" class="stats-grid" style="margin-top:12px"></div><div class="table-wrap compact" style="margin-top:12px"><table id="importResultTable"></table></div></div><div class="card span-all"><h3>Imported files history</h3><p class="small">Persistent list from the SQLite <code>import_files</code> table. Manual path imports and browser uploads both appear here.</p><div class="inline-actions" style="margin-top:0"><button class="ghost" onclick="loadImports()">Refresh imported files</button></div><div class="table-wrap compact" style="margin-top:12px"><table id="importsTable"></table></div></div></div></div></section>
@@ -6972,6 +6972,7 @@ let towerTableItems=[], anomalyTableItems=[], adminTableItems=[];
 const TABLE_PAGE_SIZE=250;
 let towerTablePage=0, anomalyTablePage=0, adminTablePage=0;
 let towerTableTotal=0, anomalyTableTotal=0, adminTableTotal=0;
+let towerTableAllMode=false;
 let mapTotal=0, mapLoadedAll=false;
 let lazyViewsLoaded=new Set();
 let tableSort={towerTable:{key:'bayes_post_p',dir:-1},anomalyTable:{key:'bayes_post_p',dir:-1},adminTable:{key:'bayes_post_p',dir:-1}};
@@ -7686,20 +7687,24 @@ async function showPoints(id,mode){clearOverlays(); resetObsMarkers(); currentPo
 	    updateObsListLocal(String(r.obs_uid||obs_uid), r.ignored ? 1 : 0);
 	  }
 	}
-function renderPager(id,page,total,loader,statusId){
+function renderPager(id,page,total,loader,statusId,pageSize=TABLE_PAGE_SIZE){
   const box=document.getElementById(id); if(!box) return;
-  const pages=Math.max(1,Math.ceil(Number(total||0)/TABLE_PAGE_SIZE));
-  const shown=total?`${page*TABLE_PAGE_SIZE+1}-${Math.min((page+1)*TABLE_PAGE_SIZE,total)} of ${total}`:'0 results';
+  const pages=Math.max(1,Math.ceil(Number(total||0)/pageSize));
+  const shown=total?`${page*pageSize+1}-${Math.min((page+1)*pageSize,total)} of ${total}`:'0 results';
   box.innerHTML=`<span class="small">${shown}</span><button class="ghost" ${page<=0?'disabled':''} onclick="${loader}(${Math.max(0,page-1)})">Previous</button><button class="ghost" ${page+1>=pages?'disabled':''} onclick="${loader}(${page+1})">Next</button>`;
   if(statusId){const status=document.getElementById(statusId); if(status) status.textContent=shown;}
 }
-async function loadTowerTable(page=0){
+async function loadTowerTable(page=0,allRows=false){
   const q=document.getElementById('towerSearch').value.trim();
+  towerTableAllMode=Boolean(allRows);
   towerTablePage=Math.max(0,Number(page)||0);
   const sort=tableSort.towerTable||{key:'bayes_post_p',dir:-1};
-  const data=await api('/api/towers?limit='+TABLE_PAGE_SIZE+'&offset='+(towerTablePage*TABLE_PAGE_SIZE)+'&compact=1&sort='+encodeURIComponent(sort.key)+'&sort_dir='+sort.dir+'&q='+encodeURIComponent(q)+'&include_ignored=1');
+  const pageSize=towerTableAllMode?5000:TABLE_PAGE_SIZE;
+  const data=await api('/api/towers?limit='+pageSize+'&offset='+(towerTablePage*pageSize)+'&compact=1&sort='+encodeURIComponent(sort.key)+'&sort_dir='+sort.dir+'&q='+encodeURIComponent(q)+'&include_ignored=1');
   towerTableItems=data.items||[]; towerTableTotal=Number(data.total||towerTableItems.length);
-  renderTowerTable('towerTable',towerTableItems,false); renderPager('towerPager',towerTablePage,towerTableTotal,'loadTowerTable','towerTableStatus');
+  renderTowerTable('towerTable',towerTableItems,false); renderPager('towerPager',towerTablePage,towerTableTotal,'loadTowerTable','towerTableStatus',pageSize);
+  const allButton=document.getElementById('towerLoadAll');
+  if(allButton) allButton.textContent=towerTableAllMode?'Load first page':'Load all rows';
 }
 async function loadAnomalyTable(page=0){
   const q=document.getElementById('anomalySearch').value.trim();
